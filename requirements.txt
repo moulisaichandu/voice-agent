@@ -1,0 +1,39 @@
+# PINNED dependencies for reproducible builds. Human-editable source: requirements.in
+# (regenerate these pins after editing it). Versions resolved from PyPI on 2026-07-18.
+
+# ── Web Framework ─────────────────────────────────────────────────────────────
+fastapi==0.139.2
+uvicorn[standard]==0.51.0
+pydantic==2.13.4
+python-dotenv==1.2.2
+
+# ── Voice / telephony ──────────────────────────────────────────────────────────
+elevenlabs==2.58.0            # Agents Platform outbound calls, webhook signature verify
+
+# ── Database (Supabase Postgres + pgvector) ─────────────────────────────────────
+asyncpg==0.31.0                # raw SQL against DATABASE_URL — see app/db/
+supabase==2.31.0               # kept for future Storage/Auth; NOT used for CRUD
+
+# ── Queue / scheduling ────────────────────────────────────────────────────────
+redis==8.0.1
+apscheduler==3.11.3            # package name is "apscheduler" on PyPI; import is "apscheduler"
+pytz==2026.2
+
+# ── RAG embeddings ────────────────────────────────────────────────────────────
+openai==2.46.0                 # text-embedding-3-small only — no chat completions used
+pypdf==6.14.2                  # extract text from PDF course docs
+python-docx==1.2.0             # extract text from .docx course docs
+
+# ── Google Sheets ─────────────────────────────────────────────────────────────
+gspread==6.2.1
+google-auth==2.56.0
+google-auth-oauthlib==1.4.0
+
+# ── HTTP ──────────────────────────────────────────────────────────────────────
+httpx==0.28.1
+
+# ── Dev / test ────────────────────────────────────────────────────────────────
+pytest==9.1.1
+pytest-cov==7.1.0
+pytest-asyncio==1.4.0
+ruff==0.15.22

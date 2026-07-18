@@ -1,0 +1,131 @@
+"""
+config.py — Centralised configuration: env vars, safe parsing, single source of truth.
+All other modules import from here; nothing else reads os.environ directly.
+"""
+
+import logging
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+# ── SAFE ENV PARSING ──────────────────────────────────────────────────────────
+# os.getenv(name, default) only returns the default when the var is ABSENT; an
+# empty or malformed override (e.g. `CALL_MAX_ATTEMPTS=` or `PORT=abc`) is a
+# non-None string that would crash int()/float() at import and take the whole
+# app down. These helpers fall back to the default with a warning instead.
+
+
+def _int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        logger.warning(f"{name}={raw!r} is not an integer — using default {default}.")
+        return default
+
+
+def _float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        logger.warning(f"{name}={raw!r} is not a number — using default {default}.")
+        return default
+
+
+def _bool(name: str, default: bool = False) -> bool:
+    """Parse a boolean env var. True for 1/true/yes/on (case-insensitive)."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _list(name: str, default: tuple[str, ...] = ()) -> list[str]:
+    """Comma-separated env var -> list of stripped, non-empty strings."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return list(default)
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+
+# ── DATABASE ──────────────────────────────────────────────────────────────────
+# Supabase Postgres IS Postgres — this is a plain connection string. Point it at
+# the local docker-compose pgvector container for dev/test, or the real Supabase
+# connection string in production. No code changes either way.
+DATABASE_URL: str | None = os.getenv("DATABASE_URL")
+
+# ── REDIS ─────────────────────────────────────────────────────────────────────
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+# ── ELEVENLABS ────────────────────────────────────────────────────────────────
+ELEVENLABS_API_KEY: str | None = os.getenv("ELEVENLABS_API_KEY")
+ELEVENLABS_WEBHOOK_SECRET: str | None = os.getenv("ELEVENLABS_WEBHOOK_SECRET")
+# Set once an agent exists in the ElevenLabs dashboard / is created via API.
+ELEVENLABS_ONEWAY_AGENT_ID: str | None = os.getenv("ELEVENLABS_ONEWAY_AGENT_ID")
+ELEVENLABS_TWOWAY_AGENT_ID: str | None = os.getenv("ELEVENLABS_TWOWAY_AGENT_ID")
+ELEVENLABS_AGENT_PHONE_NUMBER_ID: str | None = os.getenv("ELEVENLABS_AGENT_PHONE_NUMBER_ID")
+
+# ── EMBEDDINGS (OpenAI text-embedding-3-small) ────────────────────────────────
+# A separate credential from ElevenLabs — text-embedding-3-small is an OpenAI
+# model. RAG ingestion/search cannot run for real without this; code + tests run
+# fine against a mocked embeddings client regardless.
+OPENAI_API_KEY: str | None = os.getenv("OPENAI_API_KEY")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
+EMBED_DIM = _int("EMBED_DIM", 1536)
+
+# ── RAG RETRIEVAL ─────────────────────────────────────────────────────────────
+# Below this cosine-similarity score, search_relevant() returns "" / a "no
+# relevant material" note instead of the top-k regardless of score — the exact
+# bug class the blueprint's own "Mistakes to Avoid" section names from the
+# sibling project's history. See app/rag/search.py.
+RAG_MIN_SCORE = _float("RAG_MIN_SCORE", 0.30)
+RAG_TOP_K = _int("RAG_TOP_K", 4)
+
+# ── GOOGLE SHEETS ─────────────────────────────────────────────────────────────
+GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "sa.json")
+GOOGLE_SHEET_ID: str | None = os.getenv("GOOGLE_SHEET_ID")
+LEADS_WORKSHEET_NAME = os.getenv("LEADS_WORKSHEET_NAME", "Leads")
+
+# ── PUBLIC URL / WEBHOOKS ─────────────────────────────────────────────────────
+PUBLIC_BASE_URL: str | None = os.getenv("PUBLIC_BASE_URL")
+
+# ── COMPLIANCE (India TCCCPR) ─────────────────────────────────────────────────
+# Calling-hours window, IST. APScheduler's campaign_tick only enqueues leads
+# inside this window; anything outside is deferred to the next window.
+CALLING_HOURS_START = _int("CALLING_HOURS_START", 10)   # 10:00 IST
+CALLING_HOURS_END = _int("CALLING_HOURS_END", 19)        # 19:00 IST
+CALLING_HOURS_TZ = os.getenv("CALLING_HOURS_TZ", "Asia/Kolkata")
+
+# ── CAMPAIGN / DIALLING ────────────────────────────────────────────────────────
+MAX_CONCURRENT_CALLS = _int("MAX_CONCURRENT_CALLS", 10)
+PER_NUMBER_RETRY_COOLDOWN_S = _int("PER_NUMBER_RETRY_COOLDOWN_S", 3600)
+CAMPAIGN_TICK_SECONDS = _int("CAMPAIGN_TICK_SECONDS", 60)
+RETRY_SWEEP_MINUTES = _int("RETRY_SWEEP_MINUTES", 15)
+TRANSCRIPT_RECONCILE_MINUTES = _int("TRANSCRIPT_RECONCILE_MINUTES", 30)
+SHEETS_SYNC_MINUTES = _int("SHEETS_SYNC_MINUTES", 10)
+DIALING_LOCK_TTL_S = _int("DIALING_LOCK_TTL_S", 60)
+PROCESSING_REAPER_TIMEOUT_S = _int("PROCESSING_REAPER_TIMEOUT_S", 300)
+
+# ── SCHEDULER ─────────────────────────────────────────────────────────────────
+# APScheduler runs in-process. If this backend is ever scaled to multiple
+# replicas, it MUST run in exactly one of them — see the blueprint's own "one
+# scheduler, one instance" warning. This flag exists from day one so that rule
+# is enforceable later without a rewrite: only the designated instance sets it.
+SCHEDULER_ENABLED = _bool("SCHEDULER_ENABLED", True)
+
+# ── AUTH / CORS ───────────────────────────────────────────────────────────────
+APP_AUTH_TOKEN: str | None = os.getenv("APP_AUTH_TOKEN")
+ALLOWED_ORIGINS = _list("ALLOWED_ORIGINS", ("http://localhost:3000",))
+ALLOW_INSECURE_PUBLIC = _bool("ALLOW_INSECURE_PUBLIC", False)
+
+# ── LOGGING ───────────────────────────────────────────────────────────────────
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")

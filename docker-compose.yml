@@ -1,0 +1,63 @@
+services:
+  backend:
+    build: .
+    env_file: .env
+    # Override REDIS_URL/DATABASE_URL for CONTAINER-to-container traffic: .env's
+    # "localhost:6379"/"localhost:5432" are correct for running uvicorn directly
+    # on the host against these same containers' port-mapped ports, but inside
+    # the backend container "localhost" means the container itself — it must
+    # address the other services by their compose service name instead.
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql://voiceagent:voiceagent@postgres:5432/voiceagent
+    # Host port 8091, not 8000: the sibling ai-voice-agent project runs its own
+    # server on host:8000 — these are two independent apps and must not collide.
+    # Container-internal port stays 8000 (matches the Dockerfile/uvicorn command).
+    ports: ["8091:8000"]
+    depends_on:
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+        required: false   # postgres only runs under the "dev" profile
+    restart: unless-stopped
+    # Single worker keeps APScheduler single-instance.
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save 60 1 --appendonly yes
+    ports: ["6379:6379"]
+    volumes: ["redis-data:/data"]
+    restart: unless-stopped
+
+  # Local dev/test substitute for Supabase Postgres — NOT used in production.
+  # Supabase itself is managed cloud (a connection string, not a container); this
+  # gives dev/test parity (same schema, same pgvector extension) with zero cloud
+  # dependency, until DATABASE_URL is swapped to the real Supabase string.
+  postgres:
+    image: pgvector/pgvector:pg16
+    profiles: ["dev"]
+    environment:
+      POSTGRES_USER: voiceagent
+      POSTGRES_PASSWORD: voiceagent
+      POSTGRES_DB: voiceagent
+    ports: ["5432:5432"]
+    volumes: ["postgres-data:/var/lib/postgresql/data"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U voiceagent"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Uncomment once the worker is split out from the backend process (Phase 4+):
+  # worker:
+  #   build: .
+  #   env_file: .env
+  #   depends_on: [redis]
+  #   command: python -m app.telephony.worker
+
+volumes:
+  redis-data:
+  postgres-data:

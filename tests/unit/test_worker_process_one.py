@@ -1,0 +1,335 @@
+"""process_one() decision-logic tests — every collaborator (DB layer,
+ElevenLabs client, preflight, Redis) is mocked, so these test ONLY the
+sequencing/guard logic, not any real I/O. Each test targets one of the
+specific safety issues fixed vs. the blueprint's original worker sketch (see
+worker.py's module docstring).
+"""
+
+from types import SimpleNamespace
+from uuid import uuid4
+
+import pytest
+
+from app.telephony import worker
+
+
+class _FakeRedis:
+    def __init__(self, *, dnd=False, dialing_lock_free=True):
+        self._dnd = dnd
+        self._dialing_lock_free = dialing_lock_free
+        self.set_calls = []
+        self.deleted = []
+
+    async def sismember(self, key, value):
+        return self._dnd
+
+    async def set(self, key, value, nx=False, ex=None):
+        self.set_calls.append((key, value, nx, ex))
+        return self._dialing_lock_free
+
+    async def delete(self, *keys):
+        self.deleted.extend(keys)
+
+
+def _lead(**overrides):
+    defaults = dict(
+        lead_id=uuid4(), phone_e164="+919876543210", campaign_id=uuid4(),
+        status="queued", attempts=0, dnd=False,
+    )
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
+
+
+def _campaign(**overrides):
+    defaults = dict(campaign_id=uuid4(), mode="twoway", agent_id="agent_1", active=True)
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
+
+
+@pytest.fixture
+def mocks(monkeypatch):
+    lead = _lead()
+    campaign = _campaign(campaign_id=lead.campaign_id)
+    calls = {"mark_calling": [], "mark_dnd": [], "mark_result": [],
+             "record_dial_attempt": [], "create_call": [], "enqueue": []}
+
+    async def get_lead(lead_id):
+        return lead
+
+    async def get_campaign(cid):
+        return campaign
+
+    monkeypatch.setattr(worker.leads_db, "get_lead", get_lead)
+    monkeypatch.setattr(worker.campaigns_db, "get_campaign", get_campaign)
+
+    async def mark_calling(lead_id):
+        calls["mark_calling"].append(lead_id)
+        return True
+
+    async def mark_dnd(lead_id):
+        calls["mark_dnd"].append(lead_id)
+
+    async def mark_result(lead_id, status):
+        calls["mark_result"].append((lead_id, status))
+
+    async def record_dial_attempt(lead_id):
+        calls["record_dial_attempt"].append(lead_id)
+
+    async def create_call(**kwargs):
+        calls["create_call"].append(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    monkeypatch.setattr(worker.leads_db, "mark_calling", mark_calling)
+    monkeypatch.setattr(worker.leads_db, "mark_dnd", mark_dnd)
+    monkeypatch.setattr(worker.leads_db, "mark_result", mark_result)
+    monkeypatch.setattr(worker.leads_db, "record_dial_attempt", record_dial_attempt)
+    monkeypatch.setattr(worker.calls_db, "create_call", create_call)
+
+    async def fake_enqueue(lead_id):
+        calls["enqueue"].append(lead_id)
+
+    monkeypatch.setattr(worker, "enqueue_lead", fake_enqueue)
+
+    async def fake_ack(lead_id):
+        calls.setdefault("ack", []).append(lead_id)
+
+    monkeypatch.setattr(worker, "_ack", fake_ack)
+
+    async def no_preflight_error(agent_id, phone_id):
+        return None
+
+    monkeypatch.setattr(worker.preflight_module, "preflight", no_preflight_error)
+
+    async def acquire_slot():
+        return True
+
+    async def release_slot():
+        calls.setdefault("release_slot", []).append(1)
+
+    monkeypatch.setattr(worker, "try_acquire_call_slot", acquire_slot)
+    monkeypatch.setattr(worker, "release_call_slot", release_slot)
+
+    return SimpleNamespace(lead=lead, campaign=campaign, calls=calls)
+
+
+async def test_dnd_lead_is_marked_and_never_dialled(mocks, monkeypatch):
+    monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis(dnd=True))
+    await worker.process_one(str(mocks.lead.lead_id))
+
+    assert mocks.calls["mark_dnd"] == [mocks.lead.lead_id]
+    assert mocks.calls["mark_calling"] == []          # never even reserved
+    assert mocks.calls["create_call"] == []
+    assert mocks.calls["ack"] == [str(mocks.lead.lead_id)]  # still always acked
+
+
+async def test_inactive_campaign_skips_without_dialling(mocks, monkeypatch):
+    inactive = _campaign(campaign_id=mocks.lead.campaign_id, active=False)
+
+    async def get_inactive(cid):
+        return inactive
+
+    monkeypatch.setattr(worker.campaigns_db, "get_campaign", get_inactive)
+    monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
+
+    await worker.process_one(str(mocks.lead.lead_id))
+
+    assert mocks.calls["mark_calling"] == []
+    assert mocks.calls["create_call"] == []
+
+
+async def test_mark_calling_guard_rejection_skips_cleanly(mocks, monkeypatch):
+    """Simulates a race: another worker already moved this lead past 'queued'."""
+    async def reject(lead_id):
+        return False
+
+    monkeypatch.setattr(worker.leads_db, "mark_calling", reject)
+    monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
+
+    await worker.process_one(str(mocks.lead.lead_id))
+
+    assert mocks.calls["create_call"] == []
+    assert mocks.calls["record_dial_attempt"] == []   # never got that far
+    assert mocks.calls["ack"] == [str(mocks.lead.lead_id)]
+
+
+async def test_dialing_lock_contention_releases_reservation_without_counting_attempt(
+    mocks, monkeypatch,
+):
+    """Two workers race for the same phone number — the loser must put the
+    lead back to 'pending' WITHOUT incrementing attempts (see db/leads.py's
+    record_dial_attempt docstring for why that split matters)."""
+    monkeypatch.setattr(worker.redis_client, "get_redis",
+                        lambda: _FakeRedis(dialing_lock_free=False))
+
+    await worker.process_one(str(mocks.lead.lead_id))
+
+    assert mocks.calls["mark_result"] == [(mocks.lead.lead_id, "pending")]
+    assert mocks.calls["record_dial_attempt"] == []
+    assert mocks.calls["create_call"] == []
+
+
+async def test_preflight_failure_releases_reservation_without_counting_attempt(
+    mocks, monkeypatch,
+):
+    monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
+
+    async def failing_preflight(agent_id, phone_id):
+        return "PUBLIC_BASE_URL is unreachable"
+
+    monkeypatch.setattr(worker.preflight_module, "preflight", failing_preflight)
+
+    await worker.process_one(str(mocks.lead.lead_id))
+
+    assert mocks.calls["mark_result"] == [(mocks.lead.lead_id, "pending")]
+    assert mocks.calls["record_dial_attempt"] == []
+
+
+async def test_at_capacity_requeues_instead_of_busy_looping(mocks, monkeypatch):
+    monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
+
+    async def no_slot():
+        return False
+
+    monkeypatch.setattr(worker, "try_acquire_call_slot", no_slot)
+    # Deliberately NOT monkeypatching asyncio.sleep here: patching it on the
+    # shared module object would affect the whole async runtime for the
+    # test's duration, not just this call site — a real (bounded, ~1s) sleep
+    # is the safer choice.
+
+    await worker.process_one(str(mocks.lead.lead_id))
+
+    assert mocks.calls["mark_result"] == [(mocks.lead.lead_id, "pending")]
+    assert mocks.calls["enqueue"] == [str(mocks.lead.lead_id)]
+    assert mocks.calls["record_dial_attempt"] == []
+
+
+async def test_successful_placement_records_attempt_and_creates_call(mocks, monkeypatch):
+    monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
+
+    result = SimpleNamespace(success=True, message="ok",
+                             conversation_id="conv_1", call_sid="call_1")
+    monkeypatch.setattr(worker.elevenlabs_client, "place_outbound_call", lambda **kw: result)
+
+    await worker.process_one(str(mocks.lead.lead_id))
+
+    assert mocks.calls["record_dial_attempt"] == [mocks.lead.lead_id]
+    assert len(mocks.calls["create_call"]) == 1
+    assert mocks.calls["create_call"][0]["el_conversation_id"] == "conv_1"
+    # Slot ownership transfers to the webhook handler on success — NOT released here.
+    assert "release_slot" not in mocks.calls
+
+
+async def test_placement_exception_releases_slot_and_marks_failed(mocks, monkeypatch):
+    monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
+
+    def boom(**kw):
+        raise RuntimeError("ElevenLabs API down")
+
+    monkeypatch.setattr(worker.elevenlabs_client, "place_outbound_call", boom)
+
+    await worker.process_one(str(mocks.lead.lead_id))
+
+    assert mocks.calls["record_dial_attempt"] == [mocks.lead.lead_id]  # attempt DID happen
+    assert mocks.calls["mark_result"] == [(mocks.lead.lead_id, "failed")]
+    assert mocks.calls["create_call"] == []
+    assert mocks.calls["release_slot"] == [1]
+
+
+async def test_unsuccessful_result_releases_slot_and_marks_failed(mocks, monkeypatch):
+    monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
+
+    result = SimpleNamespace(success=False, message="no agent capacity",
+                             conversation_id=None, call_sid=None)
+    monkeypatch.setattr(worker.elevenlabs_client, "place_outbound_call", lambda **kw: result)
+
+    await worker.process_one(str(mocks.lead.lead_id))
+
+    assert mocks.calls["mark_result"] == [(mocks.lead.lead_id, "failed")]
+    assert mocks.calls["create_call"] == []
+    assert mocks.calls["release_slot"] == [1]
+
+
+# ── the dialing-lock must not linger when no call was placed ─────────────────
+# Regression tests for a real bug found by the end-to-end pipeline test: every
+# path that bails AFTER acquiring `dialing:<phone>` but WITHOUT placing a call
+# must delete the lock. Leaving it set blocked the lead from retrying for the
+# full DIALING_LOCK_TTL_S even though nothing was ever dialled.
+
+async def test_preflight_failure_releases_the_dialing_lock(mocks, monkeypatch):
+    r = _FakeRedis()
+    monkeypatch.setattr(worker.redis_client, "get_redis", lambda: r)
+
+    async def failing_preflight(agent_id, phone_id):
+        return "PUBLIC_BASE_URL is unreachable"
+
+    monkeypatch.setattr(worker.preflight_module, "preflight", failing_preflight)
+
+    await worker.process_one(str(mocks.lead.lead_id))
+
+    assert f"dialing:{mocks.lead.phone_e164}" in r.deleted
+
+
+async def test_at_capacity_releases_the_dialing_lock(mocks, monkeypatch):
+    r = _FakeRedis()
+    monkeypatch.setattr(worker.redis_client, "get_redis", lambda: r)
+
+    async def no_slot():
+        return False
+
+    monkeypatch.setattr(worker, "try_acquire_call_slot", no_slot)
+
+    await worker.process_one(str(mocks.lead.lead_id))
+
+    assert f"dialing:{mocks.lead.phone_e164}" in r.deleted
+
+
+async def test_placement_failure_releases_the_dialing_lock(mocks, monkeypatch):
+    r = _FakeRedis()
+    monkeypatch.setattr(worker.redis_client, "get_redis", lambda: r)
+
+    def boom(**kw):
+        raise RuntimeError("ElevenLabs API down")
+
+    monkeypatch.setattr(worker.elevenlabs_client, "place_outbound_call", boom)
+
+    await worker.process_one(str(mocks.lead.lead_id))
+
+    assert f"dialing:{mocks.lead.phone_e164}" in r.deleted
+
+
+async def test_successful_placement_KEEPS_the_dialing_lock(mocks, monkeypatch):
+    """The inverse: a genuinely in-flight call SHOULD keep the lock set (to
+    expire on its own), since that's exactly the double-dial it prevents."""
+    r = _FakeRedis()
+    monkeypatch.setattr(worker.redis_client, "get_redis", lambda: r)
+
+    result = SimpleNamespace(success=True, message="ok",
+                             conversation_id="conv_1", call_sid="sid_1")
+    monkeypatch.setattr(worker.elevenlabs_client, "place_outbound_call", lambda **kw: result)
+
+    await worker.process_one(str(mocks.lead.lead_id))
+
+    assert f"dialing:{mocks.lead.phone_e164}" not in r.deleted
+
+
+async def test_lead_not_found_is_dropped_without_crashing(monkeypatch):
+    async def get_none(lead_id):
+        return None
+
+    monkeypatch.setattr(worker.leads_db, "get_lead", get_none)
+    acked = []
+
+    async def fake_ack(lead_id):
+        acked.append(lead_id)
+
+    monkeypatch.setattr(worker, "_ack", fake_ack)
+
+    await worker.process_one(str(uuid4()))  # no exception
+    assert len(acked) == 1
+
+
+async def test_process_one_always_acks_even_on_early_return(mocks, monkeypatch):
+    """The finally block must run regardless of which branch returned."""
+    monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis(dnd=True))
+    await worker.process_one(str(mocks.lead.lead_id))
+    assert mocks.calls["ack"] == [str(mocks.lead.lead_id)]

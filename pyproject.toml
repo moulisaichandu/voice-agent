@@ -1,0 +1,34 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+asyncio_mode = "auto"
+markers = [
+    "integration: needs local Redis + Postgres containers (docker compose --profile dev up -d)",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.coverage.run]
+source = ["app"]
+omit = [
+    "tests/*",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# I = isort (import sorting), F = pyflakes (unused imports/vars), E = pycodestyle errors
+select = ["E", "F", "I"]
+ignore = [
+    "E402",  # app.main calls setup_logging() before importing app.* modules
+             # (intentional — logging must be configured before anything else
+             # can log an import-time warning). See app/main.py.
+]

@@ -1,0 +1,39 @@
+# Human-edited source. Regenerate requirements.txt after editing this file:
+#   pip install pip-tools && pip-compile requirements.in
+
+# ── Web framework ──
+fastapi
+uvicorn[standard]
+pydantic
+python-dotenv
+
+# ── Voice / telephony ──
+elevenlabs
+
+# ── Database (Supabase Postgres + pgvector) ──
+asyncpg
+supabase          # kept for future Storage/Auth use; NOT used for CRUD (see ARCHITECTURE notes)
+
+# ── Queue / scheduling ──
+redis
+apscheduler
+pytz
+
+# ── RAG embeddings ──
+openai             # text-embedding-3-small only — no chat completions used here
+pypdf              # extract text from PDF course docs
+python-docx        # extract text from .docx course docs
+
+# ── Google Sheets ──
+gspread
+google-auth
+google-auth-oauthlib
+
+# ── HTTP ──
+httpx
+
+# ── Dev / test ──
+pytest
+pytest-cov
+pytest-asyncio
+ruff
