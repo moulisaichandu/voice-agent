@@ -19,11 +19,32 @@ this — it fails if a future refactor wires search_permissive() into endpoint.p
 
 from __future__ import annotations
 
-from app.config import RAG_MIN_SCORE, RAG_TOP_K
+import asyncio
+import logging
+
+from app.config import RAG_MIN_SCORE, RAG_TOP_K, RAG_TRANSLATE_ON_MISS
 from app.db import rag_store
 from app.rag.embeddings import embed_text
+from app.rag.translate import translate_to_english
+
+logger = logging.getLogger(__name__)
 
 NO_MATERIAL_NOTE = "No relevant course material was found for that question."
+
+
+def _format(hits: list[dict]) -> str:
+    return "\n\n---\n\n".join(
+        f"[From {h['section'] or 'course material'}]\n{h['content']}" for h in hits
+    )
+
+
+async def _embed_and_match(query: str, k: int, min_score: float) -> list[dict]:
+    # embed_text is a synchronous HTTP call. Off-loaded to a thread because
+    # this runs on the same event loop that drives the call worker and the
+    # transcript webhook — blocking it here stalls every other in-flight
+    # call, not just this one lookup.
+    embedding = await asyncio.to_thread(embed_text, query)
+    return await rag_store.match_chunks(embedding, match_count=k, min_score=min_score)
 
 
 async def search_permissive(query: str, k: int = RAG_TOP_K) -> list[dict]:
@@ -32,8 +53,7 @@ async def search_permissive(query: str, k: int = RAG_TOP_K) -> list[dict]:
     query = query.strip()
     if not query:
         return []
-    embedding = embed_text(query)
-    return await rag_store.match_chunks(embedding, match_count=k, min_score=0.0)
+    return await _embed_and_match(query, k, min_score=0.0)
 
 
 async def search_relevant(
@@ -44,14 +64,34 @@ async def search_relevant(
     contract requires always returning something speakable (an empty string
     would leave the agent tool-calling with nothing to say), unlike a
     text-chat context-injection function that could safely return "" to mean
-    "don't inject anything"."""
+    "don't inject anything".
+
+    On a miss, the query is translated to English and retried ONCE (see
+    app/rag/translate.py): the course docs are English-only, and Telugu-script
+    questions embed too far from them to clear any threshold that still
+    excludes irrelevant material. min_score is applied identically to both
+    attempts — the retry changes the QUERY's language, never the relevance
+    bar, so a translated query cannot surface material an English query of
+    the same meaning wouldn't have.
+    """
     query = query.strip()
     if not query:
         return NO_MATERIAL_NOTE
-    embedding = embed_text(query)
-    hits = await rag_store.match_chunks(embedding, match_count=k, min_score=min_score)
+
+    hits = await _embed_and_match(query, k, min_score)
+    if hits:
+        return _format(hits)
+
+    if not RAG_TRANSLATE_ON_MISS:
+        return NO_MATERIAL_NOTE
+
+    translated = await translate_to_english(query)
+    if not translated:
+        return NO_MATERIAL_NOTE
+
+    hits = await _embed_and_match(translated, k, min_score)
     if not hits:
         return NO_MATERIAL_NOTE
-    return "\n\n---\n\n".join(
-        f"[From {h['section'] or 'course material'}]\n{h['content']}" for h in hits
-    )
+    logger.info(f"[rag] miss on the original query, hit after translating to "
+                f"{translated!r}")
+    return _format(hits)
