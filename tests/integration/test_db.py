@@ -5,6 +5,7 @@ disposable dev database never collide on the leads/calls unique constraints.
 """
 
 import uuid
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -81,12 +82,17 @@ async def test_record_dial_attempt_increments_only_when_called(campaign):
     assert refetched.last_called_at is not None
 
 
+_VALID_CONSENT = dict(consent_basis="explicit", consent_at=datetime.now() - timedelta(hours=1))
+
+
 async def test_due_leads_excludes_dnd_and_inactive_campaigns(campaign):
     ok = await leads_db.upsert_lead(
         sheet_row=1, name="A", phone_e164=_uniq_phone(), campaign_id=campaign.campaign_id,
+        **_VALID_CONSENT,
     )
     dnd_lead = await leads_db.upsert_lead(
         sheet_row=2, name="B", phone_e164=_uniq_phone(), campaign_id=campaign.campaign_id,
+        **_VALID_CONSENT,
     )
     await leads_db.mark_dnd(dnd_lead.lead_id)
 
@@ -94,6 +100,22 @@ async def test_due_leads_excludes_dnd_and_inactive_campaigns(campaign):
     due_ids = {lead.lead_id for lead in due}
     assert ok.lead_id in due_ids
     assert dnd_lead.lead_id not in due_ids
+
+
+async def test_due_leads_excludes_leads_without_valid_consent(campaign):
+    """The gap the audit flagged: has_valid_consent() existed and was
+    unit-tested in isolation, but nothing wired it into the query that
+    decides who's actually dial-eligible."""
+    no_consent = await leads_db.upsert_lead(
+        sheet_row=1, name="C", phone_e164=_uniq_phone(), campaign_id=campaign.campaign_id,
+    )
+    with_consent = await leads_db.upsert_lead(
+        sheet_row=2, name="D", phone_e164=_uniq_phone(), campaign_id=campaign.campaign_id,
+        **_VALID_CONSENT,
+    )
+    due_ids = {lead.lead_id for lead in await leads_db.due_leads(limit=50)}
+    assert no_consent.lead_id not in due_ids
+    assert with_consent.lead_id in due_ids
 
 
 async def test_get_lead_by_phone_matches_the_most_recent_row(campaign):

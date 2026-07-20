@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
+from app.compliance.consent import has_valid_consent
 from app.db.models import Lead
 from app.db.pool import get_pool
 
@@ -63,8 +64,22 @@ async def get_lead_by_phone(phone_e164: str) -> Lead | None:
 
 async def due_leads(limit: int) -> list[Lead]:
     """Leads eligible for dialling right now: pending, not DND, under their
-    campaign's max_attempts, on an active campaign."""
+    campaign's max_attempts, on an active campaign, AND with a recorded valid
+    consent basis + timestamp (app.compliance.consent.has_valid_consent) — a
+    lead with no consent record on file is exactly as dial-ineligible as a
+    DND one.
+
+    The consent check is deliberately pure Python, not duplicated into SQL,
+    so there's exactly one place (compliance/consent.py, already unit-tested)
+    that decides what counts as valid consent. That means over-fetching
+    candidates before filtering: a batch with some consent-ineligible rows
+    would otherwise silently return fewer than `limit` even though more
+    eligible leads exist further down the same query. campaign_tick's own
+    batch size is already a soft target (see its docstring), so returning
+    somewhat fewer than `limit` on a heavily consent-gated batch is consistent
+    with that existing tradeoff, not a new one."""
     pool = await get_pool()
+    candidate_limit = max(limit * 5, limit + 20)
     rows = await pool.fetch(
         """
         select l.* from leads l
@@ -74,9 +89,10 @@ async def due_leads(limit: int) -> list[Lead]:
         order by l.created_at
         limit $1
         """,
-        limit,
+        candidate_limit,
     )
-    return [_row_to_lead(r) for r in rows]
+    eligible = [r for r in rows if has_valid_consent(r["consent_basis"], r["consent_at"])]
+    return [_row_to_lead(r) for r in eligible[:limit]]
 
 
 async def mark_queued(lead_id: UUID) -> bool:
@@ -133,6 +149,15 @@ async def mark_dnd(lead_id: UUID) -> None:
     await pool.execute(
         "update leads set dnd = true, status = 'dnd' where lead_id = $1", lead_id
     )
+
+
+async def list_leads_for_campaign(campaign_id: UUID) -> list[Lead]:
+    """Used by the admin API's per-campaign lead list view."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "select * from leads where campaign_id = $1 order by created_at desc", campaign_id,
+    )
+    return [_row_to_lead(r) for r in rows]
 
 
 async def dnd_phones() -> list[str]:

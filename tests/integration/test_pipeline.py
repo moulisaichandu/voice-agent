@@ -11,6 +11,7 @@ than each piece working in isolation under mocks.
 """
 
 import uuid
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -67,9 +68,15 @@ async def campaign():
 
 @pytest.fixture
 async def lead(campaign):
+    # due_leads() (which campaign_tick uses) now gates on consent — every
+    # lead this pipeline exercises via campaign_tick needs a valid record or
+    # it would never be enqueued in the first place. See test_db.py's
+    # test_due_leads_excludes_leads_without_valid_consent for the dedicated
+    # coverage of that gate itself.
     return await leads_db.upsert_lead(
         sheet_row=2, name="Ravi", phone_e164="+91" + uuid.uuid4().hex[:10],
         campaign_id=campaign.campaign_id,
+        consent_basis="explicit", consent_at=datetime.now() - timedelta(hours=1),
     )
 
 
