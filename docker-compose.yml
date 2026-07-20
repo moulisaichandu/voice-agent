@@ -10,6 +10,13 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql://voiceagent:voiceagent@postgres:5432/voiceagent
+      # Falls back to the local dev tunnel ONLY when .env doesn't set one (the
+      # `:-` form treats an empty value as unset too). Set PUBLIC_BASE_URL in
+      # .env for anything real and it wins automatically — this default exists
+      # so a dev machine isn't blocked on getting that one line into .env.
+      # NOT a secret: it's a hostname ElevenLabs must reach. The webhook
+      # SECRET stays in .env and is never committed.
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://kits-drivers-straight-lessons.trycloudflare.com}
     # Host port 8091, not 8000: the sibling ai-voice-agent project runs its own
     # server on host:8000 — these are two independent apps and must not collide.
     # Container-internal port stays 8000 (matches the Dockerfile/uvicorn command).
@@ -51,10 +58,19 @@ services:
       timeout: 3s
       retries: 10
 
-  # Uncomment once the worker is split out from the backend process (Phase 4+):
+  # The call worker runs IN-PROCESS inside `backend` by default (a background
+  # asyncio task started from app/main.py's lifespan — see config.WORKER_ENABLED)
+  # so this service is not needed at the pilot's scale. Uncomment it AND set
+  # WORKER_ENABLED=false on `backend` above only to scale call throughput
+  # independently of the API/scheduler — BLMOVE's atomic pop makes running
+  # both simultaneously safe (just redundant), so this is never required for
+  # correctness, only for capacity.
   # worker:
   #   build: .
   #   env_file: .env
+  #   environment:
+  #     REDIS_URL: redis://redis:6379/0
+  #     DATABASE_URL: postgresql://voiceagent:voiceagent@postgres:5432/voiceagent
   #   depends_on: [redis]
   #   command: python -m app.telephony.worker
 

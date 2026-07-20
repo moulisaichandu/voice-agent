@@ -24,6 +24,15 @@ os.environ["ALLOW_INSECURE_PUBLIC"] = "0"
 os.environ["ALLOWED_ORIGINS"] = "http://localhost:8000"
 os.environ["APP_AUTH_TOKEN"] = ""
 os.environ["SCHEDULER_ENABLED"] = "false"
+# Same reasoning as SCHEDULER_ENABLED: a handful of unit tests boot the real
+# app via TestClient (test_health.py, test_startup_checks.py, ...). If a real
+# local Redis happens to be reachable, an enabled worker would start a
+# background BLMOVE loop with up to a ~2s shutdown grace period per boot —
+# slow and pointless for tests that never enqueue anything. The worker's own
+# behavior (run_worker, process_one, the Redis primitives) is exercised
+# directly by tests/unit/test_worker_*.py and tests/integration/test_pipeline.py,
+# neither of which goes through app.main's lifespan.
+os.environ["WORKER_ENABLED"] = "false"
 for _k in (
     "ELEVENLABS_API_KEY", "ELEVENLABS_WEBHOOK_SECRET",
     "ELEVENLABS_ONEWAY_AGENT_ID", "ELEVENLABS_TWOWAY_AGENT_ID",

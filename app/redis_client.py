@@ -58,6 +58,13 @@ async def is_available() -> bool:
 async def close() -> None:
     global _client, _client_loop
     if _client is not None:
-        await _client.aclose()
+        # Same loop-aware guard as get_redis(): a client created under a now-
+        # dead event loop (e.g. a previous pytest-asyncio test function's
+        # loop) can't have its transport closed on THIS loop — that raises
+        # "Event loop is closed" rather than actually closing anything. Just
+        # drop the stale reference in that case, matching get_redis()'s own
+        # handling of the identical situation.
+        if _client_loop is asyncio.get_running_loop():
+            await _client.aclose()
         _client = None
         _client_loop = None

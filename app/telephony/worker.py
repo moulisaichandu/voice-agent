@@ -33,11 +33,29 @@ Fixes several distinct safety issues in the blueprint's own worker sketch
      stay held for the call's real duration to enforce MAX_CONCURRENT_CALLS).
 
   6. No exception handling around call placement — one API error killed the
-     whole worker loop silently. Fixed: process_one() wraps the full
-     reserve -> dial -> record sequence; any failure is turned into a lead
-     status update, and the `finally` block always acks the processing-list
-     entry so only a genuine crash (not a handled failure) leaves work for
-     the reaper.
+     whole worker loop silently. Fixed: process_one() catches placement
+     failures specifically and turns them into a lead status update.
+
+  7. process_one() had `try/finally` with no `except`, while claiming here
+     that "any failure is turned into a lead status update". It wasn't: an
+     error anywhere OUTSIDE the placement call (get_lead, sismember,
+     mark_calling, preflight, create_call) propagated — and the `finally`
+     acked anyway, deleting the lead from calls:processing. That left it
+     status='calling', in no queue and in no processing list, so the reaper
+     couldn't see it and due_leads() (status='pending' only) never
+     re-selected it: silently un-callable forever, the exact loss BLMOVE+ack
+     exists to prevent. Fixed: an outer `except` undoes whatever the partial
+     attempt did (slot, dialing lock, reservation) and, if recovery itself
+     fails, deliberately does NOT ack — leaving the entry for the reaper.
+     A call that was actually placed is never released back to 'pending';
+     the webhook owns it from that point.
+
+  8. run_worker()'s loop body was unguarded. As a background asyncio task
+     (app/main.py's lifespan), an escaping exception killed the coroutine
+     while the process kept serving health checks — nothing dialled again
+     until a human noticed and restarted. Fixed: per-iteration try/except
+     with exponential backoff, and CancelledError re-raised so shutdown
+     still works.
 """
 
 from __future__ import annotations
@@ -136,8 +154,16 @@ async def _ack(lead_id: str) -> None:
 
 async def process_one(lead_id: str) -> None:
     """The full reserve -> dial -> record sequence for one lead_id already
-    popped into calls:processing. Always acks in `finally` — see module
-    docstring point 6."""
+    popped into calls:processing. See module docstring points 6 and 7."""
+    # Tracked so the unhandled-failure path (point 7) knows exactly what has
+    # to be undone: a partially-completed attempt must not leave the lead
+    # reserved, the number locked, or a concurrency slot held.
+    reserved = False
+    lock_key: str | None = None
+    slot_held = False
+    call_placed = False
+    safe_to_ack = True
+
     try:
         lead = await leads_db.get_lead(UUID(lead_id))
         if lead is None:
@@ -161,17 +187,19 @@ async def process_one(lead_id: str) -> None:
         if not await leads_db.mark_calling(lead.lead_id):
             logger.info(f"[worker] lead {lead_id} already left 'queued' — skipping")
             return
+        reserved = True
 
         # In-flight per-number lock (module docstring point 4). Any early
         # return past this point that releases the reservation must put the
         # lead back to 'pending' — it never actually got attempted, so
         # attempts must NOT have been incremented (record_dial_attempt()
         # hasn't run yet at any of these points).
-        lock_key = f"dialing:{lead.phone_e164}"
-        if not await r.set(lock_key, "1", nx=True, ex=DIALING_LOCK_TTL_S):
+        if not await r.set(f"dialing:{lead.phone_e164}", "1", nx=True, ex=DIALING_LOCK_TTL_S):
             logger.warning(f"[worker] lead {lead_id}: already dialing {lead.phone_e164}")
             await leads_db.mark_result(lead.lead_id, "pending")
+            reserved = False
             return
+        lock_key = f"dialing:{lead.phone_e164}"
 
         reachability_error = await preflight_module.preflight(
             campaign.agent_id, ELEVENLABS_AGENT_PHONE_NUMBER_ID or "",
@@ -183,7 +211,9 @@ async def process_one(lead_id: str) -> None:
             # Leaving it set would block this lead from retrying for the full
             # DIALING_LOCK_TTL_S even though no call was ever placed.
             await r.delete(lock_key)
+            lock_key = None
             await leads_db.mark_result(lead.lead_id, "pending")
+            reserved = False
             return
 
         if not await try_acquire_call_slot():
@@ -191,7 +221,9 @@ async def process_one(lead_id: str) -> None:
             # rather than busy-loop (module docstring point 5). Same as
             # above: no call placed, so the dialing lock must not linger.
             await r.delete(lock_key)
+            lock_key = None
             await leads_db.mark_result(lead.lead_id, "pending")
+            reserved = False
             await enqueue_lead(lead_id)
             await asyncio.sleep(1)
             return
@@ -199,32 +231,52 @@ async def process_one(lead_id: str) -> None:
         # From here on, a slot is held — every remaining exit path must
         # either transfer ownership of that slot to the webhook handler
         # (successful placement) or release it itself (any failure).
+        slot_held = True
         await leads_db.record_dial_attempt(lead.lead_id)
+        # One-way campaigns carry their message as campaigns.script — passed
+        # through as a dynamic variable, NOT read/spoken by this server (no
+        # audio flows through it). The ElevenLabs one-way agent's first
+        # message must reference {{script}} for this to actually be said;
+        # that's an agent-dashboard configuration step, not code here.
+        dynamic_variables = {"lead_id": str(lead.lead_id)}
+        if campaign.mode == "oneway" and campaign.script:
+            dynamic_variables["script"] = campaign.script
         try:
             result = elevenlabs_client.place_outbound_call(
                 agent_id=campaign.agent_id,
                 agent_phone_number_id=ELEVENLABS_AGENT_PHONE_NUMBER_ID or "",
                 to_number=lead.phone_e164,
-                dynamic_variables={"lead_id": str(lead.lead_id)},
+                dynamic_variables=dynamic_variables,
             )
         except Exception as exc:
             # No call connected, so the dialing lock must not linger either —
             # a retry (this lead is under max_attempts) would otherwise be
             # blocked for DIALING_LOCK_TTL_S for no reason.
             await release_call_slot()
+            slot_held = False
             await r.delete(lock_key)
+            lock_key = None
             logger.error(f"[worker] call placement raised for {lead_id}: "
                          f"{type(exc).__name__}: {exc}")
             await leads_db.mark_result(lead.lead_id, "failed")
+            reserved = False
             return
 
         if not result.success or not result.conversation_id:
             await release_call_slot()
+            slot_held = False
             await r.delete(lock_key)
+            lock_key = None
             logger.error(f"[worker] call placement unsuccessful for {lead_id}: "
                          f"{result.message}")
             await leads_db.mark_result(lead.lead_id, "failed")
+            reserved = False
             return
+
+        # A real call is now ringing. Past this line the lead must NEVER be
+        # released back to 'pending' by the failure path below — that would
+        # let a later tick dial someone who is already on the phone.
+        call_placed = True
 
         await calls_db.create_call(
             lead_id=lead.lead_id, campaign_id=campaign.campaign_id, mode=campaign.mode,
@@ -232,18 +284,108 @@ async def process_one(lead_id: str) -> None:
         )
         # The slot is now owned by the webhook handler, released when the
         # call's real outcome is recorded — not here.
+
+    except Exception:
+        # Module docstring point 7. Without this, ANY unhandled error (a
+        # Postgres blip in get_lead/create_call, a Redis drop in sismember)
+        # propagated straight through the `finally` below — which still
+        # acked, deleting the lead from calls:processing. The lead was left
+        # status='calling', in no queue and in no processing list, so the
+        # reaper could not see it and due_leads() (status='pending' only)
+        # never re-selected it: silently un-callable forever. That is exactly
+        # the loss BLMOVE+ack exists to prevent.
+        logger.exception(f"[worker] unhandled error processing lead {lead_id}")
+        try:
+            if call_placed:
+                # The call is live. Leave the reservation and the slot alone —
+                # the webhook owns both from here. Releasing either would risk
+                # a double-dial or an over-admitting semaphore.
+                logger.error(
+                    f"[worker] lead {lead_id}: call was already placed when this "
+                    "failed — leaving it 'calling' for the transcript webhook to "
+                    "resolve. If create_call() is what failed, the calls row is "
+                    "missing and this call's transcript cannot be matched back."
+                )
+            else:
+                if slot_held:
+                    await release_call_slot()
+                if lock_key:
+                    await redis_client.get_redis().delete(lock_key)
+                if reserved:
+                    # Back to 'pending', NOT 'failed': nothing was dialled, so
+                    # this must stay eligible for the next campaign_tick and
+                    # must not burn an attempt (see db/leads.py).
+                    await leads_db.mark_result(UUID(lead_id), "pending")
+        except Exception:
+            # Recovery itself failed — the backing store is likely down. Do
+            # NOT ack: leaving the entry in calls:processing is precisely the
+            # case the reaper was built for.
+            logger.exception(
+                f"[worker] recovery failed for lead {lead_id} — leaving it in "
+                f"{PROCESSING_KEY} for the reaper rather than acking it away"
+            )
+            safe_to_ack = False
     finally:
-        await _ack(lead_id)
+        if safe_to_ack:
+            await _ack(lead_id)
+
+
+_MAX_LOOP_BACKOFF_S = 30
 
 
 async def run_worker(stop_event: asyncio.Event) -> None:
     """The worker loop: BLMOVE, process, repeat, until *stop_event* is set.
     A short BLMOVE timeout (2s) keeps the stop check responsive without
-    busy-polling."""
+    busy-polling. Started as a background asyncio task from app.main's
+    lifespan by default (see config.WORKER_ENABLED) — see __main__ below for
+    running it as a standalone process instead.
+
+    The loop body is guarded (module docstring point 8): as a background
+    task, an escaping exception would kill this coroutine while the rest of
+    the process — health checks included — carried on looking healthy, and
+    nothing would ever dial again until someone noticed and restarted. A
+    transient Redis/Postgres blip must cost a retry, not the dialer.
+    """
     logger.info("[worker] started")
+    consecutive_failures = 0
     while not stop_event.is_set():
-        lead_id = await _reserve_next(timeout_s=2)
-        if lead_id is None:
-            continue
-        await process_one(lead_id)
+        try:
+            lead_id = await _reserve_next(timeout_s=2)
+            if lead_id is not None:
+                await process_one(lead_id)
+            consecutive_failures = 0
+        except asyncio.CancelledError:
+            # Real shutdown, not a fault — never swallow it into the backoff.
+            raise
+        except Exception:
+            consecutive_failures += 1
+            backoff = min(2 ** consecutive_failures, _MAX_LOOP_BACKOFF_S)
+            logger.exception(
+                f"[worker] loop iteration failed ({consecutive_failures} in a row) "
+                f"— retrying in {backoff}s"
+            )
+            # Back off so a sustained outage doesn't spin the CPU or flood the
+            # log, while a one-off blip still recovers within seconds.
+            await asyncio.sleep(backoff)
     logger.info("[worker] stopped")
+
+
+if __name__ == "__main__":  # pragma: no cover - manual/standalone entrypoint
+    # For running the worker as its own process/container instead of
+    # in-process with the API — see the commented-out `worker` service in
+    # docker-compose.yml. Set WORKER_ENABLED=false on the `backend` service
+    # if you do this, to avoid two redundant (harmless, just wasteful)
+    # consumers of calls:queue.
+    import signal
+
+    async def _standalone() -> None:
+        stop_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop_event.set)
+            except NotImplementedError:
+                pass  # Windows: no add_signal_handler for SIGTERM; Ctrl+C still works
+        await run_worker(stop_event)
+
+    asyncio.run(_standalone())

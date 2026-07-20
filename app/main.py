@@ -6,9 +6,12 @@ Run (prod):  uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
 
 Single worker only: APScheduler (app/scheduler.py) runs in-process and must not
 be started twice — see config.SCHEDULER_ENABLED and the blueprint's own
-"one scheduler, one instance" warning.
+"one scheduler, one instance" warning. The Redis call worker (app/telephony/
+worker.py) ALSO runs in-process, as a background asyncio task started below —
+unlike the scheduler it's safe on multiple instances (see config.WORKER_ENABLED).
 """
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -26,9 +29,14 @@ from app.config import (
     APP_AUTH_TOKEN,
     DATABASE_URL,
     ELEVENLABS_WEBHOOK_SECRET,
+    LOG_LEVEL,
     PUBLIC_BASE_URL,
     SCHEDULER_ENABLED,
+    WORKER_ENABLED,
 )
+from app.telephony import worker
+
+setup_logging(LOG_LEVEL)
 
 logger = logging.getLogger(__name__)
 
@@ -89,8 +97,35 @@ async def lifespan(app: FastAPI):
     elif SCHEDULER_ENABLED:
         logger.warning("[startup] SCHEDULER_ENABLED but Redis is down — not starting it.")
 
+    # The call worker: a background asyncio task in this same process (see
+    # config.WORKER_ENABLED) — nothing else consumes calls:queue, so without
+    # this, campaign_tick enqueues leads that never get dialled.
+    worker_stop_event: asyncio.Event | None = None
+    worker_task: asyncio.Task | None = None
+    if WORKER_ENABLED and redis_ok:
+        worker_stop_event = asyncio.Event()
+        worker_task = asyncio.create_task(worker.run_worker(worker_stop_event))
+    elif WORKER_ENABLED:
+        logger.warning("[startup] WORKER_ENABLED but Redis is down — "
+                       "the call worker is not starting.")
+
     yield
 
+    if worker_task is not None:
+        worker_stop_event.set()
+        try:
+            # Bounded: a worker wedged on an unresponsive Redis must not hang
+            # shutdown forever. BLMOVE's own timeout is 2s, so this only trips
+            # if something is genuinely stuck.
+            await asyncio.wait_for(worker_task, timeout=10)
+        except asyncio.TimeoutError:
+            logger.warning("[shutdown] call worker did not stop in 10s — cancelling it.")
+            worker_task.cancel()
+        except Exception:
+            # The worker died earlier (its own loop guard should prevent this).
+            # Awaiting a task that failed re-raises here, which would abort the
+            # rest of shutdown and leak the scheduler and the Redis pool.
+            logger.exception("[shutdown] call worker had already failed.")
     scheduler.shutdown()
     await redis_client.close()
 
@@ -112,11 +147,13 @@ app.add_middleware(
 )
 
 # ── Routers ───────────────────────────────────────────────────────────────────
+from app.admin.endpoint import router as admin_router  # noqa: E402
 from app.rag.endpoint import router as rag_router  # noqa: E402
 from app.webhooks.elevenlabs import router as elevenlabs_webhook_router  # noqa: E402
 
 app.include_router(rag_router)
 app.include_router(elevenlabs_webhook_router)
+app.include_router(admin_router)
 
 
 @app.get("/health", tags=["Health"])

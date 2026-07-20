@@ -219,6 +219,46 @@ async def test_successful_placement_records_attempt_and_creates_call(mocks, monk
     assert "release_slot" not in mocks.calls
 
 
+async def test_oneway_campaign_passes_script_as_dynamic_variable(mocks, monkeypatch):
+    oneway = _campaign(campaign_id=mocks.lead.campaign_id, mode="oneway",
+                       script="This is an AI voice assistant calling about your course.")
+
+    async def get_oneway(cid):
+        return oneway
+
+    monkeypatch.setattr(worker.campaigns_db, "get_campaign", get_oneway)
+    monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
+
+    captured = {}
+
+    def fake_place(**kw):
+        captured.update(kw)
+        return SimpleNamespace(success=True, message="ok",
+                               conversation_id="conv_1", call_sid="call_1")
+
+    monkeypatch.setattr(worker.elevenlabs_client, "place_outbound_call", fake_place)
+
+    await worker.process_one(str(mocks.lead.lead_id))
+
+    assert captured["dynamic_variables"]["script"] == oneway.script
+
+
+async def test_twoway_campaign_never_sends_a_script_dynamic_variable(mocks, monkeypatch):
+    monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
+    captured = {}
+
+    def fake_place(**kw):
+        captured.update(kw)
+        return SimpleNamespace(success=True, message="ok",
+                               conversation_id="conv_1", call_sid="call_1")
+
+    monkeypatch.setattr(worker.elevenlabs_client, "place_outbound_call", fake_place)
+
+    await worker.process_one(str(mocks.lead.lead_id))
+
+    assert "script" not in captured["dynamic_variables"]
+
+
 async def test_placement_exception_releases_slot_and_marks_failed(mocks, monkeypatch):
     monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
 
@@ -333,3 +373,70 @@ async def test_process_one_always_acks_even_on_early_return(mocks, monkeypatch):
     monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis(dnd=True))
     await worker.process_one(str(mocks.lead.lead_id))
     assert mocks.calls["ack"] == [str(mocks.lead.lead_id)]
+
+
+# ── unhandled failures must not strand the lead (docstring point 7) ──────────
+# Before this, process_one had try/finally with no except: an error anywhere
+# outside the placement call propagated, the finally acked it out of
+# calls:processing anyway, and the lead was left status='calling' — invisible
+# to both the reaper and due_leads(), i.e. never callable again.
+
+async def test_unhandled_error_before_dialling_releases_the_lead(mocks, monkeypatch):
+    r = _FakeRedis()
+    monkeypatch.setattr(worker.redis_client, "get_redis", lambda: r)
+
+    async def boom(agent_id, phone_id):
+        raise RuntimeError("Postgres went away")
+
+    monkeypatch.setattr(worker.preflight_module, "preflight", boom)
+
+    await worker.process_one(str(mocks.lead.lead_id))  # must not raise
+
+    # Back to 'pending' so the next campaign_tick re-selects it...
+    assert mocks.calls["mark_result"] == [(mocks.lead.lead_id, "pending")]
+    # ...with no attempt burned, and the dialing lock released.
+    assert mocks.calls["record_dial_attempt"] == []
+    assert f"dialing:{mocks.lead.phone_e164}" in r.deleted
+    assert mocks.calls["ack"] == [str(mocks.lead.lead_id)]
+
+
+async def test_unhandled_error_after_dialling_never_releases_the_lead(mocks, monkeypatch):
+    """create_call() failing AFTER a real call is ringing must NOT put the
+    lead back to 'pending' — a later tick would dial someone already on the
+    phone. The webhook owns the lead from placement onward."""
+    monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
+
+    result = SimpleNamespace(success=True, message="ok",
+                             conversation_id="conv_1", call_sid="sid_1")
+    monkeypatch.setattr(worker.elevenlabs_client, "place_outbound_call", lambda **kw: result)
+
+    async def boom(**kwargs):
+        raise RuntimeError("unique violation on el_conversation_id")
+
+    monkeypatch.setattr(worker.calls_db, "create_call", boom)
+
+    await worker.process_one(str(mocks.lead.lead_id))  # must not raise
+
+    assert mocks.calls["mark_result"] == []                  # never released
+    assert mocks.calls.get("release_slot", []) == []         # slot stays with the webhook
+    assert mocks.calls.get("ack") == [str(mocks.lead.lead_id)]
+
+
+async def test_lead_is_left_for_the_reaper_when_recovery_itself_fails(mocks, monkeypatch):
+    """If the backing store is down hard, cleanup can't run either. Acking
+    then would delete the only record that this lead was mid-flight — so the
+    entry must stay in calls:processing for the reaper instead."""
+    monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
+
+    async def boom(agent_id, phone_id):
+        raise RuntimeError("Postgres went away")
+
+    async def also_boom(lead_id, status):
+        raise RuntimeError("still down")
+
+    monkeypatch.setattr(worker.preflight_module, "preflight", boom)
+    monkeypatch.setattr(worker.leads_db, "mark_result", also_boom)
+
+    await worker.process_one(str(mocks.lead.lead_id))  # must not raise
+
+    assert mocks.calls.get("ack", []) == []  # deliberately NOT acked

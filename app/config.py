@@ -90,6 +90,17 @@ EMBED_DIM = _int("EMBED_DIM", 1536)
 RAG_MIN_SCORE = _float("RAG_MIN_SCORE", 0.30)
 RAG_TOP_K = _int("RAG_TOP_K", 4)
 
+# Telugu-script queries embed FAR from this English-only corpus with
+# text-embedding-3-small: measured top scores of 0.13-0.19 for questions whose
+# English equivalents score 0.37-0.46 — i.e. the same band as a deliberately
+# off-topic English query (0.128). Lowering RAG_MIN_SCORE to admit them would
+# admit noise too, and their top hits are the WRONG chunks anyway, so it would
+# trade "no answer" for "confidently wrong answer" — the exact failure this
+# project exists to avoid. Instead, on a miss ONLY, the query is translated to
+# English and retried once. English queries (the common case) never pay for it.
+RAG_TRANSLATE_ON_MISS = _bool("RAG_TRANSLATE_ON_MISS", True)
+RAG_TRANSLATE_MODEL = os.getenv("RAG_TRANSLATE_MODEL", "gpt-4o-mini")
+
 # ── GOOGLE SHEETS ─────────────────────────────────────────────────────────────
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "sa.json")
 GOOGLE_SHEET_ID: str | None = os.getenv("GOOGLE_SHEET_ID")
@@ -121,6 +132,15 @@ PROCESSING_REAPER_TIMEOUT_S = _int("PROCESSING_REAPER_TIMEOUT_S", 300)
 # scheduler, one instance" warning. This flag exists from day one so that rule
 # is enforceable later without a rewrite: only the designated instance sets it.
 SCHEDULER_ENABLED = _bool("SCHEDULER_ENABLED", True)
+
+# ── CALL WORKER ───────────────────────────────────────────────────────────────
+# Unlike the scheduler, the worker is safe to run on MULTIPLE instances at
+# once — BLMOVE's pop is atomic, so concurrent consumers of calls:queue can't
+# double-process the same lead_id. Runs in-process (a background asyncio task
+# started from app.main's lifespan) by default at this project's pilot scale;
+# set to false only if it's been split into the separate docker-compose
+# `worker` service, to avoid two redundant (harmless, just wasteful) consumers.
+WORKER_ENABLED = _bool("WORKER_ENABLED", True)
 
 # ── AUTH / CORS ───────────────────────────────────────────────────────────────
 APP_AUTH_TOKEN: str | None = os.getenv("APP_AUTH_TOKEN")
