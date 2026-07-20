@@ -1,5 +1,8 @@
 node_modules
 .next
+# Production build output — kept separate from dev's .next so `next build`
+# can't corrupt a running dev server. See next.config.js.
+.next-build
 # Renaming .next out of the way is the standard escape hatch when its chunk
 # cache corrupts (a stale build served after `next build` and `next dev`
 # clobber each other's chunks). The renamed copy is still pure build output —

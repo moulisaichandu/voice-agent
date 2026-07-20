@@ -16,8 +16,24 @@
  */
 const BACKEND_URL = process.env.BACKEND_URL ?? "http://localhost:8091";
 
+/**
+ * Dev and production builds write to DIFFERENT directories.
+ *
+ * By default both use `.next`, so running `next build` while `next dev` is
+ * running overwrites chunks the dev server has already mapped, and every
+ * page then dies with "Cannot find module './NNN.js'" until `.next` is
+ * deleted. That is a confusing failure for something as ordinary as
+ * verifying a build without stopping the dev server first — and it bit this
+ * project twice.
+ *
+ * `next dev` runs with NODE_ENV=development; `next build` and `next start`
+ * both run with production, so start still finds what build produced.
+ */
+const distDir = process.env.NODE_ENV === "production" ? ".next-build" : ".next";
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  distDir,
   async rewrites() {
     return [
       { source: "/api/backend/:path*", destination: `${BACKEND_URL}/:path*` },
