@@ -102,6 +102,31 @@ async def test_due_leads_excludes_dnd_and_inactive_campaigns(campaign):
     assert dnd_lead.lead_id not in due_ids
 
 
+async def test_due_leads_scoped_to_a_campaign_excludes_other_campaigns(campaign):
+    """Backs the admin API's per-campaign trigger: against real Postgres, a
+    scoped call must return only that campaign's leads."""
+    other = await campaigns_db.create_campaign(
+        name=f"other-{uuid.uuid4().hex[:8]}", mode="twoway", agent_id="agent_other",
+    )
+    mine = await leads_db.upsert_lead(
+        sheet_row=1, name="Mine", phone_e164=_uniq_phone(),
+        campaign_id=campaign.campaign_id, **_VALID_CONSENT,
+    )
+    theirs = await leads_db.upsert_lead(
+        sheet_row=1, name="Theirs", phone_e164=_uniq_phone(),
+        campaign_id=other.campaign_id, **_VALID_CONSENT,
+    )
+
+    scoped = {lead.lead_id for lead in
+              await leads_db.due_leads(limit=50, campaign_id=campaign.campaign_id)}
+    assert mine.lead_id in scoped
+    assert theirs.lead_id not in scoped
+
+    # Unscoped still sees both — the scheduler's own run must stay global.
+    everyone = {lead.lead_id for lead in await leads_db.due_leads(limit=200)}
+    assert {mine.lead_id, theirs.lead_id} <= everyone
+
+
 async def test_due_leads_excludes_leads_without_valid_consent(campaign):
     """The gap the audit flagged: has_valid_consent() existed and was
     unit-tested in isolation, but nothing wired it into the query that

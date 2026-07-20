@@ -72,9 +72,9 @@ export default function CampaignDetailPage() {
     setTickResult(null);
     setTickIsError(false);
     try {
-      const result = await api.triggerTick();
+      const result = await api.triggerTick(campaignId);
       setTickResult(
-        `Queued ${result.queued} lead(s) across all active campaigns. ` +
+        `Queued ${result.queued} lead(s) from this campaign. ` +
           (result.queued > 0
             ? "The in-process worker picks these up within a couple of seconds."
             : "Nothing was dial-eligible right now (outside calling hours, DND, " +
@@ -134,10 +134,10 @@ export default function CampaignDetailPage() {
           test-only bypass.
         </p>
         <div className="warning-banner">
-          If real ElevenLabs credentials and a linked phone number are
-          configured in the backend&apos;s .env, clicking this <strong>places
-          a real phone call</strong> to any dial-eligible lead across ALL
-          active campaigns (not scoped to this one).
+          Scoped to <strong>this campaign only</strong>. If real ElevenLabs
+          credentials and a linked phone number are configured in the
+          backend&apos;s .env, clicking this <strong>places real phone
+          calls</strong> to this campaign&apos;s dial-eligible leads.
         </div>
         <button onClick={handleTrigger} disabled={triggering}>
           {triggering ? "Triggering…" : "Trigger campaign tick now"}

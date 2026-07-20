@@ -148,8 +148,14 @@ export const api = {
   listCalls: (campaignId: string) =>
     request<Call[]>(`/admin/campaigns/${campaignId}/calls`),
 
-  triggerTick: () =>
-    request<{ queued: number }>("/admin/trigger-tick", { method: "POST" }),
+  // Scoped to one campaign on purpose — see the backend route's docstring.
+  // The unscoped /admin/trigger-tick exists but is deliberately not exposed
+  // in the UI: a "dial now" button on a campaign page must not call another
+  // campaign's leads.
+  triggerTick: (campaignId: string) =>
+    request<{ queued: number }>(`/admin/campaigns/${campaignId}/trigger-tick`, {
+      method: "POST",
+    }),
 
   ragSearch: (query: string) =>
     request<{ result: string }>("/rag/search", {

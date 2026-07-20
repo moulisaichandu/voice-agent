@@ -25,7 +25,7 @@ async def test_campaign_tick_queues_due_leads_inside_calling_hours(monkeypatch):
     monkeypatch.setattr(scheduler, "within_calling_hours", lambda: True)
     lead1, lead2 = SimpleNamespace(lead_id=uuid4()), SimpleNamespace(lead_id=uuid4())
 
-    async def fake_due_leads(limit):
+    async def fake_due_leads(limit, campaign_id=None):
         return [lead1, lead2]
 
     queued = []
@@ -55,7 +55,7 @@ async def test_campaign_tick_does_not_enqueue_a_lead_whose_queue_guard_rejects(m
     monkeypatch.setattr(scheduler, "within_calling_hours", lambda: True)
     lead = SimpleNamespace(lead_id=uuid4())
 
-    async def fake_due_leads(limit):
+    async def fake_due_leads(limit, campaign_id=None):
         return [lead]
 
     async def reject(lead_id):
@@ -72,6 +72,39 @@ async def test_campaign_tick_does_not_enqueue_a_lead_whose_queue_guard_rejects(m
 
     await scheduler.campaign_tick()
     assert enqueued == []
+
+
+async def test_campaign_tick_passes_the_scope_through_to_due_leads(monkeypatch):
+    """Scoping must reach the QUERY, not be applied afterwards — filtering a
+    global result set would still have queued other campaigns' leads on the
+    way past."""
+    monkeypatch.setattr(scheduler, "within_calling_hours", lambda: True)
+    target = uuid4()
+    seen = {}
+
+    async def fake_due_leads(limit, campaign_id=None):
+        seen["campaign_id"] = campaign_id
+        return []
+
+    monkeypatch.setattr(scheduler.leads_db, "due_leads", fake_due_leads)
+
+    await scheduler.campaign_tick(campaign_id=target)
+    assert seen["campaign_id"] == target
+
+    await scheduler.campaign_tick()
+    assert seen["campaign_id"] is None  # scheduler's own run stays global
+
+
+async def test_scoped_tick_still_respects_calling_hours(monkeypatch):
+    """Scoping narrows WHICH leads, it must never relax a compliance gate."""
+    monkeypatch.setattr(scheduler, "within_calling_hours", lambda: False)
+
+    async def boom(limit, campaign_id=None):
+        raise AssertionError("must not select leads outside calling hours")
+
+    monkeypatch.setattr(scheduler.leads_db, "due_leads", boom)
+
+    assert await scheduler.campaign_tick(campaign_id=uuid4()) == 0
 
 
 async def test_retry_sweeper_delegates_to_the_reaper(monkeypatch):

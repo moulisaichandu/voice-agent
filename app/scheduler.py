@@ -58,7 +58,7 @@ _WRITEBACK_BATCH_SIZE = 25
 _scheduler: AsyncIOScheduler | None = None
 
 
-async def campaign_tick() -> int:
+async def campaign_tick(campaign_id: UUID | None = None) -> int:
     """Pop due leads into the Redis queue — but only inside calling hours.
     Batch size is a simple MAX_CONCURRENT_CALLS per tick (not an exact
     free-slot computation): the worker's own semaphore is what actually gates
@@ -72,10 +72,16 @@ async def campaign_tick() -> int:
     "trigger now" endpoint to report something meaningful to the caller. This
     is deliberately the SAME function the scheduler calls on its own
     interval, not a separate bypass — running it on-demand still goes through
-    every compliance gate (calling hours, DND, consent, max_attempts)."""
+    every compliance gate (calling hours, DND, consent, max_attempts).
+
+    *campaign_id* restricts the tick to one campaign. The scheduler always
+    calls this with None (every active campaign); the admin API passes an id
+    so that a human clicking "dial now" on one campaign's page cannot start
+    calling a different campaign's leads. Scoping only narrows — no gate is
+    relaxed for a scoped run."""
     if not within_calling_hours():
         return 0
-    due = await leads_db.due_leads(limit=MAX_CONCURRENT_CALLS)
+    due = await leads_db.due_leads(limit=MAX_CONCURRENT_CALLS, campaign_id=campaign_id)
     queued = 0
     for lead in due:
         if await leads_db.mark_queued(lead.lead_id):

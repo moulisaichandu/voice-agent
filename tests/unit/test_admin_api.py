@@ -178,6 +178,43 @@ def test_list_calls_404s_for_an_unknown_campaign(client, monkeypatch):
 
 # ── trigger-tick ─────────────────────────────────────────────────────────────
 
+def test_scoped_trigger_only_ticks_that_campaign(client, monkeypatch):
+    """A "dial now" button lives on one campaign's page. It must not start
+    calling another campaign's leads — with real credentials that is real
+    calls to people the operator never intended to contact."""
+    campaign = _campaign()
+    got = {}
+
+    async def get_campaign(cid):
+        return campaign
+
+    async def fake_tick(campaign_id=None):
+        got["campaign_id"] = campaign_id
+        return 2
+
+    monkeypatch.setattr(admin_endpoint.campaigns_db, "get_campaign", get_campaign)
+    monkeypatch.setattr(admin_endpoint.scheduler, "campaign_tick", fake_tick)
+
+    r = client.post(f"/admin/campaigns/{campaign.campaign_id}/trigger-tick")
+
+    assert r.status_code == 200
+    assert r.json() == {"queued": 2}
+    assert got["campaign_id"] == campaign.campaign_id
+
+
+def test_scoped_trigger_404s_for_an_unknown_campaign(client, monkeypatch):
+    async def not_found(cid):
+        return None
+
+    async def must_not_tick(campaign_id=None):
+        raise AssertionError("must not dial for a campaign that doesn't exist")
+
+    monkeypatch.setattr(admin_endpoint.campaigns_db, "get_campaign", not_found)
+    monkeypatch.setattr(admin_endpoint.scheduler, "campaign_tick", must_not_tick)
+
+    assert client.post(f"/admin/campaigns/{uuid4()}/trigger-tick").status_code == 404
+
+
 def test_trigger_tick_calls_the_real_campaign_tick_not_a_bypass(client, monkeypatch):
     """This must be scheduler.campaign_tick() itself — the same function the
     APScheduler job calls — so calling hours/DND/consent/max_attempts are

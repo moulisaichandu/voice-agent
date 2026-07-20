@@ -62,7 +62,7 @@ async def get_lead_by_phone(phone_e164: str) -> Lead | None:
     return _row_to_lead(row) if row else None
 
 
-async def due_leads(limit: int) -> list[Lead]:
+async def due_leads(limit: int, campaign_id: UUID | None = None) -> list[Lead]:
     """Leads eligible for dialling right now: pending, not DND, under their
     campaign's max_attempts, on an active campaign, AND with a recorded valid
     consent basis + timestamp (app.compliance.consent.has_valid_consent) — a
@@ -77,7 +77,13 @@ async def due_leads(limit: int) -> list[Lead]:
     eligible leads exist further down the same query. campaign_tick's own
     batch size is already a soft target (see its docstring), so returning
     somewhat fewer than `limit` on a heavily consent-gated batch is consistent
-    with that existing tradeoff, not a new one."""
+    with that existing tradeoff, not a new one.
+
+    *campaign_id* narrows the selection to one campaign, for the admin API's
+    per-campaign trigger. It only ever NARROWS: every gate above (pending,
+    not DND, active campaign, under max_attempts, valid consent) still
+    applies, so a scoped trigger can never dial someone a global tick
+    wouldn't have."""
     pool = await get_pool()
     candidate_limit = max(limit * 5, limit + 20)
     rows = await pool.fetch(
@@ -86,10 +92,11 @@ async def due_leads(limit: int) -> list[Lead]:
         join campaigns c on c.campaign_id = l.campaign_id
         where l.status = 'pending' and l.dnd = false and c.active = true
           and l.attempts < c.max_attempts
+          and ($2::uuid is null or l.campaign_id = $2)
         order by l.created_at
         limit $1
         """,
-        candidate_limit,
+        candidate_limit, campaign_id,
     )
     eligible = [r for r in rows if has_valid_consent(r["consent_basis"], r["consent_at"])]
     return [_row_to_lead(r) for r in eligible[:limit]]
