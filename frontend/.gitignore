@@ -1,0 +1,10 @@
+node_modules
+.next
+# Renaming .next out of the way is the standard escape hatch when its chunk
+# cache corrupts (a stale build served after `next build` and `next dev`
+# clobber each other's chunks). The renamed copy is still pure build output —
+# never commit it.
+.next-stale-*
+out
+.env.local
+npm-debug.log*

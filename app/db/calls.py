@@ -55,6 +55,15 @@ async def get_latest_call_for_lead(lead_id: UUID) -> Call | None:
     return _row_to_call(row) if row else None
 
 
+async def list_calls_for_campaign(campaign_id: UUID) -> list[Call]:
+    """Used by the admin API's per-campaign call/transcript list view."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "select * from calls where campaign_id = $1 order by created_at desc", campaign_id,
+    )
+    return [_row_to_call(r) for r in rows]
+
+
 async def get_call_by_conversation_id(el_conversation_id: str) -> Call | None:
     pool = await get_pool()
     row = await pool.fetchrow(
