@@ -9,7 +9,9 @@ Sibling project: `../ai-voice-agent/` runs a SEPARATE, working OpenAI-Realtime +
 Plivo voice agent for the same business. Do not touch that repo from here.
 
 ## Stack (do not swap without asking)
-FastAPI (3.12) · ElevenLabs Agents (hosted LLM, no separate LLM key) · Exotel
+FastAPI (3.12) · ElevenLabs Agents (hosted LLM, no separate LLM key) · Plivo
+(connected to ElevenLabs via SIP trunk — the SDK has no native Plivo
+integration, only exotel/twilio/sip_trunk; see app/telephony/elevenlabs_client.py)
 · Supabase (Postgres+pgvector, accessed via raw SQL/asyncpg — NOT supabase-py
 for CRUD) · Redis · APScheduler · Docker. Async everywhere.
 

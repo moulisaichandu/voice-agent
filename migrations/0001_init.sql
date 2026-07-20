@@ -63,7 +63,7 @@ create table calls (
   lead_id            uuid references leads(lead_id),
   campaign_id        uuid references campaigns(campaign_id),
   el_conversation_id text unique,           -- NULL until ElevenLabs assigns one
-  provider_call_id   text,                  -- Exotel call sid
+  provider_call_id   text,                  -- telephony provider's call id (Plivo, via SIP trunk)
   mode               text,
   status             text,                  -- answered|no_answer|voicemail|failed
   turns              int,

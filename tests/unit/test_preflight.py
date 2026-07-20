@@ -4,6 +4,7 @@ per-failure-mode structure, plus the new agent/phone-number-not-found cases
 this project's preflight adds that the sibling's didn't need."""
 
 import httpx
+import pytest
 
 from app.telephony import preflight as pf
 
@@ -91,6 +92,64 @@ async def test_phone_number_not_found(monkeypatch):
     result = await pf.preflight("agent_1", "bad_phone")
     assert result is not None
     assert "bad_phone" in result
+
+
+@pytest.mark.parametrize("blank", ["", "   ", None])
+async def test_blank_phone_number_id_is_rejected_without_calling_the_api(monkeypatch, blank):
+    """Regression, found by running it live: phone_numbers.get("") hits the
+    COLLECTION endpoint and returns 200, so phone_number_exists("") answers
+    True. An unset ELEVENLABS_AGENT_PHONE_NUMBER_ID therefore passed the exact
+    check meant to catch it, and the dial went out and failed at ElevenLabs —
+    burning an attempt per lead for a call that could never connect."""
+    monkeypatch.setattr(pf, "ELEVENLABS_API_KEY", "key")
+    monkeypatch.setattr(pf, "PUBLIC_BASE_URL", "https://example.ngrok.dev")
+    monkeypatch.setattr(pf.httpx, "AsyncClient", lambda **kw: _FakeAsyncClient(status_code=200))
+
+    def must_not_be_called(*a, **kw):
+        raise AssertionError("the API must not be consulted for a blank id")
+
+    monkeypatch.setattr(pf, "agent_exists", must_not_be_called)
+    monkeypatch.setattr(pf, "phone_number_exists", must_not_be_called)
+
+    result = await pf.preflight("agent_1", blank)
+    assert result is not None
+    assert "ELEVENLABS_AGENT_PHONE_NUMBER_ID" in result
+
+
+@pytest.mark.parametrize("blank", ["", "   ", None])
+async def test_blank_agent_id_is_rejected_without_calling_the_api(monkeypatch, blank):
+    monkeypatch.setattr(pf, "ELEVENLABS_API_KEY", "key")
+    monkeypatch.setattr(pf, "PUBLIC_BASE_URL", "https://example.ngrok.dev")
+    monkeypatch.setattr(pf.httpx, "AsyncClient", lambda **kw: _FakeAsyncClient(status_code=200))
+
+    def must_not_be_called(*a, **kw):
+        raise AssertionError("the API must not be consulted for a blank id")
+
+    monkeypatch.setattr(pf, "agent_exists", must_not_be_called)
+
+    result = await pf.preflight(blank, "phone_1")
+    assert result is not None
+    assert "agent_id" in result
+
+
+async def test_api_failure_becomes_a_dont_dial_reason_not_an_exception(monkeypatch):
+    """preflight's contract is None = go, str = don't-dial-because. A revoked
+    key or an ElevenLabs outage must land as a reason: letting it escape
+    aborts process_one mid-reserve instead of cleanly declining to dial."""
+    monkeypatch.setattr(pf, "ELEVENLABS_API_KEY", "key")
+    monkeypatch.setattr(pf, "PUBLIC_BASE_URL", "https://example.ngrok.dev")
+    monkeypatch.setattr(pf.httpx, "AsyncClient", lambda **kw: _FakeAsyncClient(status_code=200))
+
+    def boom(agent_id):
+        raise RuntimeError("ElevenLabs is down")
+
+    monkeypatch.setattr(pf, "agent_exists", boom)
+
+    result = await pf.preflight("agent_1", "phone_1")
+
+    assert result is not None
+    assert "Could not verify" in result
+    assert "ElevenLabs is down" in result
 
 
 async def test_all_checks_pass_returns_none(monkeypatch):
