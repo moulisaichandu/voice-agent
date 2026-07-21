@@ -66,12 +66,46 @@ DATABASE_URL: str | None = os.getenv("DATABASE_URL")
 # ── REDIS ─────────────────────────────────────────────────────────────────────
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
+# ── PLIVO (telephony) ─────────────────────────────────────────────────────────
+# Plivo's STANDARD Voice API — the same one the sibling ai-voice-agent project
+# uses — not SIP trunking. Plivo dials the lead, then streams the call audio to
+# this server over a WebSocket, and app/telephony/bridge.py bridges that to the
+# ElevenLabs agent. That needs only these credentials.
+#
+# The alternative (ElevenLabs placing the call itself) requires the number to be
+# registered inside ElevenLabs over a SIP trunk, which on Plivo means Zentrunk —
+# a product that has to be provisioned per-account and was NOT enabled on ours.
+# Hence this path: it works with credentials that already exist.
+PLIVO_AUTH_ID: str | None = os.getenv("PLIVO_AUTH_ID")
+PLIVO_AUTH_TOKEN: str | None = os.getenv("PLIVO_AUTH_TOKEN")
+PLIVO_FROM_NUMBER: str | None = os.getenv("PLIVO_FROM_NUMBER")
+
+# Plivo's webhooks (/calls/answer, /calls/stream) can't carry APP_AUTH_TOKEN, so
+# they authenticate with this shared secret in the query string instead. If
+# PUBLIC_BASE_URL is set and this is empty, those routes are open to anyone who
+# finds the URL — app/main.py's startup check refuses to boot in that state.
+CALL_WEBHOOK_SECRET: str | None = os.getenv("CALL_WEBHOOK_SECRET")
+
+CALL_RING_TIMEOUT_S = _int("CALL_RING_TIMEOUT_S", 30)
+CALL_MAX_DURATION_S = _int("CALL_MAX_DURATION_S", 300)
+
+# On an outbound call the lead's first sound is almost always them answering
+# ("Hello?") — an acknowledgement, not an interruption. Without a grace window
+# that cancels the agent's opening line mid-sentence, and it restarts the
+# greeting from the top. Ported from the sibling project, which hit exactly
+# this. Barge-in is fully active after this window; 0 disables it.
+PLIVO_GREETING_GRACE_MS = _int("PLIVO_GREETING_GRACE_MS", 2500)
+
 # ── ELEVENLABS ────────────────────────────────────────────────────────────────
 ELEVENLABS_API_KEY: str | None = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_WEBHOOK_SECRET: str | None = os.getenv("ELEVENLABS_WEBHOOK_SECRET")
 # Set once an agent exists in the ElevenLabs dashboard / is created via API.
 ELEVENLABS_ONEWAY_AGENT_ID: str | None = os.getenv("ELEVENLABS_ONEWAY_AGENT_ID")
 ELEVENLABS_TWOWAY_AGENT_ID: str | None = os.getenv("ELEVENLABS_TWOWAY_AGENT_ID")
+# Only used if ElevenLabs ever places calls itself (its own SIP-trunk number).
+# The live path does NOT use it: Plivo places the call and app/telephony/
+# bridge.py bridges the audio, so no number is registered inside ElevenLabs.
+# Kept so switching back doesn't need a config change.
 ELEVENLABS_AGENT_PHONE_NUMBER_ID: str | None = os.getenv("ELEVENLABS_AGENT_PHONE_NUMBER_ID")
 
 # ── EMBEDDINGS (OpenAI text-embedding-3-small) ────────────────────────────────

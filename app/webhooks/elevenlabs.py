@@ -31,7 +31,6 @@ from app import redis_client
 from app.config import ELEVENLABS_WEBHOOK_SECRET
 from app.db import calls as calls_db
 from app.db.models import TranscriptTurn
-from app.telephony import worker as telephony_worker
 from app.telephony.elevenlabs_client import construct_webhook_event
 
 router = APIRouter(tags=["Webhooks"])
@@ -73,11 +72,14 @@ async def _handle_post_call_transcription(data: dict) -> None:
         logger.info(f"[webhooks] duplicate transcript for {conversation_id} — skipping")
         return
 
-    # The concurrency slot worker.py acquired before placing this call is
-    # released HERE, not in the worker — "placed" != "finished", and the slot
-    # must stay held for the call's real duration to enforce
-    # MAX_CONCURRENT_CALLS correctly. This is the genuine end of the call.
-    await telephony_worker.release_call_slot()
+    # NOTE: this handler deliberately does NOT release the concurrency slot.
+    # It used to, back when ElevenLabs placed the call and this webhook was
+    # the only signal a call had ended. Now Plivo places the call and
+    # app/telephony/call_routes.py owns slot release (guarded so the stream
+    # end and Plivo's hangup post can't both release). This webhook still
+    # fires for the same conversation, so releasing here as well would
+    # double-release and let the semaphore over-admit past
+    # MAX_CONCURRENT_CALLS.
 
     turns = _map_transcript(data.get("transcript"))
     summary = (data.get("analysis") or {}).get("transcript_summary")
@@ -114,9 +116,8 @@ async def _handle_call_initiation_failure(data: dict) -> None:
     conversation_id = data.get("conversation_id")
     logger.warning(f"[webhooks] call_initiation_failure conversation_id={conversation_id}: "
                     f"{data.get('reason') or data}")
-    # Same reasoning as the transcription path: this is the call's real end,
-    # so the slot worker.py acquired before placing it is released here.
-    await telephony_worker.release_call_slot()
+    # Slot release is owned by app/telephony/call_routes.py — see the note in
+    # _handle_post_call_transcription. Releasing here too would double-release.
     if conversation_id:
         await calls_db.record_transcript(
             el_conversation_id=conversation_id, status="failed", turns=0,

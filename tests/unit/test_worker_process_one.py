@@ -31,6 +31,14 @@ class _FakeRedis:
         self.deleted.extend(keys)
 
 
+def _returns(result):
+    """place_outbound_call is async now (Plivo over httpx) — a plain lambda
+    would hand process_one a coroutine-less object and the await would fail."""
+    async def _placer(**kwargs):
+        return result
+    return _placer
+
+
 def _lead(**overrides):
     defaults = dict(
         lead_id=uuid4(), phone_e164="+919876543210", campaign_id=uuid4(),
@@ -95,7 +103,7 @@ def mocks(monkeypatch):
 
     monkeypatch.setattr(worker, "_ack", fake_ack)
 
-    async def no_preflight_error(agent_id, phone_id):
+    async def no_preflight_error(agent_id):
         return None
 
     monkeypatch.setattr(worker.preflight_module, "preflight", no_preflight_error)
@@ -173,7 +181,7 @@ async def test_preflight_failure_releases_reservation_without_counting_attempt(
 ):
     monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
 
-    async def failing_preflight(agent_id, phone_id):
+    async def failing_preflight(agent_id):
         return "PUBLIC_BASE_URL is unreachable"
 
     monkeypatch.setattr(worker.preflight_module, "preflight", failing_preflight)
@@ -206,66 +214,62 @@ async def test_at_capacity_requeues_instead_of_busy_looping(mocks, monkeypatch):
 async def test_successful_placement_records_attempt_and_creates_call(mocks, monkeypatch):
     monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
 
-    result = SimpleNamespace(success=True, message="ok",
-                             conversation_id="conv_1", call_sid="call_1")
-    monkeypatch.setattr(worker.elevenlabs_client, "place_outbound_call", lambda **kw: result)
+    result = SimpleNamespace(success=True, message="ok", call_uuid="call_1")
+    monkeypatch.setattr(worker.plivo_client, "place_outbound_call", _returns(result))
 
     await worker.process_one(str(mocks.lead.lead_id))
 
     assert mocks.calls["record_dial_attempt"] == [mocks.lead.lead_id]
     assert len(mocks.calls["create_call"]) == 1
-    assert mocks.calls["create_call"][0]["el_conversation_id"] == "conv_1"
-    # Slot ownership transfers to the webhook handler on success — NOT released here.
+    assert mocks.calls["create_call"][0]["provider_call_id"] == "call_1"
+    # Slot ownership transfers to the call routes on success (released when the
+    # stream ends or Plivo posts the hangup) — NOT released here.
     assert "release_slot" not in mocks.calls
 
 
-async def test_oneway_campaign_passes_script_as_dynamic_variable(mocks, monkeypatch):
-    oneway = _campaign(campaign_id=mocks.lead.campaign_id, mode="oneway",
-                       script="This is an AI voice assistant calling about your course.")
-
-    async def get_oneway(cid):
-        return oneway
-
-    monkeypatch.setattr(worker.campaigns_db, "get_campaign", get_oneway)
-    monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
-
-    captured = {}
-
-    def fake_place(**kw):
-        captured.update(kw)
-        return SimpleNamespace(success=True, message="ok",
-                               conversation_id="conv_1", call_sid="call_1")
-
-    monkeypatch.setattr(worker.elevenlabs_client, "place_outbound_call", fake_place)
-
-    await worker.process_one(str(mocks.lead.lead_id))
-
-    assert captured["dynamic_variables"]["script"] == oneway.script
-
-
-async def test_twoway_campaign_never_sends_a_script_dynamic_variable(mocks, monkeypatch):
+async def test_worker_dials_the_lead_and_identifies_it_to_the_answer_url(mocks, monkeypatch):
+    """The worker's whole job at placement is: dial this number, and tell
+    Plivo which lead it is. lead_id travels in the answer URL, and is what
+    lets /calls/stream find the lead and campaign again when the call is
+    answered — get it wrong and the call connects to nothing."""
     monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
     captured = {}
 
-    def fake_place(**kw):
+    async def fake_place(**kw):
         captured.update(kw)
-        return SimpleNamespace(success=True, message="ok",
-                               conversation_id="conv_1", call_sid="call_1")
+        return SimpleNamespace(success=True, message="ok", call_uuid="call_1")
 
-    monkeypatch.setattr(worker.elevenlabs_client, "place_outbound_call", fake_place)
+    monkeypatch.setattr(worker.plivo_client, "place_outbound_call", fake_place)
 
     await worker.process_one(str(mocks.lead.lead_id))
 
-    assert "script" not in captured["dynamic_variables"]
+    assert captured["to_number"] == mocks.lead.phone_e164
+    assert captured["lead_id"] == str(mocks.lead.lead_id)
+
+
+async def test_call_row_starts_without_a_conversation_id(mocks, monkeypatch):
+    """With Plivo placing the call there is no ElevenLabs conversation yet —
+    one is created when the audio bridge connects, and call_routes fills it
+    in then. Writing a placeholder here would collide with the UNIQUE
+    constraint on el_conversation_id across concurrent calls."""
+    monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
+    result = SimpleNamespace(success=True, message="ok", call_uuid="plivo_uuid_1")
+    monkeypatch.setattr(worker.plivo_client, "place_outbound_call", _returns(result))
+
+    await worker.process_one(str(mocks.lead.lead_id))
+
+    created = mocks.calls["create_call"][0]
+    assert created["el_conversation_id"] is None
+    assert created["provider_call_id"] == "plivo_uuid_1"
 
 
 async def test_placement_exception_releases_slot_and_marks_failed(mocks, monkeypatch):
     monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
 
-    def boom(**kw):
-        raise RuntimeError("ElevenLabs API down")
+    async def boom(**kw):
+        raise RuntimeError("Plivo API down")
 
-    monkeypatch.setattr(worker.elevenlabs_client, "place_outbound_call", boom)
+    monkeypatch.setattr(worker.plivo_client, "place_outbound_call", boom)
 
     await worker.process_one(str(mocks.lead.lead_id))
 
@@ -278,9 +282,8 @@ async def test_placement_exception_releases_slot_and_marks_failed(mocks, monkeyp
 async def test_unsuccessful_result_releases_slot_and_marks_failed(mocks, monkeypatch):
     monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
 
-    result = SimpleNamespace(success=False, message="no agent capacity",
-                             conversation_id=None, call_sid=None)
-    monkeypatch.setattr(worker.elevenlabs_client, "place_outbound_call", lambda **kw: result)
+    result = SimpleNamespace(success=False, message="no agent capacity", call_uuid=None)
+    monkeypatch.setattr(worker.plivo_client, "place_outbound_call", _returns(result))
 
     await worker.process_one(str(mocks.lead.lead_id))
 
@@ -299,7 +302,7 @@ async def test_preflight_failure_releases_the_dialing_lock(mocks, monkeypatch):
     r = _FakeRedis()
     monkeypatch.setattr(worker.redis_client, "get_redis", lambda: r)
 
-    async def failing_preflight(agent_id, phone_id):
+    async def failing_preflight(agent_id):
         return "PUBLIC_BASE_URL is unreachable"
 
     monkeypatch.setattr(worker.preflight_module, "preflight", failing_preflight)
@@ -327,10 +330,10 @@ async def test_placement_failure_releases_the_dialing_lock(mocks, monkeypatch):
     r = _FakeRedis()
     monkeypatch.setattr(worker.redis_client, "get_redis", lambda: r)
 
-    def boom(**kw):
-        raise RuntimeError("ElevenLabs API down")
+    async def boom(**kw):
+        raise RuntimeError("Plivo API down")
 
-    monkeypatch.setattr(worker.elevenlabs_client, "place_outbound_call", boom)
+    monkeypatch.setattr(worker.plivo_client, "place_outbound_call", boom)
 
     await worker.process_one(str(mocks.lead.lead_id))
 
@@ -343,9 +346,8 @@ async def test_successful_placement_KEEPS_the_dialing_lock(mocks, monkeypatch):
     r = _FakeRedis()
     monkeypatch.setattr(worker.redis_client, "get_redis", lambda: r)
 
-    result = SimpleNamespace(success=True, message="ok",
-                             conversation_id="conv_1", call_sid="sid_1")
-    monkeypatch.setattr(worker.elevenlabs_client, "place_outbound_call", lambda **kw: result)
+    result = SimpleNamespace(success=True, message="ok", call_uuid="sid_1")
+    monkeypatch.setattr(worker.plivo_client, "place_outbound_call", _returns(result))
 
     await worker.process_one(str(mocks.lead.lead_id))
 
@@ -385,7 +387,7 @@ async def test_unhandled_error_before_dialling_releases_the_lead(mocks, monkeypa
     r = _FakeRedis()
     monkeypatch.setattr(worker.redis_client, "get_redis", lambda: r)
 
-    async def boom(agent_id, phone_id):
+    async def boom(agent_id):
         raise RuntimeError("Postgres went away")
 
     monkeypatch.setattr(worker.preflight_module, "preflight", boom)
@@ -406,9 +408,8 @@ async def test_unhandled_error_after_dialling_never_releases_the_lead(mocks, mon
     phone. The webhook owns the lead from placement onward."""
     monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
 
-    result = SimpleNamespace(success=True, message="ok",
-                             conversation_id="conv_1", call_sid="sid_1")
-    monkeypatch.setattr(worker.elevenlabs_client, "place_outbound_call", lambda **kw: result)
+    result = SimpleNamespace(success=True, message="ok", call_uuid="sid_1")
+    monkeypatch.setattr(worker.plivo_client, "place_outbound_call", _returns(result))
 
     async def boom(**kwargs):
         raise RuntimeError("unique violation on el_conversation_id")
@@ -428,7 +429,7 @@ async def test_lead_is_left_for_the_reaper_when_recovery_itself_fails(mocks, mon
     entry must stay in calls:processing for the reaper instead."""
     monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
 
-    async def boom(agent_id, phone_id):
+    async def boom(agent_id):
         raise RuntimeError("Postgres went away")
 
     async def also_boom(lead_id, status):

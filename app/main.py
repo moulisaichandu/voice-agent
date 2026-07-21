@@ -27,6 +27,7 @@ from app.config import (
     ALLOW_INSECURE_PUBLIC,
     ALLOWED_ORIGINS,
     APP_AUTH_TOKEN,
+    CALL_WEBHOOK_SECRET,
     DATABASE_URL,
     ELEVENLABS_WEBHOOK_SECRET,
     LOG_LEVEL,
@@ -66,6 +67,18 @@ async def lifespan(app: FastAPI):
             "is not. The transcript webhook would accept forged payloads. Set "
             "ELEVENLABS_WEBHOOK_SECRET (from the ElevenLabs webhook dashboard), or "
             "set ALLOW_INSECURE_PUBLIC=1 to deliberately run open (not recommended)."
+        )
+
+    # The Plivo webhooks (/calls/answer, /calls/stream) can't carry
+    # APP_AUTH_TOKEN, so CALL_WEBHOOK_SECRET is the only thing guarding them.
+    # Unguarded on a public URL, anyone who finds it could open an audio
+    # bridge to a paid agent, or feed audio into a call.
+    if PUBLIC_BASE_URL and not CALL_WEBHOOK_SECRET and not ALLOW_INSECURE_PUBLIC:
+        raise RuntimeError(
+            "Refusing to start: PUBLIC_BASE_URL is set but CALL_WEBHOOK_SECRET is "
+            "not. The Plivo call webhooks would be open to the internet. Set "
+            "CALL_WEBHOOK_SECRET to a random string, or set ALLOW_INSECURE_PUBLIC=1 "
+            "to deliberately run open (not recommended)."
         )
 
     # A wildcard CORS origin combined with a real auth token lets any website
@@ -149,11 +162,13 @@ app.add_middleware(
 # ── Routers ───────────────────────────────────────────────────────────────────
 from app.admin.endpoint import router as admin_router  # noqa: E402
 from app.rag.endpoint import router as rag_router  # noqa: E402
+from app.telephony.call_routes import router as call_router  # noqa: E402
 from app.webhooks.elevenlabs import router as elevenlabs_webhook_router  # noqa: E402
 
 app.include_router(rag_router)
 app.include_router(elevenlabs_webhook_router)
 app.include_router(admin_router)
+app.include_router(call_router)
 
 
 @app.get("/health", tags=["Health"])

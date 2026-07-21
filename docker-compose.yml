@@ -16,7 +16,7 @@ services:
       # so a dev machine isn't blocked on getting that one line into .env.
       # NOT a secret: it's a hostname ElevenLabs must reach. The webhook
       # SECRET stays in .env and is never committed.
-      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://kits-drivers-straight-lessons.trycloudflare.com}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://pet-unable-durham-attention.trycloudflare.com}
     # Host port 8091, not 8000: the sibling ai-voice-agent project runs its own
     # server on host:8000 — these are two independent apps and must not collide.
     # Container-internal port stays 8000 (matches the Dockerfile/uvicorn command).

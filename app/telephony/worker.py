@@ -65,15 +65,11 @@ import logging
 from uuid import UUID
 
 from app import redis_client
-from app.config import (
-    DIALING_LOCK_TTL_S,
-    ELEVENLABS_AGENT_PHONE_NUMBER_ID,
-    MAX_CONCURRENT_CALLS,
-)
+from app.config import DIALING_LOCK_TTL_S, MAX_CONCURRENT_CALLS
 from app.db import calls as calls_db
 from app.db import campaigns as campaigns_db
 from app.db import leads as leads_db
-from app.telephony import elevenlabs_client
+from app.telephony import plivo_client
 from app.telephony import preflight as preflight_module
 
 logger = logging.getLogger(__name__)
@@ -201,9 +197,7 @@ async def process_one(lead_id: str) -> None:
             return
         lock_key = f"dialing:{lead.phone_e164}"
 
-        reachability_error = await preflight_module.preflight(
-            campaign.agent_id, ELEVENLABS_AGENT_PHONE_NUMBER_ID or "",
-        )
+        reachability_error = await preflight_module.preflight(campaign.agent_id)
         if reachability_error:
             logger.error(f"[worker] preflight failed, not dialing: {reachability_error}")
             # Release the dialing lock: it exists to stop the same number
@@ -233,20 +227,15 @@ async def process_one(lead_id: str) -> None:
         # (successful placement) or release it itself (any failure).
         slot_held = True
         await leads_db.record_dial_attempt(lead.lead_id)
-        # One-way campaigns carry their message as campaigns.script — passed
-        # through as a dynamic variable, NOT read/spoken by this server (no
-        # audio flows through it). The ElevenLabs one-way agent's first
-        # message must reference {{script}} for this to actually be said;
-        # that's an agent-dashboard configuration step, not code here.
-        dynamic_variables = {"lead_id": str(lead.lead_id)}
-        if campaign.mode == "oneway" and campaign.script:
-            dynamic_variables["script"] = campaign.script
+        # Plivo dials; it then streams the call audio to /calls/stream, which
+        # bridges it to the ElevenLabs agent (app/telephony/bridge.py). The
+        # agent's dynamic variables — including a one-way campaign's script —
+        # are supplied there, at bridge time, because that is where the
+        # conversation actually starts.
         try:
-            result = elevenlabs_client.place_outbound_call(
-                agent_id=campaign.agent_id,
-                agent_phone_number_id=ELEVENLABS_AGENT_PHONE_NUMBER_ID or "",
+            result = await plivo_client.place_outbound_call(
                 to_number=lead.phone_e164,
-                dynamic_variables=dynamic_variables,
+                lead_id=str(lead.lead_id),
             )
         except Exception as exc:
             # No call connected, so the dialing lock must not linger either —
@@ -262,7 +251,7 @@ async def process_one(lead_id: str) -> None:
             reserved = False
             return
 
-        if not result.success or not result.conversation_id:
+        if not result.success:
             await release_call_slot()
             slot_held = False
             await r.delete(lock_key)
@@ -278,12 +267,15 @@ async def process_one(lead_id: str) -> None:
         # let a later tick dial someone who is already on the phone.
         call_placed = True
 
+        # el_conversation_id is NULL here on purpose: with Plivo placing the
+        # call there is no ElevenLabs conversation yet — one is created when
+        # the audio bridge connects, and call_routes.py fills it in then.
         await calls_db.create_call(
             lead_id=lead.lead_id, campaign_id=campaign.campaign_id, mode=campaign.mode,
-            el_conversation_id=result.conversation_id, provider_call_id=result.call_sid,
+            el_conversation_id=None, provider_call_id=result.call_uuid,
         )
-        # The slot is now owned by the webhook handler, released when the
-        # call's real outcome is recorded — not here.
+        # The slot is now owned by the call routes, released when the call
+        # actually ends (stream closes, or Plivo posts the hangup) — not here.
 
     except Exception:
         # Module docstring point 7. Without this, ANY unhandled error (a

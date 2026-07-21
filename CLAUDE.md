@@ -10,8 +10,10 @@ Plivo voice agent for the same business. Do not touch that repo from here.
 
 ## Stack (do not swap without asking)
 FastAPI (3.12) · ElevenLabs Agents (hosted LLM, no separate LLM key) · Plivo
-(connected to ElevenLabs via SIP trunk — the SDK has no native Plivo
-integration, only exotel/twilio/sip_trunk; see app/telephony/elevenlabs_client.py)
+(STANDARD Voice API: Plivo dials and streams the call audio to /calls/stream,
+and app/telephony/bridge.py bridges it to the ElevenLabs agent WebSocket. NOT
+SIP trunking — that needs Zentrunk, which isn't provisioned on our account.
+Both ends are ulaw_8000, so audio is a passthrough with no transcoding)
 · Supabase (Postgres+pgvector, accessed via raw SQL/asyncpg — NOT supabase-py
 for CRUD) · Redis · APScheduler · Docker. Async everywhere.
 

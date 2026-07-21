@@ -84,7 +84,10 @@ async def test_handle_post_call_transcription_maps_roles_and_records(fake_redis,
 
     # The concurrency slot worker.py acquired before placing this call must
     # be released here — this IS the call's real end.
-    assert len(fake_redis.eval_calls) == 1
+    # Slot release moved to app/telephony/call_routes.py when Plivo took over
+    # placing the call: this webhook still fires for the same conversation,
+    # so releasing here too would double-release and break the concurrency cap.
+    assert fake_redis.eval_calls == []
 
 
 async def test_call_initiation_failure_releases_slot_and_records_failure(fake_redis, monkeypatch):
@@ -98,7 +101,7 @@ async def test_call_initiation_failure_releases_slot_and_records_failure(fake_re
 
     await wh._handle_call_initiation_failure({"conversation_id": "conv_2"})
 
-    assert len(fake_redis.eval_calls) == 1     # slot released
+    assert fake_redis.eval_calls == []        # slot release is call_routes' job now
     assert recorded["el_conversation_id"] == "conv_2"
     assert recorded["status"] == "failed"
 
@@ -119,7 +122,10 @@ async def test_duplicate_conversation_id_is_not_reprocessed(fake_redis, monkeypa
     assert calls["n"] == 1
     # The slot must be released exactly once too — a retry releasing it again
     # would let the concurrency semaphore drift low over time.
-    assert len(fake_redis.eval_calls) == 1
+    # Slot release moved to app/telephony/call_routes.py when Plivo took over
+    # placing the call: this webhook still fires for the same conversation,
+    # so releasing here too would double-release and break the concurrency cap.
+    assert fake_redis.eval_calls == []
     assert "sheets:writeback:queue" not in fake_redis.lists or \
            len(fake_redis.lists["sheets:writeback:queue"]) == 1
 

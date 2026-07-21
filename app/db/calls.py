@@ -44,6 +44,40 @@ async def create_call(
     return _row_to_call(row)
 
 
+async def set_conversation_and_record(
+    *, lead_id: UUID, el_conversation_id: str, status: str, turns: int,
+    transcript: list[TranscriptTurn], summary: str | None,
+) -> Call | None:
+    """Attach an ElevenLabs conversation_id to this lead's most recent call row
+    and record the transcript, in one statement.
+
+    Needed by the audio-bridge path (app/telephony/call_routes.py): with Plivo
+    placing the call, the row is created at dial time when no ElevenLabs
+    conversation exists yet — that id only appears once the bridge connects.
+    record_transcript() can't be used because it looks the row up BY
+    conversation_id, which is precisely what is still missing.
+
+    Scoped to the newest call for the lead so a retry updates the attempt it
+    belongs to rather than an older one.
+    """
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        """
+        update calls
+        set el_conversation_id = $2, status = $3, turns = $4,
+            transcript = $5::jsonb, summary = $6, ended_at = now()
+        where call_id = (
+            select call_id from calls where lead_id = $1
+            order by created_at desc limit 1
+        )
+        returning *
+        """,
+        lead_id, el_conversation_id, status, turns,
+        json.dumps([t.model_dump() for t in transcript]), summary,
+    )
+    return _row_to_call(row) if row else None
+
+
 async def get_latest_call_for_lead(lead_id: UUID) -> Call | None:
     """Used by app/sheets/writeback.py — the most recent call attempt is what
     gets written back to the lead's Sheet row."""

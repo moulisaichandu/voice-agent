@@ -1,99 +1,100 @@
 """telephony/preflight.py — Validate the whole chain BEFORE dialling a campaign.
 
-NOT a straight port of ai-voice-agent's calling.preflight(): the failure
-surface here is structurally different. There, Plivo answers a call directly
-and fetches our own answer URL — a dead tunnel meant every call rang and
-dropped instantly. Here, the phone provider (Plivo, connected via a SIP trunk)
-talks directly to ElevenLabs, not to this server, so a dead PUBLIC_BASE_URL
-does NOT stop a call from connecting — it silently breaks two things instead:
-(a) the two-way agent's /rag/search tool calls, so every course question gets
-the "no relevant material" fallback, and (b) the transcript webhook, which
-degrades to ElevenLabs' own retry-then-give-up rather than failing loud on our
-side. Checked here, once per campaign_tick batch, so those failure modes are
-caught before a whole campaign runs half-blind rather than discovered
-lead-by-lead (or not at all, since neither failure mode stops calls from
-connecting).
+With Plivo placing the call and streaming the audio here, a reachable
+PUBLIC_BASE_URL is now LOAD-BEARING, not merely nice to have. Plivo fetches
+the answer URL from the public internet the instant the lead picks up; if it
+can't reach us, the lead's phone still RINGS and the call is cut the moment
+they answer — with nothing in our logs, because the request never arrived.
+That is the exact silent failure the sibling ai-voice-agent project documents,
+and it costs real calls to real people.
 
-Also checks the specific agent_id/agent_phone_number_id the campaign about to
-run will use — so a typo'd or deleted agent fails ONCE, loudly, instead of
-identically on every lead in the campaign.
+So this round-trips the REAL answer URL: one request proves the tunnel is up,
+this server is up, the webhook token matches, and <Stream> XML is served.
+
+Checked once per campaign_tick batch rather than per lead, so a broken chain
+fails once, loudly, instead of identically on every lead.
 """
 
 from __future__ import annotations
 
 import httpx
 
-from app.config import ELEVENLABS_API_KEY, PUBLIC_BASE_URL
-from app.telephony.elevenlabs_client import agent_exists, phone_number_exists
+from app.config import (
+    CALL_WEBHOOK_SECRET,
+    ELEVENLABS_API_KEY,
+    PLIVO_AUTH_ID,
+    PLIVO_AUTH_TOKEN,
+    PLIVO_FROM_NUMBER,
+    PUBLIC_BASE_URL,
+)
+from app.telephony.elevenlabs_client import agent_exists
 
 _HEALTH_CHECK_TIMEOUT_S = 10.0
 
 
-async def preflight(agent_id: str, agent_phone_number_id: str) -> str | None:
-    """Returns None if everything checks out; otherwise a human-readable
-    reason not to dial — mirrors ai-voice-agent's calling.preflight() contract
-    (None = go, str = don't, with the reason)."""
+async def preflight(agent_id: str) -> str | None:
+    """None = safe to dial; a string = the human-readable reason not to.
+
+    Never raises: an exception here would abort process_one mid-reservation
+    instead of cleanly declining to dial (see worker.py's docstring point 7).
+    """
     if not ELEVENLABS_API_KEY:
-        return ("ELEVENLABS_API_KEY is not set, so no call can be placed. Set it "
-                "in .env.")
+        return "ELEVENLABS_API_KEY is not set, so no agent can answer. Set it in .env."
 
-    if PUBLIC_BASE_URL:
-        url = f"{PUBLIC_BASE_URL.rstrip('/')}/health"
-        try:
-            async with httpx.AsyncClient(timeout=_HEALTH_CHECK_TIMEOUT_S) as client:
-                resp = await client.get(url)
-        except httpx.RequestError as exc:
-            return (f"PUBLIC_BASE_URL ({PUBLIC_BASE_URL}) is unreachable "
-                    f"({type(exc).__name__}). Two-way calls would get no course "
-                    "answers (the /rag/search tool can't be reached) and transcript "
-                    "webhooks would degrade to retry-then-fail. Is the tunnel "
-                    "(ngrok/cloudflared) running?")
-        if resp.status_code != 200:
-            return (f"PUBLIC_BASE_URL ({PUBLIC_BASE_URL}) returned HTTP "
-                    f"{resp.status_code} instead of 200 at /health. Something other "
-                    "than this app is answering, or it's misconfigured.")
-    else:
-        return ("PUBLIC_BASE_URL is not set. Two-way calls need it for the "
-                "/rag/search tool and the transcript webhook to reach this server.")
+    if not (PLIVO_AUTH_ID and PLIVO_AUTH_TOKEN):
+        return ("PLIVO_AUTH_ID / PLIVO_AUTH_TOKEN are not set, so no call can be "
+                "placed. These are Plivo's REST API credentials.")
 
-    # Blank ids are rejected BEFORE the API is consulted. A GET for an empty
-    # id degenerates to the collection endpoint (".../phone-numbers/"), which
-    # returns 200 — so phone_number_exists("") answers True and an unset
-    # ELEVENLABS_AGENT_PHONE_NUMBER_ID sails through the very check meant to
-    # catch it. Observed live: the dial then went out and failed at ElevenLabs
-    # with "Document with id  not found", burning an attempt per lead for a
-    # call that never had any chance of connecting. An unset env var is the
-    # most likely misconfiguration there is, so it must fail here, cheaply.
+    if not PLIVO_FROM_NUMBER:
+        return ("PLIVO_FROM_NUMBER is not set — there is no number to dial from. "
+                "Use the E.164 number you own in Plivo, e.g. +918035383564.")
+
     if not agent_id or not agent_id.strip():
-        return ("No agent_id is set for this campaign. Set campaigns.agent_id "
-                "(admin/seed) to a real ElevenLabs agent id.")
+        return ("No agent_id is set for this campaign. Set campaigns.agent_id to a "
+                "real ElevenLabs agent id.")
 
-    if not agent_phone_number_id or not agent_phone_number_id.strip():
-        return ("ELEVENLABS_AGENT_PHONE_NUMBER_ID is not set, so there is no "
-                "number to dial from. Register your number in ElevenLabs (for a "
-                "Plivo number, via a SIP trunk) and put the resulting id in .env.")
+    if not PUBLIC_BASE_URL:
+        return ("PUBLIC_BASE_URL is not set, so Plivo has no way to reach this "
+                "server. Every call would ring and then drop the instant it was "
+                "answered. Set it to the public HTTPS URL of this backend.")
 
-    # These two hit the ElevenLabs API, so they can fail for reasons that are
-    # neither "exists" nor "doesn't exist" — a revoked key, a rate limit, an
-    # outage. This function's contract is None = go, str = don't-dial-because,
-    # so those become a reason rather than an exception: letting them escape
-    # would abort process_one mid-reserve instead of cleanly declining to
-    # dial (see worker.py's docstring point 7 for why that matters).
+    # Round-trip the real answer URL rather than /health: this validates the
+    # webhook token and the XML too, which /health cannot.
+    url = (f"{PUBLIC_BASE_URL.rstrip('/')}/calls/answer"
+           f"?token={CALL_WEBHOOK_SECRET or ''}&lead=preflight")
+    try:
+        async with httpx.AsyncClient(timeout=_HEALTH_CHECK_TIMEOUT_S) as client:
+            resp = await client.post(url)
+    except httpx.RequestError as exc:
+        return (f"PUBLIC_BASE_URL ({PUBLIC_BASE_URL}) is unreachable "
+                f"({type(exc).__name__}). Plivo could not fetch the answer URL, so "
+                "every call would ring and drop on answer. Is the tunnel running?")
+
+    if resp.status_code == 403:
+        return ("The answer URL rejected our own token (HTTP 403). "
+                "CALL_WEBHOOK_SECRET doesn't match what this server is running "
+                "with — recreate the container after changing it. Plivo's calls "
+                "would be refused the same way.")
+    if resp.status_code != 200:
+        hint = (" That's what a dead or offline tunnel returns."
+                if resp.status_code in (404, 502, 503, 504) else "")
+        return (f"The answer URL returned HTTP {resp.status_code} instead of 200."
+                f"{hint} Plivo needs a 200 with <Stream> XML, so calls would drop "
+                f"on answer. URL: {PUBLIC_BASE_URL}/calls/answer")
+    if "<Stream" not in resp.text:
+        return ("The answer URL returned 200 but no <Stream> XML — something other "
+                "than this app is answering on that URL (a tunnel error page, or "
+                f"another service?). URL: {PUBLIC_BASE_URL}/calls/answer")
+
+    # Cheapest last: this is the only check that costs an ElevenLabs API call.
     try:
         if not agent_exists(agent_id):
             return (f"ElevenLabs agent_id {agent_id!r} was not found. Check "
-                    "ELEVENLABS_ONEWAY_AGENT_ID / ELEVENLABS_TWOWAY_AGENT_ID in .env, "
-                    "or whether the agent was deleted in the ElevenLabs dashboard. "
-                    "(A voice id is not an agent id — they look similar.)")
-
-        if not phone_number_exists(agent_phone_number_id):
-            return (f"ElevenLabs agent_phone_number_id {agent_phone_number_id!r} was "
-                    "not found. Check ELEVENLABS_AGENT_PHONE_NUMBER_ID in .env, or "
-                    "whether the number was unlinked in the ElevenLabs dashboard.")
+                    "campaigns.agent_id and ELEVENLABS_{ONEWAY,TWOWAY}_AGENT_ID in "
+                    ".env, or whether the agent was deleted. (A voice id is not an "
+                    "agent id — they look similar.)")
     except Exception as exc:
-        return (f"Could not verify the agent/phone number with ElevenLabs "
-                f"({type(exc).__name__}: {exc}). Not dialling while the platform's "
-                "state is unknown — a call placed against an unverified agent can't "
-                "be reasoned about.")
+        return (f"Could not verify the agent with ElevenLabs ({type(exc).__name__}: "
+                f"{exc}). Not dialling while the platform's state is unknown.")
 
     return None

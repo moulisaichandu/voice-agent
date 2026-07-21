@@ -81,30 +81,28 @@ async def lead(campaign):
 
 
 def _patch_dial_path(monkeypatch):
-    """Mock ONLY the external boundaries: ElevenLabs placement + preflight.
+    """Mock ONLY the external boundaries: Plivo placement + preflight.
     Everything else (Redis, Postgres, all guards) stays real.
 
-    conversation_id must be globally unique per placement: calls has a UNIQUE
-    constraint on it and this dev database persists across tests, so a fixed
-    prefix would collide between test runs (and it did — the constraint
-    correctly caught it).
+    Placement is async now — Plivo's REST API over httpx — so the stand-in
+    must be a coroutine function, not a plain callable.
     """
-    async def no_preflight_error(agent_id, phone_id):
+    async def no_preflight_error(agent_id):
         return None
 
     monkeypatch.setattr(worker.preflight_module, "preflight", no_preflight_error)
-    monkeypatch.setattr(worker, "ELEVENLABS_AGENT_PHONE_NUMBER_ID", "phone_test")
 
     placed = []
 
-    def fake_place(**kwargs):
+    async def fake_place(**kwargs):
         placed.append(kwargs)
-        return SimpleNamespace(
-            success=True, message="ok",
-            conversation_id=f"conv_{uuid.uuid4().hex}", call_sid=f"sid_{uuid.uuid4().hex[:8]}",
-        )
+        # Plivo returns its own call uuid; the ElevenLabs conversation_id does
+        # not exist until the audio bridge connects, which is why the calls row
+        # is created with el_conversation_id NULL.
+        return SimpleNamespace(success=True, message="ok",
+                               call_uuid=f"plivo_{uuid.uuid4().hex[:12]}")
 
-    monkeypatch.setattr(worker.elevenlabs_client, "place_outbound_call", fake_place)
+    monkeypatch.setattr(worker.plivo_client, "place_outbound_call", fake_place)
     return placed
 
 
@@ -131,7 +129,10 @@ async def test_full_pipeline_enqueue_reserve_dial(campaign, lead, monkeypatch):
     await worker.process_one(reserved)
 
     assert len(placed) == 1
-    assert placed[0]["dynamic_variables"] == {"lead_id": str(lead.lead_id)}
+    # lead_id rides in Plivo's answer URL — it is what lets /calls/stream find
+    # this lead and campaign again when the call is answered.
+    assert placed[0]["lead_id"] == str(lead.lead_id)
+    assert placed[0]["to_number"] == lead.phone_e164
     refetched = await leads_db.get_lead(lead.lead_id)
     assert refetched.status == "calling"
     assert refetched.attempts == 1
@@ -260,8 +261,14 @@ async def test_concurrency_cap_defers_the_second_lead(campaign, monkeypatch):
 
 async def test_transcript_webhook_records_and_queues_writeback(campaign, lead, monkeypatch):
     """The real webhook handler against the real DB + Redis: records the
-    transcript, releases the concurrency slot, and queues the Sheets
-    write-back."""
+    transcript and queues the Sheets write-back.
+
+    Follows the real ordering under the Plivo-bridge architecture: the worker
+    creates the call row with el_conversation_id NULL (no ElevenLabs
+    conversation exists at dial time), the audio bridge assigns the id when it
+    connects, and only then can this webhook — which is keyed by
+    conversation_id — find the row to enrich with ElevenLabs' own summary.
+    """
     from app.webhooks import elevenlabs as wh
 
     placed = _patch_dial_path(monkeypatch)
@@ -271,7 +278,14 @@ async def test_transcript_webhook_records_and_queues_writeback(campaign, lead, m
     assert len(placed) == 1
 
     call = await calls_db.get_latest_call_for_lead(lead.lead_id)
-    conversation_id = call.el_conversation_id
+    assert call.el_conversation_id is None  # not known until the bridge connects
+
+    # What app/telephony/call_routes.py does when the bridge ends.
+    conversation_id = f"conv_{uuid.uuid4().hex}"
+    await calls_db.set_conversation_and_record(
+        lead_id=lead.lead_id, el_conversation_id=conversation_id,
+        status="done", turns=0, transcript=[], summary=None,
+    )
 
     await wh._handle_post_call_transcription({
         "conversation_id": conversation_id,

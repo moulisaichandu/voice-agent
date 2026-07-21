@@ -7,13 +7,18 @@ conversation, answering course questions from RAG over the course documents).
 Transcripts are written back to the lead's Sheet row.
 
 Built on the ElevenLabs Agents Platform (which owns the hard real-time part:
-STT + LLM + cloned TTS + turn-taking) with a Plivo number for India telephony,
-connected to ElevenLabs via a SIP trunk (the ElevenLabs SDK has no native
-Plivo integration — only `exotel`, `twilio`, and generic `sip_trunk`; see
-`app/telephony/elevenlabs_client.py`). This backend is the orchestration
-layer: it syncs leads, enforces India calling rules, paces campaigns,
-receives transcript webhooks, and writes results back. **No audio flows
-through this server** — only control messages and text.
+STT + LLM + cloned TTS + turn-taking) with a Plivo number for India telephony.
+
+**Plivo places the call using its standard Voice API**, then streams the call
+audio to this server, which bridges it to the ElevenLabs agent's WebSocket
+(`app/telephony/bridge.py`). Both ends speak G.711 μ-law at 8 kHz, so the
+audio is a straight passthrough with no transcoding — that is what the
+`ulaw_8000` rule is for. This needs only Plivo's ordinary API credentials;
+SIP trunking (Zentrunk) is **not** required.
+
+Beyond the audio bridge, this backend is the orchestration layer: it syncs
+leads, enforces India calling rules, paces campaigns, records transcripts, and
+writes results back.
 
 > Sibling project: `../ai-voice-agent/` is a **separate, working** OpenAI
 > Realtime + Plivo voice agent for the same business (Plivo directly, not via
@@ -32,14 +37,15 @@ Google Sheet ──sync──> Supabase (Postgres + pgvector) <──── RAG 
                       campaign pacing)                            │
                             │ enqueue                             │
                             ▼                                     │
-                       Redis queue ──> Call worker ──────> ElevenLabs Agents
-                                                                  │
-                                                       Plivo (SIP │ (India, DLT,
-                                                        trunk)    │  140-series)
-                                                                  ▼
-                                                             Lead's phone
-                                                                  │
-        Sheet row  <──write-back──  Supabase  <──transcript webhook┘
+                       Redis queue ──> Call worker
+                                            │ Plivo Voice API (calls.create)
+                                            ▼
+                                       Lead's phone
+                                            │ audio (μ-law 8k) over WebSocket
+                                            ▼
+                              /calls/stream ──> bridge.py <──> ElevenLabs agent
+                                            │
+        Sheet row  <──write-back──  Supabase ┘  (transcript, from the bridge)
 ```
 
 ## Quick start (local dev, no cloud accounts needed)
