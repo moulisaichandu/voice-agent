@@ -77,7 +77,8 @@ async def _connect(url: str, headers: dict[str, str]) -> Any:
         return await websockets.connect(url, extra_headers=headers, max_size=None)
 
 
-def _session_update(*, lead_name: str | None, script: str | None) -> dict:
+def _session_update(*, lead_name: str | None, script: str | None,
+                    language_style: str | None) -> dict:
     """The session frame sent immediately after the socket opens.
 
     No tools and no input transcription: a one-way call has nothing to look up
@@ -101,7 +102,9 @@ def _session_update(*, lead_name: str | None, script: str | None) -> dict:
         "type": "session.update",
         "session": {
             "type": "realtime",
-            "instructions": openai_prompts.one_way_instructions(lead_name, script),
+            "instructions": openai_prompts.one_way_instructions(
+                lead_name, script, language_style=language_style,
+            ),
             "output_modalities": ["audio"],
             "audio": {"input": input_cfg, "output": output_cfg},
         },
@@ -161,6 +164,10 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
             await oa.send(json.dumps(_session_update(
                 lead_name=variables.get("lead_name"),
                 script=variables.get("script"),
+                # Put here by call_routes._call_language() — the exact style
+                # text for te vs tinglish, so this backend's persona actually
+                # differs by register instead of one hardcoded rule for both.
+                language_style=variables.get("language_style"),
             )))
             # One-way: ask for the message immediately. Nothing else will —
             # with turn detection off the model waits for an explicit cue.

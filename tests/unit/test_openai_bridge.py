@@ -17,6 +17,7 @@ import json
 
 import pytest
 
+from app import languages
 from app.telephony import openai_bridge, openai_prompts
 
 _AUDIO_B64 = base64.b64encode(b"\xff" * 640).decode()
@@ -287,3 +288,79 @@ def test_the_prompt_survives_a_campaign_with_no_script_or_name():
     instructions = openai_prompts.one_way_instructions(None, "   ")
     assert "MESSAGE TO DELIVER" not in instructions
     assert "You are calling" not in instructions
+
+
+# ── the language register: 'te' vs 'tinglish' must actually differ ──────────
+#
+# app/languages.py defines two distinct registers with two distinct style
+# texts. Both used to route through one hardcoded _LANGUAGE_RULE that
+# happened to permit English mixing — so pure Telugu wrongly invited mixing,
+# and Tinglish was indistinguishable from it. The operator picked two
+# different things and got one.
+
+def test_pure_telugu_does_not_invite_english_mixing():
+    instructions = openai_prompts.one_way_instructions(
+        None, None, language_style=languages.style("te")
+    )
+    lowered = instructions.lower()
+    assert "do not switch to english" in lowered
+    assert "may mix" not in lowered and "keep these" not in lowered
+
+
+def test_tinglish_keeps_everyday_english_words_in_english():
+    instructions = openai_prompts.one_way_instructions(
+        None, None, language_style=languages.style("tinglish")
+    )
+    lowered = instructions.lower()
+    assert "course" in lowered and "fees" in lowered and "certificate" in lowered
+
+
+def test_pure_telugu_and_tinglish_produce_different_instructions():
+    te = openai_prompts.one_way_instructions(None, None, language_style=languages.style("te"))
+    tinglish = openai_prompts.one_way_instructions(
+        None, None, language_style=languages.style("tinglish")
+    )
+    assert te != tinglish
+
+
+def test_hindi_stays_forbidden_regardless_of_register():
+    """REGRESSION guard for a real observed failure (the sibling's model
+    drifted into Hindi mid-call) — must survive no matter which register the
+    LANGUAGE rule is built from, including the no-style fallback."""
+    for style in (None, languages.style("te"), languages.style("tinglish")):
+        assert "Never use Hindi" in openai_prompts.one_way_instructions(
+            None, None, language_style=style
+        )
+
+
+def test_disclosure_and_meaning_rules_survive_in_both_registers():
+    """The other two real-observed-failure rules must not get lost when the
+    LANGUAGE rule becomes an input instead of a constant."""
+    for style in (languages.style("te"), languages.style("tinglish")):
+        instructions = openai_prompts.one_way_instructions(
+            "Asha", "Course starts Monday.", language_style=style
+        )
+        lowered = instructions.lower()
+        assert "first sentence" in lowered and "ai" in lowered
+        assert "meaning to convey" in lowered or "convey its meaning" in lowered
+
+
+async def test_the_language_style_reaches_the_session_instructions(bridged):
+    """Wiring proof: call_routes._call_language() puts the resolved register's
+    style text in dynamic_variables['language_style'] — this backend must
+    actually use it rather than a hardcoded rule. A unique marker, not real
+    style prose, so this fails for the right reason if the style is ignored
+    (the old hardcoded rule already contained real words like 'certificate')."""
+    oa = _FakeOpenAIWS([_audio_delta()])
+    bridged(oa)
+
+    await asyncio.wait_for(
+        openai_bridge.bridge(
+            _FakePlivoWS(), agent_id="x", lead_id="l", language="te", one_way=True,
+            dynamic_variables={"language_style": "ZZZ-MARKER-STYLE-ZZZ"},
+        ),
+        timeout=5,
+    )
+
+    instructions = _session(oa)["session"]["instructions"]
+    assert "ZZZ-MARKER-STYLE-ZZZ" in instructions
