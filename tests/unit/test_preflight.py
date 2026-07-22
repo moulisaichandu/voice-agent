@@ -191,18 +191,25 @@ async def test_preflight_passes_with_no_language_requested(monkeypatch):
 
 
 async def test_preflight_passes_when_the_agent_supports_the_language(monkeypatch):
+    """Hindi, not Telugu: Telugu no longer reaches this ElevenLabs branch at
+    all (it routes to the OpenAI Realtime backend — see the backend-split
+    tests below), so the ElevenLabs-side happy path is pinned with a language
+    that actually stays on this backend."""
     _configured(monkeypatch)
     _support(monkeypatch)
-    assert await pf.preflight("agent_1", "te") is None
+    assert await pf.preflight("agent_1", "hi") is None
 
 
 async def test_preflight_blocks_when_the_override_is_disabled(monkeypatch):
     """Overrides are off by default and ElevenLabs raises when one arrives
     unannounced — every call in the campaign would fail. Say which box to
-    tick, once, instead of failing N calls."""
+    tick, once, instead of failing N calls.
+
+    Hindi, not Telugu: Telugu no longer reaches this ElevenLabs branch at all
+    (see the backend-split tests below)."""
     _configured(monkeypatch)
     _support(monkeypatch, override_allowed=False)
-    result = await pf.preflight("agent_1", "te")
+    result = await pf.preflight("agent_1", "hi")
     assert result and "Security" in result
 
 
@@ -216,13 +223,19 @@ async def test_preflight_blocks_when_the_language_is_not_on_the_agent(monkeypatc
     assert result and "Additional Languages" in result
 
 
-async def test_preflight_blocks_telugu_on_a_v2_model(monkeypatch):
+async def test_the_v3_model_gate_still_fires_for_whatever_language_needs_it(monkeypatch):
     """REGRESSION for the real failure this feature was built around: Flash
-    v2.5's 32 languages don't include Telugu, so the agent produced garbled
-    audio and fell back to English. Invisible from the outside."""
+    v2.5's 32 languages don't include Telugu, so an ElevenLabs agent produced
+    garbled audio and fell back to English. Telugu itself no longer reaches
+    this branch at all any more — it now dials on the OpenAI Realtime backend
+    instead (see the backend-split tests below), so this pins the SAME gate
+    with V3_ONLY_ISO forced onto a still-ElevenLabs-backed language, proving
+    the check itself (not just Telugu's specific escape from it) is intact
+    for whatever language it names next."""
     _configured(monkeypatch)
     _support(monkeypatch, tts_model="eleven_flash_v2_5")
-    result = await pf.preflight("agent_1", "te")
+    monkeypatch.setattr(pf.languages_module, "V3_ONLY_ISO", frozenset({"hi"}))
+    result = await pf.preflight("agent_1", "hi")
     assert result and "v3" in result
 
 
@@ -238,14 +251,17 @@ async def test_a_language_lookup_failure_does_not_block_the_campaign(monkeypatch
     """An unreachable or changed API must not become a dial-stopping outage:
     the language check is an EXTRA guard, and the call can still succeed if
     the agent happens to be configured correctly. Every other preflight check
-    still applies."""
+    still applies.
+
+    Hindi, not Telugu: Telugu no longer reaches this ElevenLabs branch at all
+    (see the backend-split tests below)."""
     _configured(monkeypatch)
 
     def boom(agent_id):
         raise RuntimeError("ElevenLabs API changed")
 
     monkeypatch.setattr(pf, "agent_language_support", boom)
-    assert await pf.preflight("agent_1", "te") is None
+    assert await pf.preflight("agent_1", "hi") is None
 
 
 # ── the message must not send an operator after a setting that cannot exist ──
@@ -255,8 +271,15 @@ async def test_an_unsupported_language_says_so_instead_of_naming_a_setting(monke
     Languages in the agent's settings" for EVERY unconfigured language —
     including Telugu, which ElevenLabs does not offer at all. The operator
     went hunting in the dashboard for an option that cannot exist and
-    reasonably concluded they were doing it wrong, not that the tool was."""
+    reasonably concluded they were doing it wrong, not that the tool was.
+
+    Telugu itself no longer reaches this ElevenLabs branch at all (it now
+    routes to the OpenAI Realtime backend — see the backend-split tests
+    below), so backend_for_iso is forced here to keep exercising this exact
+    wording logic on the ISO it was written for."""
     _configured(monkeypatch)
+    monkeypatch.setattr(pf.languages_module, "backend_for_iso",
+                        lambda iso: pf.languages_module.ELEVENLABS)
     _support(monkeypatch, languages={"en", "hi"})
     result = await pf.preflight("agent_1", "te")
     assert result is not None
@@ -274,3 +297,42 @@ async def test_a_supported_but_unconfigured_language_still_names_the_setting(mon
     result = await pf.preflight("agent_1", "hi")
     assert result is not None
     assert "Additional Languages" in result
+
+
+# ── the OpenAI backend has entirely different prerequisites ──────────────────
+#
+# For an OpenAI-backed call every one of the ElevenLabs questions above is
+# meaningless — there is no agent, no language preset, no override switch —
+# and running them would refuse every Telugu campaign for a reason unrelated
+# to whether it can dial.
+
+async def test_a_telugu_campaign_does_not_ask_elevenlabs_anything(monkeypatch):
+    """Telugu never touches ElevenLabs. Asking it about an agent that isn't
+    involved would refuse every Telugu campaign for a reason that has nothing
+    to do with why it can or can't dial."""
+    _configured(monkeypatch)
+    monkeypatch.setattr(pf, "OPENAI_API_KEY", "sk-test")
+
+    def boom(agent_id):
+        raise AssertionError("must not consult ElevenLabs for an OpenAI-backed call")
+
+    monkeypatch.setattr(pf, "agent_language_support", boom)
+    assert await pf.preflight("agent_1", "te") is None
+
+
+async def test_a_telugu_campaign_needs_an_openai_key(monkeypatch):
+    _configured(monkeypatch)
+    monkeypatch.setattr(pf, "OPENAI_API_KEY", None)
+    reason = await pf.preflight("agent_1", "te")
+    assert reason is not None
+    assert "OPENAI_API_KEY" in reason
+
+
+async def test_hindi_still_runs_the_elevenlabs_checks(monkeypatch):
+    """The other side of the branch: an ElevenLabs-backed language must keep
+    every check it had."""
+    _configured(monkeypatch)
+    _support(monkeypatch, override_allowed=False)
+    reason = await pf.preflight("agent_1", "hi")
+    assert reason is not None
+    assert "Security" in reason

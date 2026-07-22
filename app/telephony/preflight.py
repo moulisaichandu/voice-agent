@@ -26,6 +26,7 @@ from app import languages as languages_module
 from app.config import (
     CALL_WEBHOOK_SECRET,
     ELEVENLABS_API_KEY,
+    OPENAI_API_KEY,
     PLIVO_AUTH_ID,
     PLIVO_AUTH_TOKEN,
     PLIVO_FROM_NUMBER,
@@ -113,6 +114,22 @@ async def preflight(agent_id: str, language: str | None = None) -> str | None:
     # when a language was actually requested. An 'auto' campaign overrides
     # nothing and so cannot fail here — it must not gain a new way to not dial.
     if language:
+        # Which questions are worth asking depends entirely on which backend
+        # will actually carry this call. An OpenAI-backed language has no
+        # ElevenLabs agent, no language preset and no override switch —
+        # running the ElevenLabs checks below against it would refuse the
+        # campaign for a reason unrelated to whether it can dial. See
+        # app/languages.py's backend_for_iso() for why this needs the ISO
+        # lookup rather than backend_for()'s token lookup.
+        if languages_module.backend_for_iso(language) == languages_module.OPENAI_REALTIME:
+            if not OPENAI_API_KEY:
+                return (
+                    f"This campaign dials in '{language}', which runs on the "
+                    "OpenAI Realtime backend, but OPENAI_API_KEY is not set. "
+                    "Set it in .env — it is the same key the RAG embedder uses."
+                )
+            return None
+
         try:
             support = await asyncio.to_thread(agent_language_support, agent_id)
         except Exception as exc:

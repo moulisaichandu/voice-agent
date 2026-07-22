@@ -166,6 +166,26 @@ def backend_for(token: str) -> str:
     return _BACKEND_BY_TOKEN.get(normalize(token), ELEVENLABS)
 
 
+def backend_for_iso(iso: str | None) -> str:
+    """The backend for an ISO code, for callers that only have the code.
+
+    app/telephony/preflight.py is one such caller: it receives the ISO code
+    that app/languages.py's own for_call()/iso_code() produced, never the raw
+    catalogue token, so it cannot call backend_for() directly.
+
+    Several tokens can share an ISO code (te and tinglish are both 'te'), but
+    they never disagree about the backend — a language is carried by exactly
+    one backend — so resolving through the first token that matches is safe.
+    Falls back to ELEVENLABS for an unrecognised or absent code, for the same
+    reason backend_for() does: degrading to the backend that is known to work
+    beats raising mid-dial.
+    """
+    for token, backend in _BACKEND_BY_TOKEN.items():
+        if iso_code(token) == iso:
+            return backend
+    return ELEVENLABS
+
+
 # ISO codes ElevenLabs' Flash/Turbo v2.5 models cannot pronounce, kept as a
 # backstop on the model rather than the language. Largely superseded by
 # ELEVENLABS_AGENT_LANGUAGES above: 'te' is refused as an agent language before

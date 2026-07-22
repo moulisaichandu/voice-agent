@@ -237,3 +237,29 @@ def test_no_language_routes_to_elevenlabs_for_something_it_cannot_speak():
             assert languages.elevenlabs_can_speak(iso), (
                 f"{token} routes to ElevenLabs but ElevenLabs cannot speak {iso}"
             )
+
+
+# ── backend_for_iso: the same table, for callers that only have an ISO code ──
+#
+# app/telephony/preflight.py receives an ISO code (it round-trips through
+# app/languages.py's for_call()/iso_code(), never the raw catalogue token), so
+# it cannot call backend_for() directly. This must never disagree with it —
+# two lookups into the same fact, computed two different ways, is exactly the
+# kind of pair that drifts apart silently if only one of them is tested.
+
+def test_backend_for_iso_agrees_with_backend_for_token():
+    """The two lookups must never disagree — preflight uses the ISO one and
+    the dial path uses the token one, on the same call."""
+    for token in languages.TOKENS:
+        iso = languages.iso_code(token)
+        if iso:
+            assert languages.backend_for_iso(iso) == languages.backend_for(token)
+
+
+def test_backend_for_iso_routes_telugu_to_openai():
+    assert languages.backend_for_iso("te") == languages.OPENAI_REALTIME
+
+
+def test_backend_for_iso_routes_hindi_and_none_to_elevenlabs():
+    assert languages.backend_for_iso("hi") == languages.ELEVENLABS
+    assert languages.backend_for_iso(None) == languages.ELEVENLABS
