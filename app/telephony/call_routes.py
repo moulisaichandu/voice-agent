@@ -26,7 +26,7 @@ from uuid import UUID
 from fastapi import APIRouter, Request, WebSocket
 from fastapi.responses import Response
 
-from app import redis_client
+from app import languages, redis_client
 from app.config import CALL_WEBHOOK_SECRET
 from app.db import calls as calls_db
 from app.db import campaigns as campaigns_db
@@ -162,6 +162,23 @@ async def answer(request: Request) -> Response:
                     media_type="application/xml")
 
 
+def _call_language(lead, campaign) -> tuple[str | None, dict]:
+    """This call's ElevenLabs language code, and the prompt variables that go
+    with it.
+
+    Returns (None, {}) for 'auto' — which is not "the default language" but
+    "send nothing at all". Kept as a pure function of two rows so the
+    precedence rule is testable without a WebSocket; see app/languages.py.
+    """
+    token = languages.resolve(lead.language_pref, campaign.language)
+    if token == languages.AUTO:
+        return None, {}
+    return languages.iso_code(token), {
+        "language": languages.display(token),
+        "language_style": languages.style(token),
+    }
+
+
 @router.websocket("/calls/stream")
 async def stream(ws: WebSocket) -> None:
     """The call's audio, bridged to the ElevenLabs agent."""
@@ -190,11 +207,14 @@ async def stream(ws: WebSocket) -> None:
         await _release_slot_once(lead_id)
         return
 
+    call_language, language_vars = _call_language(lead, campaign)
+
     dynamic_variables = {"lead_id": str(lead.lead_id)}
     if lead.name:
         dynamic_variables["lead_name"] = lead.name
     if campaign.mode == "oneway" and campaign.script:
         dynamic_variables["script"] = campaign.script
+    dynamic_variables.update(language_vars)
 
     # Passed INTO the bridge rather than taken from its return value, so a
     # bridge that raises part-way through still leaves us the turns and the
@@ -210,6 +230,7 @@ async def stream(ws: WebSocket) -> None:
             agent_id=campaign.agent_id,
             lead_id=str(lead.lead_id),
             dynamic_variables=dynamic_variables,
+            language=call_language,
             one_way=(campaign.mode == "oneway"),
             outcome=outcome,
         )

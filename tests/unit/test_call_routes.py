@@ -321,3 +321,56 @@ async def test_a_sheets_failure_never_breaks_the_call_outcome(redis, monkeypatch
     })  # must not raise
 
     assert recorded["el_conversation_id"] == "conv_3"
+
+
+# ── language resolution on the dial path ─────────────────────────────────────
+
+def _lead_and_campaign(lead_language="auto", campaign_language="auto"):
+    from datetime import datetime, timezone
+    from uuid import uuid4
+
+    from app.db.models import Campaign, Lead
+
+    campaign_id = uuid4()
+    lead = Lead(
+        lead_id=uuid4(), phone_e164="+919876543210", campaign_id=campaign_id,
+        language_pref=lead_language, created_at=datetime.now(timezone.utc),
+    )
+    campaign = Campaign(
+        campaign_id=campaign_id, name="Demo", mode="twoway", agent_id="agent_1",
+        language=campaign_language, created_at=datetime.now(timezone.utc),
+    )
+    return lead, campaign
+
+
+def test_build_call_language_uses_the_campaign_default():
+    lang, dyn = call_routes._call_language(*_lead_and_campaign(campaign_language="te"))
+    assert lang == "te"
+    assert dyn["language"] == "Telugu"
+    assert "Telugu" in dyn["language_style"]
+
+
+def test_build_call_language_lets_the_lead_override_the_campaign():
+    """A mixed-language file must work without splitting it into separate
+    campaigns — the row's own value wins, exactly as consent already does."""
+    lang, dyn = call_routes._call_language(
+        *_lead_and_campaign(lead_language="hi", campaign_language="te")
+    )
+    assert lang == "hi"
+    assert dyn["language"] == "Hindi"
+
+
+def test_build_call_language_maps_tinglish_to_telugu():
+    """Speech recognition and synthesis must run as Telugu; the code-mixing
+    is carried by the style text, not by the ISO code."""
+    lang, dyn = call_routes._call_language(*_lead_and_campaign(campaign_language="tinglish"))
+    assert lang == "te"
+    assert "English" in dyn["language_style"]
+
+
+def test_build_call_language_sends_nothing_for_auto():
+    """The safety default: an untouched campaign adds no language variables
+    and requests no override."""
+    lang, dyn = call_routes._call_language(*_lead_and_campaign())
+    assert lang is None
+    assert dyn == {}
