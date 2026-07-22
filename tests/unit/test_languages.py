@@ -194,3 +194,46 @@ def test_every_catalogue_iso_is_either_speakable_or_knowingly_not():
         if iso is None:
             continue
         assert isinstance(languages.elevenlabs_can_speak(iso), bool)
+
+
+# ── which backend carries which language ─────────────────────────────────────
+
+def test_telugu_and_tinglish_route_to_openai():
+    """ElevenLabs cannot speak Telugu at all — see ELEVENLABS_AGENT_LANGUAGES.
+    Routing them anywhere else is what makes these campaigns dialable."""
+    assert languages.backend_for("te") == languages.OPENAI_REALTIME
+    assert languages.backend_for("tinglish") == languages.OPENAI_REALTIME
+
+
+def test_english_hindi_and_auto_stay_on_elevenlabs():
+    """The working path. Every campaign in production today is one of these,
+    and none of them may move backend as a side effect of this feature."""
+    for token in ("auto", "en", "hi", "hinglish"):
+        assert languages.backend_for(token) == languages.ELEVENLABS
+
+
+def test_every_catalogue_token_has_a_backend():
+    """A language in the dropdown with no backend would fail at dial time with
+    a KeyError rather than a message anyone can act on."""
+    for token in languages.TOKENS:
+        assert languages.backend_for(token) in (
+            languages.ELEVENLABS, languages.OPENAI_REALTIME
+        )
+
+
+def test_an_unknown_token_falls_back_to_the_working_backend():
+    """normalize() sends junk to 'auto', so this can only happen if a caller
+    hand-builds a token. Degrade to the backend that works, not to a crash."""
+    assert languages.backend_for("klingon") == languages.ELEVENLABS
+
+
+def test_no_language_routes_to_elevenlabs_for_something_it_cannot_speak():
+    """The consistency guard between the two tables: if a language is routed
+    to ElevenLabs, ElevenLabs must actually offer it. Adding Tamil later and
+    forgetting to route it would otherwise dial into a wall."""
+    for token in languages.TOKENS:
+        iso = languages.iso_code(token)
+        if iso and languages.backend_for(token) == languages.ELEVENLABS:
+            assert languages.elevenlabs_can_speak(iso), (
+                f"{token} routes to ElevenLabs but ElevenLabs cannot speak {iso}"
+            )

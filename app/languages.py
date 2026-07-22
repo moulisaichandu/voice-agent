@@ -27,6 +27,7 @@ nothing is what keeps the working one-way and two-way flows working.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 AUTO = "auto"
 
@@ -127,6 +128,42 @@ def elevenlabs_can_speak(iso: str | None) -> bool:
     should be told that, not sent to look for a setting that doesn't exist.
     """
     return bool(iso) and iso in ELEVENLABS_AGENT_LANGUAGES
+
+
+# ── which backend carries which language ─────────────────────────────────────
+# Two voice backends exist because no single one covers this business's
+# languages. ElevenLabs Agents sounds better and is already in production, but
+# does not offer Telugu at any price (see ELEVENLABS_AGENT_LANGUAGES). OpenAI
+# Realtime does, and the sibling ../ai-voice-agent proves it on real 8 kHz
+# phone calls.
+#
+# The backend is DERIVED from the language, never chosen per call and never
+# inferred by a model — campaigns.language is admin-set at creation, so the
+# backend is fully determined before a call is placed. That is the same
+# discipline campaigns.mode follows, for the same reason.
+ELEVENLABS = "elevenlabs"
+OPENAI_REALTIME = "openai_realtime"
+
+VoiceBackend = Literal["elevenlabs", "openai_realtime"]
+
+_BACKEND_BY_TOKEN: dict[str, str] = {
+    AUTO: ELEVENLABS,
+    "en": ELEVENLABS,
+    "hi": ELEVENLABS,
+    "hinglish": ELEVENLABS,
+    "te": OPENAI_REALTIME,
+    "tinglish": OPENAI_REALTIME,
+}
+
+
+def backend_for(token: str) -> str:
+    """The voice backend that can carry *token*.
+
+    Falls back to ELEVENLABS for anything unrecognised: normalize() already
+    routes junk to AUTO, so reaching this means a caller hand-built a token,
+    and degrading to the backend that is known to work beats raising mid-dial.
+    """
+    return _BACKEND_BY_TOKEN.get(normalize(token), ELEVENLABS)
 
 
 # ISO codes ElevenLabs' Flash/Turbo v2.5 models cannot pronounce, kept as a
