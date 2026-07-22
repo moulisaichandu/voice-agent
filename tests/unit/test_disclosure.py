@@ -92,3 +92,28 @@ def test_a_hindi_script_without_a_disclosure_still_fails():
 
 def test_hindi_artificial_intelligence_spelled_out_is_accepted():
     assert has_ai_disclosure("यह कॉल कृत्रिम बुद्धिमत्ता द्वारा की जा रही है।")
+
+
+def test_hindi_bare_automated_describing_a_payment_system_is_not_a_disclosure():
+    """REGRESSION. Task 7 added the bare Hindi word "स्वचालित" ("automated")
+    as a marker. It matches an unrelated automated PROCESS, not the caller,
+    so a script describing an automated fee-payment system was wrongly
+    accepted as disclosing the caller is AI. Mirrors the English discipline
+    of never having a bare "automated" marker — see _DISCLOSURE_MARKERS."""
+    assert not has_ai_disclosure(
+        "नमस्ते! हमारा कोर्स अब स्वचालित शुल्क भुगतान प्रणाली के साथ उपलब्ध है।"
+    )
+
+
+def test_hindi_bare_automated_describing_admission_process_is_not_a_disclosure():
+    """REGRESSION, same defect as above with a different unrelated process
+    (admission), pinned to the exact sentence the reviewer reported."""
+    assert not has_ai_disclosure(
+        "नमस्ते! हमारा प्रवेश स्वचालित है, कोई इंतजार नहीं।"
+    )
+
+
+def test_hindi_automated_call_disclosing_the_caller_passes():
+    """The disambiguated marker must still accept a script that pairs the
+    automation word with a noun that makes the CALLER the automated thing."""
+    assert has_ai_disclosure("नमस्ते! यह एक स्वचालित कॉल है, डिजिटल ब्रॉली की ओर से।")

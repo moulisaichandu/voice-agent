@@ -69,7 +69,10 @@ _DISCLOSURE_MARKERS = (
     "ఆటోమేటెడ్",  # Telugu: "automated"
     "एआई",  # Hindi: "AI" spelled out in Devanagari
     "कृत्रिम बुद्धिमत्ता",  # Hindi: "artificial intelligence"
-    "स्वचालित",  # Hindi: "automated"
+    "स्वचालित कॉल",  # Hindi: "automated call"
+    "स्वचालित आवाज़",  # Hindi: "automated voice"
+    "स्वचालित सहायक",  # Hindi: "automated assistant"
+    "वॉइस असिस्टेंट",  # Hindi: "voice assistant" (transliterated)
 )
 
 
