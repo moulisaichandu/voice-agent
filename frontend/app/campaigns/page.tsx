@@ -4,8 +4,11 @@ import Link from "next/link";
 import { useEffect, useState, type FormEvent } from "react";
 import {
   api,
+  CAMPAIGN_LANGUAGES,
   errorMessage,
+  languageLabel,
   type Campaign,
+  type CampaignLanguage,
   type CampaignMode,
   type ConsentBasis,
   type LeadImportResult,
@@ -40,6 +43,7 @@ export default function CampaignsPage() {
   const [togglingId, setTogglingId] = useState<string | null>(null);
 
   const [mode, setMode] = useState<CampaignMode>("twoway");
+  const [language, setLanguage] = useState<CampaignLanguage>("auto");
   const [script, setScript] = useState("");
   const [leadsFile, setLeadsFile] = useState<File | null>(null);
   const [consentBasis, setConsentBasis] = useState<ConsentBasis | undefined>();
@@ -79,6 +83,7 @@ export default function CampaignsPage() {
       const campaign = await api.createCampaign({
         name: uniqueCampaignName(leadsFile.name, campaigns),
         mode,
+        language,
         script: script.trim() || undefined,
       });
 
@@ -132,6 +137,23 @@ export default function CampaignsPage() {
         description="Drop in your leads file. The campaign takes its name from the file, and calls run top to bottom in the order the rows appear."
       >
         <form onSubmit={handleCreate} className="flex max-w-lg flex-col gap-4">
+          <Field
+            label="Language"
+            hint="Every lead in this file is called in this language. A Language column in the file overrides it for that row. “Agent default” changes nothing about how your agent already speaks."
+          >
+            <select
+              className={fieldControlClass}
+              value={language}
+              onChange={(e) => setLanguage(e.target.value as CampaignLanguage)}
+            >
+              {CAMPAIGN_LANGUAGES.map((l) => (
+                <option key={l.value} value={l.value}>
+                  {l.label}
+                </option>
+              ))}
+            </select>
+          </Field>
+
           <LeadsUpload
             onChange={(file, basis) => {
               setLeadsFile(file);
@@ -203,15 +225,16 @@ export default function CampaignsPage() {
             <tr>
               <Th>Name</Th>
               <Th>Mode</Th>
+              <Th>Language</Th>
               <Th>Agent</Th>
               <Th>Active</Th>
               <Th />
             </tr>
           </thead>
           <tbody>
-            {loading && <TableMessageRow colSpan={5}>Loading…</TableMessageRow>}
+            {loading && <TableMessageRow colSpan={6}>Loading…</TableMessageRow>}
             {!loading && campaigns.length === 0 && (
-              <TableMessageRow colSpan={5}>No campaigns yet — create one above.</TableMessageRow>
+              <TableMessageRow colSpan={6}>No campaigns yet — create one above.</TableMessageRow>
             )}
             {!loading &&
               campaigns.map((c) => (
@@ -219,6 +242,11 @@ export default function CampaignsPage() {
                   <Td>{c.name}</Td>
                   <Td>
                     <Badge tone={c.mode === "twoway" ? "accent" : "neutral"}>{c.mode}</Badge>
+                  </Td>
+                  <Td>
+                    <Badge tone={c.language === "auto" ? "neutral" : "accent"}>
+                      {languageLabel(c.language)}
+                    </Badge>
                   </Td>
                   <Td className="font-mono text-xs">{c.agent_id}</Td>
                   <Td>

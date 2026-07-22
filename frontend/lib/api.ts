@@ -13,12 +13,32 @@ const AUTH_TOKEN = process.env.NEXT_PUBLIC_API_AUTH_TOKEN;
 
 export type CampaignMode = "oneway" | "twoway";
 
+/** Mirrors app/languages.py's TOKENS and migrations/0003's CHECK constraint.
+ * "auto" sends no override to ElevenLabs and uses whatever the agent is
+ * configured with — the behaviour of every campaign created before this
+ * existed. */
+export type CampaignLanguage = "auto" | "en" | "te" | "tinglish" | "hi" | "hinglish";
+
+export const CAMPAIGN_LANGUAGES: { value: CampaignLanguage; label: string }[] = [
+  { value: "auto", label: "Agent default" },
+  { value: "en", label: "English" },
+  { value: "te", label: "Telugu" },
+  { value: "tinglish", label: "Tinglish (Telugu + English)" },
+  { value: "hi", label: "Hindi" },
+  { value: "hinglish", label: "Hinglish (Hindi + English)" },
+];
+
+export function languageLabel(value: string): string {
+  return CAMPAIGN_LANGUAGES.find((l) => l.value === value)?.label ?? value;
+}
+
 export type Campaign = {
   campaign_id: string;
   name: string;
   mode: CampaignMode;
   agent_id: string;
   script: string | null;
+  language: CampaignLanguage;
   max_attempts: number;
   active: boolean;
   created_at: string;
@@ -180,6 +200,8 @@ export const api = {
      * Kept optional rather than removed so an explicit id still works. */
     agent_id?: string;
     script?: string;
+    /** Omit for "auto" — no override, the agent's own language. */
+    language?: CampaignLanguage;
     max_attempts?: number;
   }) =>
     request<Campaign>("/admin/campaigns", {

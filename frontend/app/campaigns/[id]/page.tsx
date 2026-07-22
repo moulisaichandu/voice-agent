@@ -2,7 +2,15 @@
 
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { useParams } from "next/navigation";
-import { api, errorMessage, type Call, type Campaign, type Lead, type Readiness } from "@/lib/api";
+import {
+  api,
+  errorMessage,
+  languageLabel,
+  type Call,
+  type Campaign,
+  type Lead,
+  type Readiness,
+} from "@/lib/api";
 import { ConfirmButton } from "@/components/ConfirmButton";
 import { CallTable } from "@/components/CallTable";
 import { LeadsUpload } from "@/components/LeadsUpload";
@@ -162,6 +170,9 @@ export default function CampaignDetailPage() {
       {campaign && (
         <div className="flex flex-wrap items-center gap-3">
           <Badge tone={campaign.mode === "twoway" ? "accent" : "neutral"}>{campaign.mode}</Badge>
+          <Badge tone={campaign.language === "auto" ? "neutral" : "accent"}>
+            {languageLabel(campaign.language)}
+          </Badge>
           <Badge tone={campaign.active ? "good" : "neutral"}>
             {campaign.active ? "active" : "inactive"}
           </Badge>
