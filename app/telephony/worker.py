@@ -259,7 +259,7 @@ async def process_one(lead_id: str) -> None:
         # a code-mixed ("tinglish"/"hinglish") campaign.
         call_iso_code, _ = languages.for_call(lead.language_pref, campaign.language)
         reachability_error = await preflight_module.preflight(
-            campaign.agent_id, call_iso_code,
+            campaign.agent_id, call_iso_code, mode=campaign.mode,
         )
         if reachability_error:
             logger.error(f"[worker] preflight failed, not dialing: {reachability_error}")

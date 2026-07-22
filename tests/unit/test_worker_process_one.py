@@ -104,7 +104,7 @@ def mocks(monkeypatch):
 
     monkeypatch.setattr(worker, "_ack", fake_ack)
 
-    async def no_preflight_error(agent_id, language=None):
+    async def no_preflight_error(agent_id, language=None, mode=None):
         return None
 
     monkeypatch.setattr(worker.preflight_module, "preflight", no_preflight_error)
@@ -210,7 +210,7 @@ async def test_preflight_failure_releases_reservation_without_counting_attempt(
 ):
     monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
 
-    async def failing_preflight(agent_id, language=None):
+    async def failing_preflight(agent_id, language=None, mode=None):
         return "PUBLIC_BASE_URL is unreachable"
 
     monkeypatch.setattr(worker.preflight_module, "preflight", failing_preflight)
@@ -231,14 +231,19 @@ async def test_preflight_receives_the_resolved_iso_code_not_the_raw_token(
     token "tinglish" — not an ISO code, not in any agent's language set — and
     refuse EVERY dial for every code-mixed campaign with no failing test to
     catch it. Pin the exact regression: a 'tinglish' campaign must reach
-    preflight as 'te'."""
+    preflight as 'te'.
+
+    Also pins that the campaign's mode reaches preflight — the two-way
+    dial-time guard needs it, and this is the worker's own call site."""
     monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
     mocks.campaign.language = "tinglish"
+    mocks.campaign.mode = "twoway"
 
     received = {}
 
-    async def capturing_preflight(agent_id, language=None):
+    async def capturing_preflight(agent_id, language=None, mode=None):
         received["language"] = language
+        received["mode"] = mode
         return None
 
     monkeypatch.setattr(worker.preflight_module, "preflight", capturing_preflight)
@@ -246,6 +251,7 @@ async def test_preflight_receives_the_resolved_iso_code_not_the_raw_token(
     await worker.process_one(str(mocks.lead.lead_id))
 
     assert received["language"] == "te"
+    assert received["mode"] == "twoway"
 
 
 async def test_at_capacity_requeues_instead_of_busy_looping(mocks, monkeypatch):
@@ -358,7 +364,7 @@ async def test_preflight_failure_releases_the_dialing_lock(mocks, monkeypatch):
     r = _FakeRedis()
     monkeypatch.setattr(worker.redis_client, "get_redis", lambda: r)
 
-    async def failing_preflight(agent_id, language=None):
+    async def failing_preflight(agent_id, language=None, mode=None):
         return "PUBLIC_BASE_URL is unreachable"
 
     monkeypatch.setattr(worker.preflight_module, "preflight", failing_preflight)

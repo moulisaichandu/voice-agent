@@ -39,12 +39,51 @@ _HEALTH_CHECK_TIMEOUT_S = 10.0
 logger = logging.getLogger(__name__)
 
 
-async def preflight(agent_id: str, language: str | None = None) -> str | None:
+async def preflight(
+    agent_id: str, language: str | None = None, mode: str | None = None,
+) -> str | None:
     """None = safe to dial; a string = the human-readable reason not to.
 
     Never raises: an exception here would abort process_one mid-reservation
     instead of cleanly declining to dial (see worker.py's docstring point 7).
+
+    *mode* defaults to None so every existing caller (and every test written
+    before this parameter existed) keeps working unchanged — None never
+    equals 'twoway', so the guard below simply never fires for them.
     """
+    # Refuse a two-way call the backend cannot hold — unconditional, checked
+    # first, and before anything else can fail open. This is pure local logic
+    # with no I/O, unlike every check below it, so there is no outage to fail
+    # open on.
+    #
+    # app/telephony/openai_bridge.py is ONE-WAY ONLY (see its module
+    # docstring) — two-way conversation is Milestone B. app/admin/campaigns.py's
+    # _check_twoway_capable() already refuses this combination at CREATION
+    # time, but that cannot catch a campaign that already existed when this
+    # feature shipped. Undialled today, such a campaign would connect to
+    # OpenAI, never speak (no turn-detection cue, no response.create), never
+    # listen, and sit in dead silence for the full CALL_MAX_DURATION_S of
+    # billed Plivo airtime — then be recorded as a SUCCESSFUL zero-turn call,
+    # because max_duration counts as a clean exit. Worse than the
+    # mode-produces-calls-leads-couldn't-respond-to failure CLAUDE.md warns
+    # about by name, because at least a monologue is audible.
+    #
+    # 'auto' (language=None) always resolves to ELEVENLABS (see
+    # languages.backend_for_iso), so a two-way 'auto' campaign — every
+    # campaign created before this feature existed — can never trip this.
+    twoway_backend = languages_module.backend_for_iso(language)
+    if mode == "twoway" and twoway_backend != languages_module.ELEVENLABS:
+        return (
+            f"This campaign is 'twoway' in '{language}', but that language's "
+            "voice backend (OpenAI Realtime) only supports one-way calls "
+            "today — it cannot listen or hold a conversation, so the call "
+            "would sit in dead silence for the full call duration and still "
+            "be recorded as a success. One-way calling IS available for "
+            f"'{language}' today; two-way is not yet. Change this campaign's "
+            "mode to 'oneway', or choose a different language for a two-way "
+            "campaign."
+        )
+
     if not ELEVENLABS_API_KEY:
         return "ELEVENLABS_API_KEY is not set, so no agent can answer. Set it in .env."
 

@@ -158,7 +158,9 @@ async def _compute_preflight() -> dict:
     # container log, exactly the diagnostic cycle this dashboard exists to
     # prevent.
     call_language = languages.iso_code(languages.resolve(None, campaign.language))
-    reason = await preflight_module.preflight(campaign.agent_id, call_language)
+    reason = await preflight_module.preflight(
+        campaign.agent_id, call_language, mode=campaign.mode,
+    )
     if reason:
         return {"key": "preflight", "status": "critical", "label": "Preflight", "detail": reason}
     return {"key": "preflight", "status": "good", "label": "Preflight",

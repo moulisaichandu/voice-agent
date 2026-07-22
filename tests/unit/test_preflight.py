@@ -336,3 +336,54 @@ async def test_hindi_still_runs_the_elevenlabs_checks(monkeypatch):
     reason = await pf.preflight("agent_1", "hi")
     assert reason is not None
     assert "Security" in reason
+
+
+# ── refuse a two-way call the backend cannot hold, AT DIAL TIME ──────────────
+#
+# openai_bridge.py is ONE-WAY ONLY; two-way is Milestone B. Task 4's
+# creation-time guard (app/admin/campaigns.py's _check_twoway_capable) cannot
+# catch a campaign that already existed when this feature shipped. Undialled
+# today, such a campaign would connect to OpenAI, never speak (no
+# turn-detection cue), never listen, sit in dead silence for the full
+# CALL_MAX_DURATION_S of billed Plivo airtime, and then be recorded as a
+# SUCCESSFUL zero-turn call because max_duration counts as a clean exit —
+# worse than the silent-mismatch bug CLAUDE.md warns about by name, because at
+# least a monologue is audible.
+
+async def test_a_twoway_openai_backed_campaign_is_refused(monkeypatch):
+    _configured(monkeypatch)
+    monkeypatch.setattr(pf, "OPENAI_API_KEY", "sk-test")
+    reason = await pf.preflight("agent_1", "te", mode="twoway")
+    assert reason is not None
+    assert "twoway" in reason
+    assert "te" in reason
+    assert "one-way" in reason.lower()
+
+
+async def test_a_oneway_openai_backed_campaign_is_not_refused(monkeypatch):
+    _configured(monkeypatch)
+    monkeypatch.setattr(pf, "OPENAI_API_KEY", "sk-test")
+    assert await pf.preflight("agent_1", "te", mode="oneway") is None
+
+
+async def test_a_twoway_elevenlabs_backed_campaign_is_not_refused(monkeypatch):
+    """This combination works in production today (every existing two-way
+    campaign) and must not be caught by the new guard."""
+    _configured(monkeypatch)
+    _support(monkeypatch)
+    assert await pf.preflight("agent_1", "hi", mode="twoway") is None
+
+
+async def test_an_auto_twoway_campaign_is_not_refused(monkeypatch):
+    """'auto' sends no language override at all and always stays on
+    ElevenLabs — it must not gain a new way to fail."""
+    _configured(monkeypatch)
+    assert await pf.preflight("agent_1", None, mode="twoway") is None
+
+
+async def test_the_twoway_guard_needs_no_mode_argument_to_keep_working(monkeypatch):
+    """Existing callers that don't pass mode= must keep working exactly as
+    before — mode defaults to something that never triggers the guard."""
+    _configured(monkeypatch)
+    monkeypatch.setattr(pf, "OPENAI_API_KEY", "sk-test")
+    assert await pf.preflight("agent_1", "te") is None
