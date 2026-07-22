@@ -31,6 +31,7 @@ from app.config import CALL_WEBHOOK_SECRET
 from app.db import calls as calls_db
 from app.db import campaigns as campaigns_db
 from app.db import leads as leads_db
+from app.db.models import Campaign, Lead
 from app.telephony import bridge as bridge_module
 from app.telephony import plivo_client
 from app.telephony import worker as telephony_worker
@@ -162,21 +163,18 @@ async def answer(request: Request) -> Response:
                     media_type="application/xml")
 
 
-def _call_language(lead, campaign) -> tuple[str | None, dict]:
+def _call_language(lead: Lead, campaign: Campaign) -> tuple[str | None, dict]:
     """This call's ElevenLabs language code, and the prompt variables that go
     with it.
 
-    Returns (None, {}) for 'auto' — which is not "the default language" but
-    "send nothing at all". Kept as a pure function of two rows so the
-    precedence rule is testable without a WebSocket; see app/languages.py.
+    A thin adapter over app/languages.py's for_call() — kept as a function of
+    two rows (rather than called inline at the one use site) so the
+    precedence rule stays testable without a WebSocket. The actual resolution
+    logic lives in for_call() so this and app/telephony/worker.py's dial-time
+    preflight call can never drift apart; see for_call()'s own docstring for
+    what drifting apart would break.
     """
-    token = languages.resolve(lead.language_pref, campaign.language)
-    if token == languages.AUTO:
-        return None, {}
-    return languages.iso_code(token), {
-        "language": languages.display(token),
-        "language_style": languages.style(token),
-    }
+    return languages.for_call(lead.language_pref, campaign.language)
 
 
 @router.websocket("/calls/stream")

@@ -120,3 +120,45 @@ def test_telugu_is_flagged_as_needing_a_v3_model():
     exact misconfiguration that produced garbled Telugu audio in testing."""
     assert "te" in languages.V3_ONLY_ISO
     assert "hi" not in languages.V3_ONLY_ISO
+
+
+# ── for_call: the single shared resolution used by both dial-path call sites ─
+#
+# app/telephony/call_routes.py's _call_language() and app/telephony/worker.py
+# both need "the ISO code and prompt variables for one call", computed from
+# the same two inputs (a lead's language_pref and a campaign's language).
+# Before this, each call site resolved it inline, and nothing pinned them
+# together — a future "simplification" of one that passed the raw token
+# (e.g. campaign.language directly) instead of running it through resolve()
+# and iso_code() would silently send preflight the string "tinglish", which
+# is not in any agent's ISO language set, and preflight would refuse EVERY
+# dial for every code-mixed campaign. Hoisting the resolution into one
+# function both call sites use is what makes that impossible instead of
+# merely untested.
+
+def test_for_call_returns_the_campaign_default_when_the_lead_has_none():
+    lang, dyn = languages.for_call(None, "te")
+    assert lang == "te"
+    assert dyn["language"] == "Telugu"
+    assert "Telugu" in dyn["language_style"]
+
+
+def test_for_call_lets_the_lead_override_the_campaign():
+    lang, dyn = languages.for_call("hi", "te")
+    assert lang == "hi"
+    assert dyn["language"] == "Hindi"
+
+
+def test_for_call_maps_tinglish_to_the_telugu_iso_code():
+    """The exact regression this function exists to prevent: 'tinglish' is a
+    catalogue token, not an ISO code, and preflight only understands ISO
+    codes — it must never receive the raw token."""
+    lang, dyn = languages.for_call(None, "tinglish")
+    assert lang == "te"
+    assert "English" in dyn["language_style"]
+
+
+def test_for_call_sends_nothing_for_auto():
+    lang, dyn = languages.for_call(None, None)
+    assert lang is None
+    assert dyn == {}

@@ -166,3 +166,30 @@ def display(token: str) -> str | None:
     """The human-readable name — shown in the dashboard and passed to the
     agent as the {{language}} dynamic variable."""
     return LANGUAGES[normalize(token)].display
+
+
+def for_call(lead_pref: str | None, campaign_language: str | None) -> tuple[str | None, dict]:
+    """The ISO code and prompt variables for one call, resolved from a lead's
+    own preference and its campaign's default.
+
+    This is the ONE place both dial-path call sites compute this —
+    app/telephony/call_routes.py's _call_language() and app/telephony/
+    worker.py both need it, and before this existed each resolved it inline.
+    Nothing pinned the two together: a future edit that "simplified" either
+    one to pass a raw catalogue token (e.g. campaign_language directly)
+    instead of running it through resolve() + iso_code() would silently send
+    preflight the string "tinglish" — not an ISO code, not in any agent's
+    language set — and preflight would refuse EVERY dial for every code-mixed
+    campaign, with no failing test to catch it. One function, one place that
+    can go wrong.
+
+    Returns (None, {}) for 'auto' — which is not "the default language" but
+    "send nothing at all"; see the module docstring on why that matters.
+    """
+    token = resolve(lead_pref, campaign_language)
+    if token == AUTO:
+        return None, {}
+    return iso_code(token), {
+        "language": display(token),
+        "language_style": style(token),
+    }

@@ -252,9 +252,14 @@ async def process_one(lead_id: str) -> None:
             return
         lock_key = f"dialing:{lead.phone_e164}"
 
+        # for_call() is the single shared resolution app/telephony/
+        # call_routes.py's _call_language() also uses — see its docstring
+        # for why passing campaign.language (a catalogue token, not an ISO
+        # code) straight to preflight would silently refuse every dial for
+        # a code-mixed ("tinglish"/"hinglish") campaign.
+        call_iso_code, _ = languages.for_call(lead.language_pref, campaign.language)
         reachability_error = await preflight_module.preflight(
-            campaign.agent_id,
-            languages.iso_code(languages.resolve(lead.language_pref, campaign.language)),
+            campaign.agent_id, call_iso_code,
         )
         if reachability_error:
             logger.error(f"[worker] preflight failed, not dialing: {reachability_error}")

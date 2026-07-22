@@ -221,6 +221,33 @@ async def test_preflight_failure_releases_reservation_without_counting_attempt(
     assert mocks.calls["record_dial_attempt"] == []
 
 
+async def test_preflight_receives_the_resolved_iso_code_not_the_raw_token(
+    mocks, monkeypatch,
+):
+    """REGRESSION guard. app/languages.py's for_call() is the ONE place both
+    this worker and call_routes._call_language() resolve a call's language.
+    If the worker were ever "simplified" to pass campaign.language straight
+    through instead of resolving it, preflight would receive the catalogue
+    token "tinglish" — not an ISO code, not in any agent's language set — and
+    refuse EVERY dial for every code-mixed campaign with no failing test to
+    catch it. Pin the exact regression: a 'tinglish' campaign must reach
+    preflight as 'te'."""
+    monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
+    mocks.campaign.language = "tinglish"
+
+    received = {}
+
+    async def capturing_preflight(agent_id, language=None):
+        received["language"] = language
+        return None
+
+    monkeypatch.setattr(worker.preflight_module, "preflight", capturing_preflight)
+
+    await worker.process_one(str(mocks.lead.lead_id))
+
+    assert received["language"] == "te"
+
+
 async def test_at_capacity_requeues_instead_of_busy_looping(mocks, monkeypatch):
     monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
 
