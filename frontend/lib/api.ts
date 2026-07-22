@@ -1,4 +1,4 @@
-// lib/api.ts — thin fetch wrapper over the backend's /admin and /rag routes.
+// lib/api.ts — thin fetch wrapper over the backend's /admin routes.
 // No auth header is sent unless NEXT_PUBLIC_API_AUTH_TOKEN is set, matching
 // the backend's APP_AUTH_TOKEN: unset on both sides = open for local dev.
 
@@ -58,6 +58,57 @@ export type Call = {
   created_at: string;
 };
 
+export type ConsentBasis = "explicit" | "inferred";
+
+export type LeadImportError = { row_number: number; reason: string };
+
+export type LeadImportResult = {
+  received: number;
+  imported: number;
+  skipped: number;
+  /** Of those imported, how many pass the same consent check the dialer
+   * applies. A file with no consent information imports fine and dials
+   * nothing — this is how that becomes visible instead of silent. */
+  dialable: number;
+  errors: LeadImportError[];
+};
+
+export type ReadinessTone = "good" | "warning" | "serious" | "critical";
+
+export type ReadinessCheck = {
+  key: string;
+  status: ReadinessTone;
+  label: string;
+  detail: string;
+  cached: boolean;
+  checked_at: string;
+};
+
+export type Readiness = {
+  can_dial: boolean;
+  checked_at: string;
+  checks: ReadinessCheck[];
+};
+
+export type Stats = {
+  leads_by_status: Record<string, number>;
+  calls_today: number;
+  calls_today_with_transcript: number;
+};
+
+export type ConfigVar = {
+  name: string;
+  is_set: boolean;
+  value: string | number | boolean | null;
+};
+
+export type SheetsStatus = {
+  configured: boolean;
+  last_sync_at: string | null;
+  last_synced_count: number | null;
+  last_error: string | null;
+};
+
 class ApiError extends Error {
   status: number;
   constructor(status: number, message: string) {
@@ -67,8 +118,13 @@ class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  // A FormData body must NOT carry a hand-set Content-Type: the browser has to
+  // generate `multipart/form-data; boundary=...` itself, and an explicit
+  // application/json here makes the server fail to find any boundary at all.
+  const isFormData =
+    typeof FormData !== "undefined" && init?.body instanceof FormData;
   const headers: Record<string, string> = {
-    "Content-Type": "application/json",
+    ...(isFormData ? {} : { "Content-Type": "application/json" }),
     ...(init?.headers as Record<string, string> | undefined),
   };
   if (AUTH_TOKEN) headers["Authorization"] = `Bearer ${AUTH_TOKEN}`;
@@ -117,14 +173,24 @@ export const api = {
 
   createCampaign: (body: {
     name: string;
-    mode: CampaignMode;
-    agent_id: string;
+    /** Defaults to twoway server-side — the safer of the two. Still admin-set
+     * at creation time, never inferred per call. */
+    mode?: CampaignMode;
+    /** Omit to use the agent configured for the mode in the backend's .env.
+     * Kept optional rather than removed so an explicit id still works. */
+    agent_id?: string;
     script?: string;
     max_attempts?: number;
   }) =>
     request<Campaign>("/admin/campaigns", {
       method: "POST",
       body: JSON.stringify(body),
+    }),
+
+  setCampaignActive: (campaignId: string, active: boolean) =>
+    request<Campaign>(`/admin/campaigns/${campaignId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ active }),
     }),
 
   listLeads: (campaignId: string) =>
@@ -145,8 +211,31 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
+  uploadLeads: (campaignId: string, file: File, consentBasis?: ConsentBasis) => {
+    const form = new FormData();
+    form.append("file", file);
+    // Only sent when the operator actually affirmed it. Omitting the field
+    // means those rows import with no consent and are never dialled, which is
+    // the safe default — see the endpoint's docstring.
+    if (consentBasis) form.append("consent_basis", consentBasis);
+    return request<LeadImportResult>(
+      `/admin/campaigns/${campaignId}/leads/upload`,
+      { method: "POST", body: form }
+    );
+  },
+
+  searchLeadsByPhone: (phone: string) =>
+    request<Lead[]>(`/admin/leads?phone=${encodeURIComponent(phone)}`),
+
+  leadCalls: (leadId: string) => request<Call[]>(`/admin/leads/${leadId}/calls`),
+
+  doNotCall: (leadId: string) =>
+    request<Lead>(`/admin/leads/${leadId}/do-not-call`, { method: "POST" }),
+
   listCalls: (campaignId: string) =>
     request<Call[]>(`/admin/campaigns/${campaignId}/calls`),
+
+  recentCalls: (limit = 50) => request<Call[]>(`/admin/calls?limit=${limit}`),
 
   // Scoped to one campaign on purpose — see the backend route's docstring.
   // The unscoped /admin/trigger-tick exists but is deliberately not exposed
@@ -157,11 +246,16 @@ export const api = {
       method: "POST",
     }),
 
-  ragSearch: (query: string) =>
-    request<{ result: string }>("/rag/search", {
-      method: "POST",
-      body: JSON.stringify({ query }),
-    }),
+  readiness: () => request<Readiness>("/admin/readiness"),
+  refreshReadiness: () =>
+    request<Readiness>("/admin/readiness/refresh", { method: "POST" }),
+
+  stats: () => request<Stats>("/admin/stats"),
+
+  config: () => request<{ variables: ConfigVar[] }>("/admin/config"),
+
+  sheetsStatus: () => request<SheetsStatus>("/admin/sheets-status"),
+
 };
 
 export function errorMessage(e: unknown): string {

@@ -17,6 +17,8 @@ fails once, loudly, instead of identically on every lead.
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 
 from app.config import (
@@ -87,8 +89,14 @@ async def preflight(agent_id: str) -> str | None:
                 f"another service?). URL: {PUBLIC_BASE_URL}/calls/answer")
 
     # Cheapest last: this is the only check that costs an ElevenLabs API call.
+    #
+    # Off the event loop: agent_exists is a SYNCHRONOUS SDK call, and this
+    # function runs per dial on the same loop that carries every live audio
+    # bridge — so calling it inline froze the audio of every call in progress
+    # for a full ElevenLabs round-trip, every time the worker dialled anyone.
+    # bridge._signed_url wraps its SDK call for exactly this reason.
     try:
-        if not agent_exists(agent_id):
+        if not await asyncio.to_thread(agent_exists, agent_id):
             return (f"ElevenLabs agent_id {agent_id!r} was not found. Check "
                     "campaigns.agent_id and ELEVENLABS_{ONEWAY,TWOWAY}_AGENT_ID in "
                     ".env, or whether the agent was deleted. (A voice id is not an "

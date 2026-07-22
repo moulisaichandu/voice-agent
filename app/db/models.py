@@ -39,6 +39,10 @@ class Lead(BaseModel):
     campaign_id: UUID | None = None
     consent_basis: str | None = None
     consent_at: datetime | None = None
+    # Position in the file this lead was imported from — what due_leads()
+    # orders by. NULL for Google-Sheet and single-lead-form leads, which have
+    # no file position and sort after the ordered ones.
+    dial_order: int | None = None
     dnd: bool = False
     status: LeadStatus = "pending"
     attempts: int = 0

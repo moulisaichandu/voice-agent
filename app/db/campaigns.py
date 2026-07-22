@@ -73,6 +73,19 @@ async def list_campaigns() -> list[Campaign]:
     return [_row_to_campaign(r) for r in rows]
 
 
+async def set_campaign_active(campaign_id: UUID, active: bool) -> Campaign | None:
+    """Toggle whether a campaign is dial-eligible. Reversible and low-stakes —
+    unlike removing a lead, deactivating a campaign touches no history; its
+    leads and calls are untouched, and due_leads()/campaign_tick simply stop
+    selecting them while active=false."""
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "update campaigns set active = $2 where campaign_id = $1 returning *",
+        campaign_id, active,
+    )
+    return _row_to_campaign(row) if row else None
+
+
 async def get_campaign_by_name(name: str) -> Campaign | None:
     """Used by app/sheets/sync.py to resolve a Sheet row's "Campaign" column
     (a human-typed name) to a campaign_id. Most-recently-created wins if a

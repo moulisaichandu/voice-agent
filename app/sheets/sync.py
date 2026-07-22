@@ -21,15 +21,23 @@ from app.sheets.client import get_worksheet
 
 logger = logging.getLogger(__name__)
 
-_NAME_HINTS = ("name",)
-_PHONE_HINTS = ("phone", "mobile", "number", "contact", "whatsapp")
-_CAMPAIGN_HINTS = ("campaign",)
-_LANGUAGE_HINTS = ("language", "lang")
-_CONSENT_BASIS_HINTS = ("consent basis", "consent")
-_CONSENT_AT_HINTS = ("consent at", "consent timestamp", "consent date")
+# Public because three callers need the SAME answer to "which column is the
+# phone number in this human's spreadsheet": this module, app/sheets/writeback.py
+# (matching a transcript back to its row) and app/leads_import.py (an uploaded
+# file). writeback.py used to carry its own inline rule, which could pick a
+# different column than sync did — on headers like
+# ["Name", "Telephone Ext", "Mobile"] sync matches "Mobile" and the old
+# writeback rule matched "Telephone Ext", so every write-back silently failed
+# forever. One implementation, one answer.
+NAME_HINTS = ("name",)
+PHONE_HINTS = ("phone", "mobile", "number", "contact", "whatsapp")
+CAMPAIGN_HINTS = ("campaign",)
+LANGUAGE_HINTS = ("language", "lang")
+CONSENT_BASIS_HINTS = ("consent basis", "consent")
+CONSENT_AT_HINTS = ("consent at", "consent timestamp", "consent date")
 
 
-def _find_column(headers: list[str], hints: tuple[str, ...]) -> str | None:
+def find_column(headers: list[str], hints: tuple[str, ...]) -> str | None:
     """First header whose lowercased text contains any hint word, preferring
     an exact (case-insensitive) match over a substring match."""
     lowered = {h: h.lower().strip() for h in headers}
@@ -42,7 +50,7 @@ def _find_column(headers: list[str], hints: tuple[str, ...]) -> str | None:
     return None
 
 
-def _parse_consent_at(raw: object) -> datetime | None:
+def parse_consent_at(raw: object) -> datetime | None:
     if not raw:
         return None
     text = str(raw).strip()
@@ -66,12 +74,12 @@ async def sheets_sync() -> int:
         return 0
 
     headers = list(rows[0].keys())
-    name_col = _find_column(headers, _NAME_HINTS)
-    phone_col = _find_column(headers, _PHONE_HINTS)
-    campaign_col = _find_column(headers, _CAMPAIGN_HINTS)
-    language_col = _find_column(headers, _LANGUAGE_HINTS)
-    consent_basis_col = _find_column(headers, _CONSENT_BASIS_HINTS)
-    consent_at_col = _find_column(headers, _CONSENT_AT_HINTS)
+    name_col = find_column(headers, NAME_HINTS)
+    phone_col = find_column(headers, PHONE_HINTS)
+    campaign_col = find_column(headers, CAMPAIGN_HINTS)
+    language_col = find_column(headers, LANGUAGE_HINTS)
+    consent_basis_col = find_column(headers, CONSENT_BASIS_HINTS)
+    consent_at_col = find_column(headers, CONSENT_AT_HINTS)
 
     if not phone_col:
         logger.error("[sheets] no phone-like column found in the leads sheet — nothing synced")
@@ -106,7 +114,7 @@ async def sheets_sync() -> int:
             language_pref=str(row.get(language_col) or "auto").strip() if language_col else "auto",
             consent_basis=str(row.get(consent_basis_col) or "").strip() or None
             if consent_basis_col else None,
-            consent_at=_parse_consent_at(row.get(consent_at_col)) if consent_at_col else None,
+            consent_at=parse_consent_at(row.get(consent_at_col)) if consent_at_col else None,
         )
         synced += 1
 

@@ -26,7 +26,9 @@ fire twice, per the blueprint's own "one scheduler, one instance" warning).
 
 from __future__ import annotations
 
+import json
 import logging
+from datetime import datetime, timezone
 from uuid import UUID
 
 import pytz
@@ -56,6 +58,13 @@ logger = logging.getLogger(__name__)
 _WRITEBACK_BATCH_SIZE = 25
 
 _scheduler: AsyncIOScheduler | None = None
+
+# Sheets sync failures previously only reached a log line — invisible to
+# anyone not tailing the container. The admin API's /admin/sheets-status
+# reads this key so "did the last sync work, and when" is answerable from the
+# console instead of shelling in. Redis is the right home per CLAUDE.md:
+# ephemeral, rebuildable, and this is the one place that already writes it.
+SHEETS_LAST_SYNC_KEY = "sheets:last_sync"
 
 
 async def campaign_tick(campaign_id: UUID | None = None) -> int:
@@ -119,13 +128,22 @@ async def dnd_refresh() -> None:
 
 
 async def sheets_sync() -> None:
+    r = redis_client.get_redis()
+    now_iso = datetime.now(timezone.utc).isoformat()
     try:
-        await sheets_sync_module.sheets_sync()
+        synced = await sheets_sync_module.sheets_sync()
+        record = {"at": now_iso, "synced": synced, "error": None}
     except Exception as exc:
         # A Sheets outage/misconfiguration must not crash the scheduler loop
         # (which also runs campaign_tick/retry_sweeper/dnd_refresh) — log and
         # let the next interval retry.
         logger.error(f"[scheduler] sheets_sync failed: {type(exc).__name__}: {exc}")
+        record = {"at": now_iso, "synced": None, "error": f"{type(exc).__name__}: {exc}"}
+
+    try:
+        await r.set(SHEETS_LAST_SYNC_KEY, json.dumps(record))
+    except Exception:
+        pass  # Redis itself may be what's down; the log line above still landed
 
 
 async def transcript_reconcile() -> None:

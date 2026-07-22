@@ -17,14 +17,46 @@ course facts): the fallback asserts nothing.
 from __future__ import annotations
 
 import logging
+import secrets
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 
+from app.config import RAG_TOOL_SECRET
 from app.rag.search import NO_MATERIAL_NOTE, search_relevant
 
 router = APIRouter(tags=["RAG"])
 logger = logging.getLogger(__name__)
+
+# The header ElevenLabs is configured to send on every tool call. A header, not
+# a query param: uvicorn's access log writes query strings verbatim, so a
+# ?token= form would print this secret on every tool call of every call.
+RAG_TOKEN_HEADER = "X-RAG-Token"
+
+
+async def require_rag_tool_auth(
+    x_rag_token: str | None = Header(default=None, alias=RAG_TOKEN_HEADER),
+) -> None:
+    """Shared-secret gate for the live agent's tool.
+
+    Open when RAG_TOOL_SECRET is unset, matching CALL_WEBHOOK_SECRET's
+    local-dev behaviour — and, like it, app/main.py refuses to boot in that
+    state behind a PUBLIC_BASE_URL, so an open endpoint can only ever be a
+    local one.
+
+    Compared as bytes with compare_digest: a plain `==` leaks the secret's
+    prefix by timing, and compare_digest raises TypeError on a non-ASCII str,
+    which would turn a junk header into a 500 instead of a clean 401.
+
+    ElevenLabs is the only caller. The secret therefore lives on their side
+    and on the server, and never needs to reach a browser — the console has no
+    retrieval page.
+    """
+    if not RAG_TOOL_SECRET:
+        return
+    supplied = (x_rag_token or "").encode("utf-8", errors="replace")
+    if not secrets.compare_digest(supplied, RAG_TOOL_SECRET.encode()):
+        raise HTTPException(status_code=401, detail="unauthorized")
 
 
 class RagQuery(BaseModel):
@@ -33,7 +65,7 @@ class RagQuery(BaseModel):
     query: str = Field(min_length=1, max_length=512)
 
 
-@router.post("/rag/search")
+@router.post("/rag/search", dependencies=[Depends(require_rag_tool_auth)])
 async def rag_search(body: RagQuery) -> dict:
     """Look up course material for a query — called by the ElevenLabs agent
     when it invokes the search_course_material tool. Returns text the agent

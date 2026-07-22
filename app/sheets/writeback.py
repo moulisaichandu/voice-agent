@@ -27,6 +27,7 @@ from app.compliance.dnd import normalize_phone_e164
 from app.db import calls as calls_db
 from app.db import leads as leads_db
 from app.sheets.client import get_worksheet
+from app.sheets.sync import PHONE_HINTS, find_column
 
 logger = logging.getLogger(__name__)
 
@@ -89,9 +90,14 @@ async def write_back_lead(lead_id: UUID) -> bool:
     ws = await get_worksheet()
     col_map = await _ensure_writeback_columns(ws)
     headers = await asyncio.to_thread(ws.row_values, 1)
-    phone_header = next(
-        (h for h in headers if "phone" in h.lower() or "mobile" in h.lower()), None,
-    )
+    # The SAME rule sheets_sync uses to pick the phone column — see
+    # sync.find_column. This was an inline `"phone" in h or "mobile" in h`
+    # scan, which could resolve to a different column than sync did and then
+    # fail to match every lead forever: on ["Name", "Telephone Ext", "Mobile"]
+    # sync picks "Mobile" (exact match wins) while the old rule picked
+    # "Telephone Ext". It also found no column at all for a sheet whose header
+    # is "WhatsApp Number", which sync handles fine.
+    phone_header = find_column(headers, PHONE_HINTS)
     if phone_header is None:
         logger.error("[sheets] write_back_lead: no phone column found in the sheet")
         return False

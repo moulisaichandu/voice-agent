@@ -16,3 +16,6 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# Superpowers scratch (SDD ledger, task briefs, review packages)
+.superpowers/

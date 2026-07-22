@@ -10,13 +10,16 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql://voiceagent:voiceagent@postgres:5432/voiceagent
-      # Falls back to the local dev tunnel ONLY when .env doesn't set one (the
-      # `:-` form treats an empty value as unset too). Set PUBLIC_BASE_URL in
-      # .env for anything real and it wins automatically — this default exists
-      # so a dev machine isn't blocked on getting that one line into .env.
-      # NOT a secret: it's a hostname ElevenLabs must reach. The webhook
-      # SECRET stays in .env and is never committed.
-      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://pet-unable-durham-attention.trycloudflare.com}
+      # Passed straight through from .env (empty if unset). NOT hardcoded to a
+      # tunnel hostname any more: quick tunnels get a new random name on every
+      # start, so a baked-in default is guaranteed to rot — it used to point at
+      # a tunnel that had been dead for days, which read as a broken app.
+      #
+      # scripts/resolve_public_url.sh decides the effective value at startup:
+      # a reachable PUBLIC_BASE_URL wins, otherwise it asks the cloudflared
+      # service below for the tunnel it is currently serving.
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      TUNNEL_DISCOVERY_URL: http://cloudflared:20241
     # Host port 8091, not 8000: the sibling ai-voice-agent project runs its own
     # server on host:8000 — these are two independent apps and must not collide.
     # Container-internal port stays 8000 (matches the Dockerfile/uvicorn command).
@@ -28,8 +31,31 @@ services:
         condition: service_healthy
         required: false   # postgres only runs under the "dev" profile
     restart: unless-stopped
+    # Resolves PUBLIC_BASE_URL (see the script's own docstring) and then execs
+    # the command below. It must run BEFORE uvicorn because app/config.py reads
+    # the variable once at import, and modules bind it by name from there.
+    entrypoint: ["/app_root/scripts/resolve_public_url.sh"]
     # Single worker keeps APScheduler single-instance.
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
+
+  # The public tunnel Plivo needs to reach /calls/answer and /calls/stream.
+  #
+  # Runs HERE rather than in a terminal someone has to remember to keep open:
+  # closing that terminal, or rebooting, silently broke every call, and the
+  # only symptom was preflight saying the URL was unreachable. As a compose
+  # service it starts with `docker compose up` and comes back on its own.
+  #
+  # Still a QUICK tunnel — the hostname changes on every restart. That is now
+  # harmless because nothing writes it down: the backend's entrypoint asks this
+  # container for the current one. For a fixed hostname, move to a NAMED tunnel
+  # (needs a domain on a Cloudflare account) and just set PUBLIC_BASE_URL in
+  # .env — a reachable value there wins and discovery is skipped.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    # --metrics serves /quicktunnel, which is how the backend learns the URL.
+    command: tunnel --no-autoupdate --metrics 0.0.0.0:20241 --url http://backend:8000
+    restart: unless-stopped
+    depends_on: [backend]
 
   redis:
     image: redis:7-alpine

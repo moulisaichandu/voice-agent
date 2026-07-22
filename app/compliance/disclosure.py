@@ -7,10 +7,32 @@ to create a campaign whose script doesn't pass, so a missing disclosure can
 never reach a real dial, not just get flagged in review.
 
 Pure logic, no I/O. Detection is keyword-based, not semantic — TCCCPR doesn't
-mandate exact wording, so this checks for a recognisable disclosure marker
-(English "AI"/"artificial intelligence", or Telugu "కృత్రిమ మేధ", the
-standard Telugu rendering of "artificial intelligence") in the FIRST sentence
-only — a script that discloses AI involvement later, or not at all, fails.
+mandate exact wording, so this looks for a recognisable marker that the CALLER
+IS A MACHINE, in the script's opening only.
+
+Two things this deliberately gets right, both of which a naive `"ai" in first
+sentence` check gets wrong:
+
+  1. The brand name is not a disclosure. This business trades as "AI Skills"
+     (aiskills.in), so a bare \\bai\\b match accepted
+     "Hello from AI Skills, we have a new course." — a script that discloses
+     nothing whatsoever — as compliant. Brand names are stripped BEFORE
+     looking for a marker, so the company's own name can never be mistaken
+     for telling someone they're talking to a bot.
+
+  2. A BARE greeting before the disclosure is still a disclosure. Splitting on
+     the first [.!?] rejected "Namaste! This is an AI voice assistant..."
+     because the "first sentence" was just "Namaste" — a false negative that
+     blocks a perfectly compliant script and sends the operator round in
+     circles. So a first sentence that is only a greeting rolls the window
+     forward to the next one.
+
+     This does NOT weaken the "first line" rule, because the roll-forward is
+     conditional on the first sentence saying nothing substantive.
+     "Namaste, this is Digital Brolly. By the way, this is an AI call." still
+     fails: its first sentence identifies the caller WITHOUT disclosing, which
+     is precisely the non-compliant pattern of sounding human up front and
+     admitting the machine later.
 """
 
 from __future__ import annotations
@@ -18,26 +40,77 @@ from __future__ import annotations
 import re
 
 _SENTENCE_END = re.compile(r"[.!?\n]")
+
+# A first sentence of at most this many words counts as a BARE greeting
+# ("Namaste!", "Hello there!") and rolls the window forward to the next
+# sentence. Anything longer is already making a substantive claim, so the
+# disclosure has to be in it — see the module docstring, point 2.
+_GREETING_MAX_WORDS = 3
+_MAX_OPENING_CHARS = 200
+
+# Stripped before marker matching so the company's OWN name can't satisfy the
+# disclosure. Order matters only in that longer forms should precede shorter
+# ones. Matched case-insensitively as whole words.
+_BRAND_NAMES = ("ai skills", "aiskills", "digital brolly")
+
 _AI_WORD = re.compile(r"\bai\b", re.IGNORECASE)
 # Substring markers beyond bare "AI" — checked case-insensitively, so no word
 # boundary needed (none of these are common English substrings of other words).
-_DISCLOSURE_MARKERS = ("artificial intelligence", "automated voice", "voice assistant",
-                       "కృత్రిమ మేధ")
+# Each must convey MACHINE-ness on its own; a marker that merely names the
+# company or the product does not belong here.
+_DISCLOSURE_MARKERS = (
+    "artificial intelligence",
+    "automated voice",
+    "automated call",
+    "voice assistant",
+    "voice bot",
+    "virtual assistant",
+    "కృత్రిమ మేధ",  # Telugu: "artificial intelligence"
+    "ఆటోమేటెడ్",  # Telugu: "automated"
+)
 
 
-def _first_sentence(script: str) -> str:
-    match = _SENTENCE_END.search(script)
-    return script[: match.start()] if match else script
+def _strip_brand_names(text: str) -> str:
+    """Remove the company's own trading names so they can't be misread as a
+    disclosure. See this module's docstring, point 1."""
+    out = text
+    for brand in _BRAND_NAMES:
+        out = re.sub(rf"\b{re.escape(brand)}\b", " ", out, flags=re.IGNORECASE)
+    return out
+
+
+def _split_first_sentence(text: str) -> tuple[str, str]:
+    match = _SENTENCE_END.search(text)
+    if match is None:
+        return text, ""
+    return text[: match.start()], text[match.end() :]
+
+
+def _is_bare_greeting(sentence: str) -> bool:
+    """True for an opener that asserts nothing — "Namaste!", "Hello there!".
+    Once a sentence names the caller it is no longer bare, and the disclosure
+    belongs in it."""
+    return len(sentence.split()) <= _GREETING_MAX_WORDS
+
+
+def _opening(script: str) -> str:
+    """The part of *script* a disclosure has to appear in — see the module
+    docstring, point 2."""
+    first, remainder = _split_first_sentence(script)
+    if _is_bare_greeting(first):
+        second, _ = _split_first_sentence(remainder)
+        return f"{first} {second}"[:_MAX_OPENING_CHARS]
+    return first[:_MAX_OPENING_CHARS]
 
 
 def has_ai_disclosure(script: str | None) -> bool:
-    """True only if *script*'s first sentence contains a recognisable AI
-    disclosure marker. None/blank scripts fail outright — no script means no
+    """True only if *script*'s opening contains a recognisable marker that the
+    caller is a machine. None/blank scripts fail outright — no script means no
     disclosure was ever spoken."""
     if not script or not script.strip():
         return False
-    first = _first_sentence(script)
-    if _AI_WORD.search(first):
+    opening = _strip_brand_names(_opening(script))
+    if _AI_WORD.search(opening):
         return True
-    lowered = first.lower()
+    lowered = opening.lower()
     return any(marker in lowered for marker in _DISCLOSURE_MARKERS)

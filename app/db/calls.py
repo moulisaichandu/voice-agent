@@ -10,6 +10,7 @@ retried webhook cannot create a duplicate row even if the Redis key expired.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from uuid import UUID
 
 from app.db.models import Call, TranscriptTurn
@@ -45,7 +46,7 @@ async def create_call(
 
 
 async def set_conversation_and_record(
-    *, lead_id: UUID, el_conversation_id: str, status: str, turns: int,
+    *, lead_id: UUID, el_conversation_id: str | None, status: str, turns: int,
     transcript: list[TranscriptTurn], summary: str | None,
 ) -> Call | None:
     """Attach an ElevenLabs conversation_id to this lead's most recent call row
@@ -59,12 +60,23 @@ async def set_conversation_and_record(
 
     Scoped to the newest call for the lead so a retry updates the attempt it
     belongs to rather than an older one.
+
+    *el_conversation_id* may be None, and is then left as it was rather than
+    nulling out an id already recorded. A call can end with no conversation id
+    at all — most importantly when ElevenLabs refuses the WebSocket handshake
+    over a payment issue, so no conversation_initiation_metadata is ever sent.
+    Callers used to skip this write entirely in that case, leaving the row at
+    status=NULL/ended_at=NULL forever; recording the failure is the whole
+    point. Postgres allows repeated NULLs under the unique index on this
+    column, so the schema-level duplicate guard (migrations/0001_init.sql) is
+    unaffected.
     """
     pool = await get_pool()
     row = await pool.fetchrow(
         """
         update calls
-        set el_conversation_id = $2, status = $3, turns = $4,
+        set el_conversation_id = coalesce($2, el_conversation_id),
+            status = $3, turns = $4,
             transcript = $5::jsonb, summary = $6, ended_at = now()
         where call_id = (
             select call_id from calls where lead_id = $1
@@ -96,6 +108,49 @@ async def list_calls_for_campaign(campaign_id: UUID) -> list[Call]:
         "select * from calls where campaign_id = $1 order by created_at desc", campaign_id,
     )
     return [_row_to_call(r) for r in rows]
+
+
+async def list_recent_calls(limit: int = 50) -> list[Call]:
+    """Most recent calls across every campaign — the admin API's call-history
+    view. Not scoped to active campaigns: a call that already happened is
+    history regardless of whether its campaign is still active."""
+    pool = await get_pool()
+    rows = await pool.fetch("select * from calls order by created_at desc limit $1", limit)
+    return [_row_to_call(r) for r in rows]
+
+
+async def list_calls_for_lead(lead_id: UUID) -> list[Call]:
+    """Every call ever placed to this lead — the admin API's per-lead history."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "select * from calls where lead_id = $1 order by created_at desc", lead_id,
+    )
+    return [_row_to_call(r) for r in rows]
+
+
+async def call_counts_since(
+    since: datetime, *, active_campaigns_only: bool = False,
+) -> dict[str, int]:
+    """{"total": N, "with_transcript": N} for calls started at or after
+    *since* — the dashboard's "calls today" stat. with_transcript counts
+    calls whose turns > 0: actually connected and talked, not just attempted.
+
+    active_campaigns_only matches lead_status_counts_for_active_campaigns()'s
+    reasoning: a dev database repeatedly exercised by the integration suite
+    accumulates calls against deactivated test-*/pipeline-* campaigns, which
+    would otherwise dominate a same-day count that's supposed to reflect
+    real campaign activity."""
+    pool = await get_pool()
+    query = "select count(*) as total, count(*) filter (where turns > 0) as with_transcript " \
+            "from calls c where c.started_at >= $1"
+    if active_campaigns_only:
+        query = (
+            "select count(*) as total, count(*) filter (where c.turns > 0) as with_transcript "
+            "from calls c join campaigns camp on camp.campaign_id = c.campaign_id "
+            "where c.started_at >= $1 and camp.active = true"
+        )
+    row = await pool.fetchrow(query, since)
+    return {"total": row["total"], "with_transcript": row["with_transcript"]}
 
 
 async def get_call_by_conversation_id(el_conversation_id: str) -> Call | None:

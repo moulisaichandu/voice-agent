@@ -117,7 +117,35 @@ def mocks(monkeypatch):
     monkeypatch.setattr(worker, "try_acquire_call_slot", acquire_slot)
     monkeypatch.setattr(worker, "release_call_slot", release_slot)
 
+    # Pinned open, or every dial test here would depend on the wall clock of
+    # whoever runs pytest and fail outside 10:00-19:00 IST. The closed case is
+    # asserted explicitly below.
+    monkeypatch.setattr(worker, "within_calling_hours", lambda: True)
+
     return SimpleNamespace(lead=lead, campaign=campaign, calls=calls)
+
+
+async def test_outside_calling_hours_the_lead_is_never_dialled(mocks, monkeypatch):
+    """REGRESSION. campaign_tick checked calling hours at ENQUEUE time and
+    process_one never re-checked, but queued leads outlive that check:
+    calls:queue is AOF-persisted on a named volume and the backend runs
+    restart: unless-stopped, so a batch queued at 18:58 was dialled in full
+    whenever the process next came back — 02:30, say. retry_sweeper's reaper
+    runs 24/7 and could feed the same path. CLAUDE.md makes the window a hard
+    rule, so it has to hold at the moment of dialling, not only at queueing."""
+    monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
+    monkeypatch.setattr(worker, "within_calling_hours", lambda: False)
+
+    await worker.process_one(str(mocks.lead.lead_id))
+
+    assert mocks.calls["create_call"] == [], "must not place a call out of hours"
+    assert mocks.calls["mark_calling"] == [], "must not even reserve the lead"
+    assert mocks.calls["record_dial_attempt"] == [], "must not burn an attempt"
+    # Back to 'pending' specifically: nothing else transitions 'queued' ->
+    # 'pending', so leaving it queued would strand the lead forever because
+    # due_leads() only ever selects 'pending'.
+    assert mocks.calls["mark_result"] == [(mocks.lead.lead_id, "pending")]
+    assert mocks.calls["ack"] == [str(mocks.lead.lead_id)]
 
 
 async def test_dnd_lead_is_marked_and_never_dialled(mocks, monkeypatch):

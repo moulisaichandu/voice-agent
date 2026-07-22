@@ -1,10 +1,19 @@
-"""Unit tests for telephony/bridge.py's pure parts — the answer XML.
+"""Unit tests for telephony/bridge.py.
 
-The bridge loop itself needs two live WebSockets and is exercised end to end
-against a real call; what is unit-testable here is the XML Plivo fetches on
-answer, which is easy to get subtly wrong and fails in a way that is very hard
-to diagnose from the outside (the call rings, connects, and is silent).
+Two groups. The answer XML is pure and easy to get subtly wrong, and fails in
+a way that is very hard to diagnose from the outside (the call rings,
+connects, and is silent).
+
+The bridge loop itself is driven here against a pair of fake WebSockets. That
+is worth the fakes because the loop's two failure modes are both expensive and
+both invisible in a passing call: a one-way call that never hangs up bills
+CALL_MAX_DURATION_S of silence to every lead, and an exception mid-call used
+to throw away the transcript of a conversation that really happened.
 """
+
+import asyncio
+import base64
+import json
 
 import pytest
 
@@ -59,3 +68,179 @@ def test_answer_xml_handles_a_http_base_url(monkeypatch):
     monkeypatch.setattr(bridge, "PUBLIC_BASE_URL", "http://localhost:8091")
     xml = bridge.answer_xml("lead-1")
     assert "ws://localhost:8091/calls/stream" in xml
+
+
+# ── the bridge loop ──────────────────────────────────────────────────────────
+
+# 80 ms of mu-law: long enough to be realistic, short enough that waiting for
+# it to "play out" costs the test nothing.
+_AUDIO_B64 = base64.b64encode(b"\xff" * 640).decode()
+
+
+def _metadata(fmt: str = "ulaw_8000") -> str:
+    return json.dumps({
+        "type": "conversation_initiation_metadata",
+        "conversation_initiation_metadata_event": {
+            "conversation_id": "conv_test_1", "agent_output_audio_format": fmt,
+        },
+    })
+
+
+def _audio() -> str:
+    return json.dumps({"type": "audio", "audio_event": {"audio_base_64": _AUDIO_B64}})
+
+
+def _agent_says(text: str) -> str:
+    return json.dumps({
+        "type": "agent_response", "agent_response_event": {"agent_response": text},
+    })
+
+
+class _FakeElevenLabsWS:
+    """Yields *messages*, then goes quiet forever — which is exactly what the
+    real service does on a one-way call: with no user audio forwarded it has
+    no turn to end, so it never closes the socket."""
+
+    def __init__(self, messages: list[str], *, raise_on_exit: Exception | None = None):
+        self._messages = list(messages)
+        self._raise_on_exit = raise_on_exit
+        self.sent: list[str] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        if self._raise_on_exit is not None:
+            raise self._raise_on_exit
+        return False
+
+    async def send(self, payload):
+        self.sent.append(payload)
+
+    def __aiter__(self):
+        async def _gen():
+            for m in self._messages:
+                yield m
+            await asyncio.Event().wait()  # never closes on its own
+        return _gen()
+
+
+class _FakePlivoWS:
+    """A lead who has answered and is saying nothing — the normal case on a
+    one-way call."""
+
+    def __init__(self):
+        self.sent: list[dict] = []
+
+    async def receive_text(self):
+        await asyncio.Event().wait()
+
+    async def send_text(self, raw):
+        self.sent.append(json.loads(raw))
+
+
+@pytest.fixture
+def bridged(monkeypatch):
+    """Wire bridge() to fakes and make the one-way timings test-fast."""
+    monkeypatch.setattr(bridge, "ELEVENLABS_API_KEY", "sk-test")
+    monkeypatch.setattr(bridge, "ONEWAY_SILENCE_TAIL_S", 0)
+    monkeypatch.setattr(bridge, "ONEWAY_MAX_SILENT_S", 0)
+
+    async def fake_signed_url(agent_id):
+        return "wss://elevenlabs.invalid/signed"
+
+    monkeypatch.setattr(bridge, "_signed_url", fake_signed_url)
+
+    def _install(el_ws):
+        monkeypatch.setattr(bridge.websockets, "connect", lambda *a, **kw: el_ws)
+
+    return _install
+
+
+async def test_a_one_way_call_ends_once_the_message_has_played(bridged):
+    """REGRESSION, and the most expensive bug this suite covers. A one-way
+    bridge never forwards the lead's audio, so ElevenLabs gets no turn-end
+    signal and never closes; from_plivo only returns if the lead hangs up.
+    Nothing set `stop`, so the bridge sat on CALL_MAX_DURATION_S — 300
+    seconds of billed Plivo airtime and a 300-second ElevenLabs conversation
+    for a 20-second message, with the lead listening to silence throughout."""
+    el_ws = _FakeElevenLabsWS([_metadata(), _agent_says("This is an AI call."), _audio()])
+    bridged(el_ws)
+    plivo_ws = _FakePlivoWS()
+
+    outcome = await asyncio.wait_for(
+        bridge.bridge(plivo_ws, agent_id="agent_1", lead_id="lead-1", one_way=True),
+        timeout=5,
+    )
+
+    assert outcome["status"] == "done", (
+        "a one-way call that delivered its message ran its course — recording it "
+        "'failed' would mark the lead failed and burn a retry on a perfect call"
+    )
+    assert outcome["conversation_id"] == "conv_test_1"
+    assert [t.text for t in outcome["transcript"]] == ["This is an AI call."]
+    assert any(m["event"] == "playAudio" for m in plivo_ws.sent)
+
+
+async def test_a_one_way_call_with_a_silent_agent_gives_up(bridged):
+    """An agent that never speaks (a broken prompt, a dynamic variable it is
+    waiting on) must cost ONEWAY_MAX_SILENT_S, not CALL_MAX_DURATION_S."""
+    el_ws = _FakeElevenLabsWS([_metadata()])
+    bridged(el_ws)
+
+    outcome = await asyncio.wait_for(
+        bridge.bridge(_FakePlivoWS(), agent_id="agent_1", lead_id="lead-1", one_way=True),
+        timeout=5,
+    )
+
+    assert outcome["status"] == "failed", "nothing was said, so nothing was delivered"
+    assert outcome["turns"] == 0
+
+
+async def test_a_two_way_call_is_not_ended_by_the_watchdog(bridged, monkeypatch):
+    """The watchdog must run for one-way calls ONLY. On a two-way call the
+    silence after the agent's greeting is the lead thinking about their reply;
+    hanging up on it would cut off every conversation at hello."""
+    monkeypatch.setattr(bridge, "CALL_MAX_DURATION_S", 1)
+    el_ws = _FakeElevenLabsWS([_metadata(), _audio()])
+    bridged(el_ws)
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await asyncio.wait_for(
+        bridge.bridge(_FakePlivoWS(), agent_id="agent_1", lead_id="lead-1", one_way=False),
+        timeout=5,
+    )
+    elapsed = loop.time() - started
+
+    # Asserted on ELAPSED TIME, not on the outcome: a wrongly-running watchdog
+    # would exit with "oneway_complete", which is also a 'done' status, so
+    # only the timing distinguishes the two. The fakes fall silent
+    # immediately, so anything near the 1s cap means nothing cut the call
+    # short — with ONEWAY_SILENCE_TAIL_S monkeypatched to 0, a live watchdog
+    # would have ended it within a poll interval.
+    assert elapsed >= 0.9, f"the call was ended early, after {elapsed:.2f}s"
+
+
+async def test_a_mid_call_failure_still_yields_what_was_collected(bridged):
+    """REGRESSION. bridge()'s results used to be reachable only through its
+    return value, and call_routes kept its own default dict — so an exception
+    escaping the `async with` discarded a real conversation and recorded zero
+    turns, no conversation_id, and a 'failed' lead that then burned a retry."""
+    el_ws = _FakeElevenLabsWS(
+        [_metadata(), _agent_says("Hello."), _audio()],
+        raise_on_exit=RuntimeError("socket died on close"),
+    )
+    bridged(el_ws)
+
+    outcome: dict = {}
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(
+            bridge.bridge(_FakePlivoWS(), agent_id="agent_1", lead_id="lead-1",
+                          one_way=True, outcome=outcome),
+            timeout=5,
+        )
+
+    assert outcome["conversation_id"] == "conv_test_1"
+    assert outcome["turns"] == 1
+    assert [t.text for t in outcome["transcript"]] == ["Hello."]

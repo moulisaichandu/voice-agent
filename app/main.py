@@ -32,6 +32,7 @@ from app.config import (
     ELEVENLABS_WEBHOOK_SECRET,
     LOG_LEVEL,
     PUBLIC_BASE_URL,
+    RAG_TOOL_SECRET,
     SCHEDULER_ENABLED,
     WORKER_ENABLED,
 )
@@ -81,13 +82,47 @@ async def lifespan(app: FastAPI):
             "to deliberately run open (not recommended)."
         )
 
-    # A wildcard CORS origin combined with a real auth token lets any website
-    # attach an Authorization header to a cross-origin request against this API.
-    if APP_AUTH_TOKEN and "*" in ALLOWED_ORIGINS and not ALLOW_INSECURE_PUBLIC:
+    # /rag/search is the two-way agent's live tool. Every request costs real
+    # money — a paid OpenAI embedding, plus a paid gpt-4o-mini completion when
+    # the first attempt misses — and the response is verbatim course material.
+    # Open on a public URL it is both a billing drain and a way to extract the
+    # whole corpus a few chunks at a time.
+    if PUBLIC_BASE_URL and not RAG_TOOL_SECRET and not ALLOW_INSECURE_PUBLIC:
         raise RuntimeError(
-            "Refusing to start: ALLOWED_ORIGINS contains '*' while APP_AUTH_TOKEN is "
-            "set. Set ALLOWED_ORIGINS to your real origin(s), or set "
-            "ALLOW_INSECURE_PUBLIC=1 to deliberately allow a wildcard origin."
+            "Refusing to start: PUBLIC_BASE_URL is set but RAG_TOOL_SECRET is not. "
+            "POST /rag/search would be open to the internet, where each request "
+            "spends OpenAI credit and returns your course documents verbatim. Set "
+            "RAG_TOOL_SECRET to a random string and add it as the X-RAG-Token "
+            "header on the agent's search tool in the ElevenLabs dashboard, or set "
+            "ALLOW_INSECURE_PUBLIC=1 to deliberately run open (not recommended)."
+        )
+
+    # The admin API fails OPEN when APP_AUTH_TOKEN is unset (see
+    # admin/__init__.py's require_admin_auth) — fine on a laptop, unacceptable
+    # once the app is reachable from the internet. Without this check the two
+    # guards above protected the webhook surfaces while /admin, the surface
+    # that can create campaigns and PLACE REAL CALLS, sat wide open to anyone
+    # who learned the tunnel hostname. It is also the surface that returns
+    # lead PII and full call transcripts.
+    if PUBLIC_BASE_URL and not APP_AUTH_TOKEN and not ALLOW_INSECURE_PUBLIC:
+        raise RuntimeError(
+            "Refusing to start: PUBLIC_BASE_URL is set but APP_AUTH_TOKEN is not. "
+            "Every /admin route would be open to the internet — including "
+            "POST /admin/trigger-tick, which places real phone calls, and "
+            "GET /admin/calls, which returns lead PII and transcripts. Set "
+            "APP_AUTH_TOKEN to a random string, or set ALLOW_INSECURE_PUBLIC=1 "
+            "to deliberately run open (not recommended)."
+        )
+
+    # A wildcard CORS origin lets any website read this API's responses from a
+    # visitor's browser. NOT conditioned on APP_AUTH_TOKEN being set: with no
+    # token the endpoints need no credentials at all, so a wildcard is MORE
+    # dangerous there, not less — that combination used to boot happily.
+    if "*" in ALLOWED_ORIGINS and not ALLOW_INSECURE_PUBLIC:
+        raise RuntimeError(
+            "Refusing to start: ALLOWED_ORIGINS contains '*'. Set it to your real "
+            "origin(s), or set ALLOW_INSECURE_PUBLIC=1 to deliberately allow a "
+            "wildcard origin."
         )
 
     # Redis unreachable at startup must NOT crash the app — health/RAG/Sheets-sync
@@ -109,6 +144,22 @@ async def lifespan(app: FastAPI):
         scheduler.start()
     elif SCHEDULER_ENABLED:
         logger.warning("[startup] SCHEDULER_ENABLED but Redis is down — not starting it.")
+
+    # Rebuild the dial-time DND set NOW rather than waiting for dnd_refresh's
+    # 06:00 cron. CLAUDE.md calls Redis ephemeral and safe to flush, but the
+    # DND set was written by that cron alone — so a flush, a recreated volume,
+    # or a fresh managed Redis left the worker's SISMEMBER scrub matching
+    # nothing at all, silently, for up to 20 hours. An empty set is
+    # indistinguishable from "nobody has opted out". This makes the set
+    # genuinely rebuildable, which is what "safe to flush" has to mean.
+    if redis_ok:
+        try:
+            await scheduler.dnd_refresh()
+        except Exception:
+            logger.exception(
+                "[startup] could not rebuild the DND set — the dial-time scrub "
+                "may be incomplete until dnd_refresh next runs"
+            )
 
     # The call worker: a background asyncio task in this same process (see
     # config.WORKER_ENABLED) — nothing else consumes calls:queue, so without
@@ -160,7 +211,7 @@ app.add_middleware(
 )
 
 # ── Routers ───────────────────────────────────────────────────────────────────
-from app.admin.endpoint import router as admin_router  # noqa: E402
+from app.admin import router as admin_router  # noqa: E402
 from app.rag.endpoint import router as rag_router  # noqa: E402
 from app.telephony.call_routes import router as call_router  # noqa: E402
 from app.webhooks.elevenlabs import router as elevenlabs_webhook_router  # noqa: E402

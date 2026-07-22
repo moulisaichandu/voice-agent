@@ -117,6 +117,25 @@ def phone_number_exists(agent_phone_number_id: str) -> bool:
         raise
 
 
+def subscription_status() -> dict:
+    """The account's billing status — used by the admin readiness check.
+
+    A non-active status blocks every conversation at the PLATFORM level, not
+    just this app: verified live (2026-07) when the account went `past_due`
+    and the agent WebSocket refused the handshake with "This request cannot
+    be processed due to a payment issue." No retry or backoff on our side
+    fixes that — only the invoice being paid does — so it is worth a readiness
+    check of its own rather than only surfacing as an inexplicable dial
+    failure later.
+    """
+    sub = get_client().user.subscription.get()
+    return {
+        "status": sub.status,
+        "character_count": sub.character_count,
+        "character_limit": sub.character_limit,
+    }
+
+
 def construct_webhook_event(raw_body: str, sig_header: str, secret: str) -> dict:
     """Verifies the ElevenLabs-Signature HMAC and returns the parsed payload.
     Raises on a missing/invalid/expired signature — callers must not catch

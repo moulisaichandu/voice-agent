@@ -11,6 +11,11 @@ RUN pip install -r requirements.txt
 
 COPY . .
 
+# Git on Windows doesn't preserve the executable bit, so set it here rather
+# than relying on the checkout — otherwise the container dies at startup with
+# "permission denied" on the entrypoint.
+RUN chmod +x scripts/resolve_public_url.sh
+
 # Non-root for safety.
 RUN useradd -m appuser && chown -R appuser /app_root
 USER appuser

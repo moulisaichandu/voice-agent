@@ -1,150 +1,92 @@
 "use client";
 
-import { useEffect, useState, type FormEvent } from "react";
-import Link from "next/link";
-import { api, errorMessage, type Campaign, type CampaignMode } from "@/lib/api";
+import { useCallback, useEffect, useState } from "react";
+import { api, errorMessage, type Call, type Readiness, type Stats } from "@/lib/api";
+import { CallTable } from "@/components/CallTable";
+import { ReadinessStrip } from "@/components/ReadinessStrip";
+import { StatTile } from "@/components/StatTile";
+import { Card } from "@/components/ui/Card";
+import { usePolling } from "@/lib/usePolling";
 
-export default function CampaignsPage() {
-  const [campaigns, setCampaigns] = useState<Campaign[]>([]);
+const POLL_INTERVAL_MS = 10000;
+
+// Fixed order regardless of which statuses currently have leads — a pipeline
+// stage reads as "0 right now", not as absent, and the order should always
+// read left-to-right as a lead's actual lifecycle (see LEAD_STATUS_META).
+const PIPELINE_STAGES: { key: string; label: string }[] = [
+  { key: "pending", label: "Pending" },
+  { key: "queued", label: "Queued" },
+  { key: "calling", label: "Calling" },
+  { key: "done", label: "Done" },
+  { key: "failed", label: "Failed" },
+  { key: "dnd", label: "Do not call" },
+];
+
+export default function DashboardPage() {
+  const [readiness, setReadiness] = useState<Readiness | null>(null);
+  const [stats, setStats] = useState<Stats | null>(null);
+  const [recentCalls, setRecentCalls] = useState<Call[]>([]);
   const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const [includeInactive, setIncludeInactive] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  const [name, setName] = useState("");
-  const [mode, setMode] = useState<CampaignMode>("twoway");
-  const [agentId, setAgentId] = useState("");
-  const [script, setScript] = useState("");
-  const [formError, setFormError] = useState<string | null>(null);
-  const [submitting, setSubmitting] = useState(false);
-
-  async function refresh(inactive = includeInactive) {
-    setLoading(true);
-    setLoadError(null);
+  const refresh = useCallback(async () => {
     try {
-      setCampaigns(await api.listCampaigns(inactive));
+      const [r, s, c] = await Promise.all([
+        api.readiness(),
+        api.stats(),
+        api.recentCalls(10),
+      ]);
+      setReadiness(r);
+      setStats(s);
+      setRecentCalls(c);
+      setError(null);
     } catch (e) {
-      setLoadError(errorMessage(e));
+      setError(errorMessage(e));
     } finally {
       setLoading(false);
     }
-  }
+  }, []);
 
   useEffect(() => {
-    refresh(includeInactive);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [includeInactive]);
+    refresh();
+  }, [refresh]);
 
-  async function handleCreate(e: FormEvent) {
-    e.preventDefault();
-    setFormError(null);
-    setSubmitting(true);
-    try {
-      await api.createCampaign({
-        name,
-        mode,
-        agent_id: agentId,
-        script: script.trim() || undefined,
-      });
-      setName("");
-      setAgentId("");
-      setScript("");
-      await refresh();
-    } catch (e) {
-      setFormError(errorMessage(e));
-    } finally {
-      setSubmitting(false);
-    }
-  }
+  usePolling(refresh, POLL_INTERVAL_MS, true);
 
   return (
-    <div>
-      <h1>Campaigns</h1>
+    <div className="flex flex-col gap-6">
+      <h1 className="text-2xl font-semibold text-neutral-900 dark:text-neutral-50">Dashboard</h1>
 
-      <section className="card">
-        <h2>Create a campaign</h2>
-        <form onSubmit={handleCreate} className="form">
-          <label>
-            Name
-            <input value={name} onChange={(e) => setName(e.target.value)} required />
-          </label>
-          <label>
-            Mode
-            <select value={mode} onChange={(e) => setMode(e.target.value as CampaignMode)}>
-              <option value="twoway">Two-way (RAG conversation)</option>
-              <option value="oneway">One-way (message + hang up)</option>
-            </select>
-          </label>
-          <label>
-            ElevenLabs agent ID
-            <input
-              value={agentId}
-              onChange={(e) => setAgentId(e.target.value)}
-              placeholder="agent_..."
-              required
-            />
-          </label>
-          <label>
-            Script{" "}
-            {mode === "oneway"
-              ? "(required — first sentence must disclose AI, e.g. contain the word AI)"
-              : "(optional for two-way)"}
-            <textarea
-              value={script}
-              onChange={(e) => setScript(e.target.value)}
-              rows={3}
-              placeholder="This is an AI voice assistant calling on behalf of Digital Brolly..."
-            />
-          </label>
-          {formError && <p className="error">{formError}</p>}
-          <button type="submit" disabled={submitting}>
-            {submitting ? "Creating…" : "Create campaign"}
-          </button>
-        </form>
-      </section>
+      {error && <p className="text-sm text-status-critical">{error}</p>}
 
-      <section className="card">
-        <h2>Existing campaigns</h2>
-        <label className="checkbox" style={{ marginBottom: "0.75rem" }}>
-          <input
-            type="checkbox"
-            checked={includeInactive}
-            onChange={(e) => setIncludeInactive(e.target.checked)}
+      <ReadinessStrip readiness={readiness} onRefreshed={setReadiness} />
+
+      <Card title="Lead pipeline" description="Across active campaigns only — deactivated test campaigns don't count.">
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+          {PIPELINE_STAGES.map((stage) => (
+            <StatTile
+              key={stage.key}
+              label={stage.label}
+              value={loading ? "…" : (stats?.leads_by_status[stage.key] ?? 0)}
+            />
+          ))}
+        </div>
+      </Card>
+
+      <Card title="Today">
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+          <StatTile label="Calls today" value={loading ? "…" : (stats?.calls_today ?? 0)} />
+          <StatTile
+            label="With transcript"
+            value={loading ? "…" : (stats?.calls_today_with_transcript ?? 0)}
+            hint="Two-way calls that produced a recorded turn"
           />
-          Include inactive (a dev DB that&apos;s run the integration suite holds
-          hundreds of throwaway test campaigns)
-        </label>
-        {loading && <p>Loading…</p>}
-        {loadError && <p className="error">{loadError}</p>}
-        {!loading && !loadError && campaigns.length === 0 && (
-          <p>No campaigns yet — create one above.</p>
-        )}
-        {campaigns.length > 0 && (
-          <table>
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Mode</th>
-                <th>Agent</th>
-                <th>Active</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              {campaigns.map((c) => (
-                <tr key={c.campaign_id}>
-                  <td>{c.name}</td>
-                  <td>{c.mode}</td>
-                  <td className="mono">{c.agent_id}</td>
-                  <td>{c.active ? "yes" : "no"}</td>
-                  <td>
-                    <Link href={`/campaigns/${c.campaign_id}`}>View →</Link>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </section>
+        </div>
+      </Card>
+
+      <Card title="Recent calls" description="Most recent 10, across every campaign.">
+        <CallTable calls={recentCalls} loading={loading} />
+      </Card>
     </div>
   );
 }

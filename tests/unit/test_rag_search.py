@@ -7,6 +7,7 @@ Postgres/Docker dependency.
 """
 
 import pytest
+from fastapi import HTTPException
 
 from app.rag import endpoint, search
 
@@ -249,3 +250,63 @@ def test_endpoint_module_never_imports_search_permissive():
     on a comment that merely WARNS not to do this (see this module's own
     docstring, which names search_permissive for exactly that reason)."""
     assert "search_permissive" not in vars(endpoint)
+
+
+# ── tool auth (RAG_TOOL_SECRET) ──────────────────────────────────────────────
+
+def test_rag_search_is_open_when_no_tool_secret_is_configured(client, monkeypatch):
+    """Local-dev default, matching CALL_WEBHOOK_SECRET. main.py refuses to boot
+    in this state behind a PUBLIC_BASE_URL, so it can only ever be local."""
+    monkeypatch.setattr(endpoint, "RAG_TOOL_SECRET", None)
+
+    async def fake_search(q):
+        return "course material"
+
+    monkeypatch.setattr(endpoint, "search_relevant", fake_search)
+
+    r = client.post("/rag/search", json={"query": "fees"})
+    assert r.status_code == 200
+
+
+def test_rag_search_rejects_a_missing_or_wrong_tool_token(client, monkeypatch):
+    """Each request spends OpenAI credit and returns verbatim course material,
+    so an unauthenticated caller is both a billing drain and a corpus leak."""
+    monkeypatch.setattr(endpoint, "RAG_TOOL_SECRET", "s3cret")
+
+    async def boom(q):
+        raise AssertionError("must not reach the paid search path")
+
+    monkeypatch.setattr(endpoint, "search_relevant", boom)
+
+    assert client.post("/rag/search", json={"query": "fees"}).status_code == 401
+    assert client.post("/rag/search", json={"query": "fees"},
+                       headers={"X-RAG-Token": "wrong"}).status_code == 401
+
+
+def test_rag_search_accepts_the_configured_tool_token(client, monkeypatch):
+    monkeypatch.setattr(endpoint, "RAG_TOOL_SECRET", "s3cret")
+
+    async def fake_search(q):
+        return "course material"
+
+    monkeypatch.setattr(endpoint, "search_relevant", fake_search)
+
+    r = client.post("/rag/search", json={"query": "fees"},
+                    headers={"X-RAG-Token": "s3cret"})
+    assert r.status_code == 200
+    assert r.json()["result"] == "course material"
+
+
+async def test_a_non_ascii_tool_token_is_a_clean_401_not_a_crash(monkeypatch):
+    """compare_digest raises TypeError on a non-ASCII str, which would surface
+    as a 500 — an error the live agent has no script for, and an oracle
+    confirming the real secret is ASCII.
+
+    Exercised against the dependency directly rather than through the test
+    client: HTTP headers are ASCII/latin-1 on the wire, so httpx refuses to
+    send this before it ever reaches the server. The guard still encodes
+    defensively because it is not the only possible caller."""
+    monkeypatch.setattr(endpoint, "RAG_TOOL_SECRET", "s3cret")
+    with pytest.raises(HTTPException) as exc:
+        await endpoint.require_rag_tool_auth(x_rag_token="café")
+    assert exc.value.status_code == 401

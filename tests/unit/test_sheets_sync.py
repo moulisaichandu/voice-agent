@@ -114,4 +114,4 @@ async def test_sync_empty_sheet_returns_zero(monkeypatch, campaign):
 def test_find_column_prefers_exact_match_over_substring():
     # "contact" is a phone-hint word too, so "Contact Person" would ALSO
     # substring-match — an exact "phone" header must still win over it.
-    assert sync._find_column(["phone", "Contact Person"], sync._PHONE_HINTS) == "phone"
+    assert sync.find_column(["phone", "Contact Person"], sync.PHONE_HINTS) == "phone"

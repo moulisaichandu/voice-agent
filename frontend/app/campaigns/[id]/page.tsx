@@ -1,17 +1,32 @@
 "use client";
 
-import { useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { useParams } from "next/navigation";
-import { api, errorMessage, type Call, type Lead } from "@/lib/api";
+import { api, errorMessage, type Call, type Campaign, type Lead, type Readiness } from "@/lib/api";
+import { ConfirmButton } from "@/components/ConfirmButton";
+import { CallTable } from "@/components/CallTable";
+import { LeadsUpload } from "@/components/LeadsUpload";
+import { LeadTable } from "@/components/LeadTable";
+import { ReadinessStrip } from "@/components/ReadinessStrip";
+import { Badge } from "@/components/ui/Badge";
+import { Button } from "@/components/ui/Button";
+import { Card } from "@/components/ui/Card";
+import { Field, fieldControlClass } from "@/components/ui/Field";
+import { usePolling } from "@/lib/usePolling";
+
+const POLL_INTERVAL_MS = 3000;
 
 export default function CampaignDetailPage() {
   const params = useParams<{ id: string }>();
   const campaignId = params.id;
 
+  const [campaign, setCampaign] = useState<Campaign | null>(null);
   const [leads, setLeads] = useState<Lead[]>([]);
   const [calls, setCalls] = useState<Call[]>([]);
+  const [readiness, setReadiness] = useState<Readiness | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [togglingActive, setTogglingActive] = useState(false);
 
   const [phone, setPhone] = useState("");
   const [leadName, setLeadName] = useState("");
@@ -23,28 +38,48 @@ export default function CampaignDetailPage() {
   const [tickIsError, setTickIsError] = useState(false);
   const [triggering, setTriggering] = useState(false);
 
-  async function refresh() {
-    setLoading(true);
-    setLoadError(null);
+  const refresh = useCallback(async () => {
     try {
-      const [l, c] = await Promise.all([
+      // Campaign is fetched by listing (no single-campaign GET endpoint
+      // exists) — cheap enough at this project's scale, and it's what
+      // confirms the id in the URL actually resolves to something.
+      const [all, l, c] = await Promise.all([
+        api.listCampaigns(true),
         api.listLeads(campaignId),
         api.listCalls(campaignId),
       ]);
+      setCampaign(all.find((x) => x.campaign_id === campaignId) ?? null);
       setLeads(l);
       setCalls(c);
+      setLoadError(null);
     } catch (e) {
       setLoadError(errorMessage(e));
     } finally {
       setLoading(false);
     }
+  }, [campaignId]);
+
+  async function refreshReadiness() {
+    try {
+      setReadiness(await api.readiness());
+    } catch {
+      // Non-fatal — the strip just stays in its "checking" state; the page's
+      // other data doesn't depend on this.
+    }
   }
 
   useEffect(() => {
     refresh();
+    refreshReadiness();
     // campaignId comes from the route and won't change without a remount
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [campaignId]);
+
+  // Auto-refresh only while something is actually in flight — a lead sitting
+  // 'pending' isn't going to change on its own, so polling then would just
+  // be noise (and unnecessary backend load).
+  const anyInFlight = leads.some((l) => l.status === "queued" || l.status === "calling");
+  usePolling(refresh, POLL_INTERVAL_MS, anyInFlight);
 
   async function handleAddLead(e: FormEvent) {
     e.preventDefault();
@@ -67,6 +102,28 @@ export default function CampaignDetailPage() {
     }
   }
 
+  async function handleDoNotCall(lead: Lead) {
+    try {
+      await api.doNotCall(lead.lead_id);
+      await refresh();
+    } catch (e) {
+      setLoadError(errorMessage(e));
+    }
+  }
+
+  async function handleToggleActive() {
+    if (!campaign) return;
+    setTogglingActive(true);
+    try {
+      await api.setCampaignActive(campaign.campaign_id, !campaign.active);
+      await refresh();
+    } catch (e) {
+      setLoadError(errorMessage(e));
+    } finally {
+      setTogglingActive(false);
+    }
+  }
+
   async function handleTrigger() {
     setTriggering(true);
     setTickResult(null);
@@ -78,9 +135,9 @@ export default function CampaignDetailPage() {
           (result.queued > 0
             ? "The in-process worker picks these up within a couple of seconds."
             : "Nothing was dial-eligible right now (outside calling hours, DND, " +
-              "missing consent, or attempts exhausted) — refresh below to check.")
+              "missing consent, or attempts exhausted) — check the readiness panel above.")
       );
-      await refresh();
+      await Promise.all([refresh(), refreshReadiness()]);
     } catch (e) {
       setTickIsError(true);
       setTickResult(errorMessage(e));
@@ -89,145 +146,110 @@ export default function CampaignDetailPage() {
     }
   }
 
-  return (
-    <div>
-      <h1>Campaign</h1>
-      <p className="mono">{campaignId}</p>
+  const dialEligibleCount = leads.filter(
+    (l) => l.status === "pending" && !l.dnd && l.consent_basis
+  ).length;
 
-      <section className="card">
-        <h2>Add a lead</h2>
-        <form onSubmit={handleAddLead} className="form">
-          <label>
-            Phone
+  return (
+    <div className="flex flex-col gap-6">
+      <div>
+        <h1 className="text-2xl font-semibold text-neutral-900 dark:text-neutral-50">
+          {campaign?.name ?? "Campaign"}
+        </h1>
+        <p className="font-mono text-xs text-neutral-500 dark:text-neutral-400">{campaignId}</p>
+      </div>
+
+      {campaign && (
+        <div className="flex flex-wrap items-center gap-3">
+          <Badge tone={campaign.mode === "twoway" ? "accent" : "neutral"}>{campaign.mode}</Badge>
+          <Badge tone={campaign.active ? "good" : "neutral"}>
+            {campaign.active ? "active" : "inactive"}
+          </Badge>
+          <Button variant="secondary" onClick={handleToggleActive} disabled={togglingActive}>
+            {togglingActive ? "…" : campaign.active ? "Deactivate campaign" : "Activate campaign"}
+          </Button>
+        </div>
+      )}
+
+      <ReadinessStrip readiness={readiness} onRefreshed={setReadiness} />
+
+      <Card
+        title="Import leads from a file"
+        description="CSV or Excel. Re-uploading the same file is safe — leads are matched by phone number and updated, not duplicated."
+      >
+        <LeadsUpload campaignId={campaignId} onImported={refresh} />
+      </Card>
+
+      <Card title="Add a single lead">
+        <form onSubmit={handleAddLead} className="flex max-w-md flex-col gap-4">
+          <Field label="Phone">
             <input
+              className={fieldControlClass}
               value={phone}
               onChange={(e) => setPhone(e.target.value)}
               placeholder="+91XXXXXXXXXX or 0XXXXXXXXXX"
               required
             />
-          </label>
-          <label>
-            Name
-            <input value={leadName} onChange={(e) => setLeadName(e.target.value)} />
-          </label>
-          <label className="checkbox">
+          </Field>
+          <Field label="Name">
+            <input
+              className={fieldControlClass}
+              value={leadName}
+              onChange={(e) => setLeadName(e.target.value)}
+            />
+          </Field>
+          <Field label="Record explicit consent right now" inline>
             <input
               type="checkbox"
               checked={recordConsent}
               onChange={(e) => setRecordConsent(e.target.checked)}
             />
-            Record explicit consent right now — required for this lead to ever
-            be dial-eligible (app/compliance/consent.py)
-          </label>
-          {leadError && <p className="error">{leadError}</p>}
-          <button type="submit" disabled={addingLead}>
+          </Field>
+          <p className="text-xs text-neutral-500 dark:text-neutral-400">
+            Required for this lead to ever be dial-eligible (app/compliance/consent.py).
+          </p>
+          {leadError && <p className="text-sm text-status-critical">{leadError}</p>}
+          <Button type="submit" disabled={addingLead}>
             {addingLead ? "Adding…" : "Add lead"}
-          </button>
+          </Button>
         </form>
-      </section>
+      </Card>
 
-      <section className="card">
-        <h2>Trigger a call now</h2>
-        <p className="hint">
+      <Card title="Trigger a call now">
+        <p className="mb-3 text-sm text-neutral-500 dark:text-neutral-400">
           Runs the exact same campaign_tick the scheduler runs automatically —
-          calling hours, DND, and consent are all still enforced, there is no
-          test-only bypass.
+          calling hours, DND, and consent are all still enforced; there is no
+          test-only bypass. {dialEligibleCount} lead(s) here currently look
+          dial-eligible on the surface (final gates are re-checked at dial time).
         </p>
-        <div className="warning-banner">
-          Scoped to <strong>this campaign only</strong>. If real ElevenLabs
-          credentials and a linked phone number are configured in the
-          backend&apos;s .env, clicking this <strong>places real phone
-          calls</strong> to this campaign&apos;s dial-eligible leads.
-        </div>
-        <button onClick={handleTrigger} disabled={triggering}>
+        <ConfirmButton
+          onConfirm={handleTrigger}
+          disabled={triggering}
+          consequence={
+            readiness && !readiness.can_dial
+              ? "The readiness panel above reports this system cannot dial right now — this will still run, and will queue nothing until that's resolved."
+              : "This places REAL phone calls to this campaign's dial-eligible leads if live credentials are configured."
+          }
+        >
           {triggering ? "Triggering…" : "Trigger campaign tick now"}
-        </button>
-        {tickResult && <p className={tickIsError ? "error" : ""}>{tickResult}</p>}
-      </section>
-
-      <section className="card">
-        <h2>Leads</h2>
-        {loading && <p>Loading…</p>}
-        {loadError && <p className="error">{loadError}</p>}
-        {!loading && !loadError && (
-          <table>
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Phone</th>
-                <th>Status</th>
-                <th>Attempts</th>
-                <th>Consent</th>
-              </tr>
-            </thead>
-            <tbody>
-              {leads.map((l) => (
-                <tr key={l.lead_id}>
-                  <td>{l.name ?? "—"}</td>
-                  <td className="mono">{l.phone_e164}</td>
-                  <td>
-                    <span className={`badge badge-${l.status}`}>{l.status}</span>
-                  </td>
-                  <td>{l.attempts}</td>
-                  <td>{l.consent_basis ?? "none"}</td>
-                </tr>
-              ))}
-              {leads.length === 0 && (
-                <tr>
-                  <td colSpan={5}>No leads yet — add one above.</td>
-                </tr>
-              )}
-            </tbody>
-          </table>
+        </ConfirmButton>
+        {tickResult && (
+          <p className={`mt-3 text-sm ${tickIsError ? "text-status-critical" : ""}`}>{tickResult}</p>
         )}
-      </section>
+      </Card>
 
-      <section className="card">
-        <h2>Calls</h2>
-        {!loading && !loadError && (
-          <table>
-            <thead>
-              <tr>
-                <th>Status</th>
-                <th>Turns</th>
-                <th>Summary</th>
-                <th>Started</th>
-              </tr>
-            </thead>
-            <tbody>
-              {calls.map((c) => (
-                <tr key={c.call_id}>
-                  <td>{c.status ?? "—"}</td>
-                  <td>{c.turns ?? "—"}</td>
-                  <td>{c.summary ?? "—"}</td>
-                  <td>{c.started_at ?? "—"}</td>
-                </tr>
-              ))}
-              {calls.length === 0 && (
-                <tr>
-                  <td colSpan={4}>No calls yet.</td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        )}
-        {calls
-          .filter((c) => c.transcript && c.transcript.length > 0)
-          .map((c) => (
-            <div key={c.call_id} className="transcript">
-              <h3 className="mono">Transcript — {c.call_id}</h3>
-              {c.transcript!.map((t, i) => (
-                <p key={i} className={`turn turn-${t.role}`}>
-                  <strong>{t.role}:</strong> {t.text}
-                </p>
-              ))}
-            </div>
-          ))}
-      </section>
+      <Card title="Leads">
+        {loadError && <p className="mb-3 text-sm text-status-critical">{loadError}</p>}
+        <LeadTable leads={leads} loading={loading} onDoNotCall={handleDoNotCall} />
+      </Card>
 
-      <button className="secondary" onClick={refresh}>
+      <Card title="Calls">
+        <CallTable calls={calls} loading={loading} />
+      </Card>
+
+      <Button variant="secondary" onClick={refresh} className="self-start">
         Refresh
-      </button>
+      </Button>
     </div>
   );
 }

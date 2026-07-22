@@ -36,6 +36,35 @@ def test_ai_as_a_word_inside_another_word_does_not_false_positive():
     assert has_ai_disclosure("We are calling again about your course.") is False
 
 
+def test_company_trading_name_is_not_a_disclosure():
+    """REGRESSION. This business trades as "AI Skills" (aiskills.in), so a bare
+    \\bai\\b match accepted a script that discloses nothing at all as compliant —
+    the worst possible failure for the one rule CLAUDE.md says must be enforced
+    by a test. The brand name is stripped before the marker search."""
+    assert has_ai_disclosure("Hello from AI Skills, we have a new course.") is False
+    assert has_ai_disclosure(
+        "Namaste, this is Ravi from AI Skills Digital Brolly about your enquiry."
+    ) is False
+
+
+def test_bare_greeting_before_the_disclosure_still_passes():
+    """REGRESSION (false negative). Splitting on the first [.!?] made the
+    "first sentence" of this script just "Namaste", so a fully compliant
+    script was rejected and the operator had no way to tell why."""
+    assert has_ai_disclosure(
+        "Namaste! This is an AI voice assistant calling from Digital Brolly."
+    ) is True
+
+
+def test_a_substantive_first_sentence_must_carry_the_disclosure_itself():
+    """The greeting roll-forward must not become a general second-sentence
+    allowance — sounding human up front and admitting the machine afterwards
+    is exactly the non-compliant pattern. Guards the fix above."""
+    assert has_ai_disclosure(
+        "Namaste, this is Digital Brolly. By the way, this is an AI call."
+    ) is False
+
+
 def test_none_script_fails():
     assert has_ai_disclosure(None) is False
 

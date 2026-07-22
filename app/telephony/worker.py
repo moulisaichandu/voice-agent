@@ -62,9 +62,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from uuid import UUID
 
 from app import redis_client
+from app.compliance.calling_hours import within_calling_hours
 from app.config import DIALING_LOCK_TTL_S, MAX_CONCURRENT_CALLS
 from app.db import calls as calls_db
 from app.db import campaigns as campaigns_db
@@ -78,6 +80,21 @@ QUEUE_KEY = "calls:queue"
 PROCESSING_KEY = "calls:processing"
 LIVE_COUNT_KEY = "calls:live:count"
 DND_SET_KEY = "dnd:numbers"
+
+# Written once per loop iteration (~every 2s, the BLMOVE timeout below) — the
+# admin readiness check's only way to know the worker is actually alive, not
+# just configured. Earlier this session the worker died silently while
+# /health kept returning 200; WORKER_ENABLED alone would just repeat the
+# config back, which is exactly what lied then. TTL is generous versus the
+# write cadence so one slow iteration doesn't flap readiness to critical.
+HEARTBEAT_KEY = "worker:heartbeat"
+HEARTBEAT_TTL_S = 30
+
+# How long this attempt's Plivo CallUUID stays readable. It only has to
+# outlive the call itself, since call_routes' slot-release guard reads it when
+# the stream ends and when Plivo posts the hangup. Matches
+# call_routes._SLOT_GUARD_TTL_S deliberately — the two expire together.
+CALL_UUID_TTL_S = 3600
 
 _ACQUIRE_SLOT_LUA = """
 local count = tonumber(redis.call('GET', KEYS[1]) or '0')
@@ -116,6 +133,20 @@ async def enqueue_lead(lead_id: str) -> None:
     """Called by scheduler.py's campaign_tick for each due lead."""
     r = redis_client.get_redis()
     await r.lpush(QUEUE_KEY, lead_id)
+
+
+async def add_to_dnd_set(phone_e164: str) -> None:
+    """Put a number into the dial-time DND set NOW, rather than waiting for
+    scheduler.dnd_refresh's 06:00 cron.
+
+    process_one checks this set with SISMEMBER on every dequeue, and it was
+    the only thing catching a person who opted out on one campaign while still
+    being a dial-eligible row on another. Since the set was written solely by
+    a once-a-day job, an opt-out recorded at 10:15 did not reach the scrub
+    until 06:00 the NEXT morning — a full day of calling someone who had
+    already asked you to stop. Writing it here closes that window to zero."""
+    r = redis_client.get_redis()
+    await r.sadd(DND_SET_KEY, phone_e164)
 
 
 async def reaper_sweep(timeout_s: int) -> int:
@@ -177,6 +208,30 @@ async def process_one(lead_id: str) -> None:
         campaign = await campaigns_db.get_campaign(lead.campaign_id)
         if campaign is None or not campaign.active:
             logger.warning(f"[worker] lead {lead_id}: campaign missing/inactive — skipping")
+            return
+
+        # Calling hours, re-checked HERE and not only in campaign_tick.
+        #
+        # CLAUDE.md makes the 10:00-19:00 IST window a hard rule, but the only
+        # check used to be at enqueue time in scheduler.campaign_tick — and
+        # queued leads outlive that check. calls:queue is a Redis list with AOF
+        # persistence on a named volume, and the backend has
+        # restart: unless-stopped, so a batch queued at 18:58 survives a crash
+        # and gets dialled the moment the process comes back, whatever the
+        # hour. retry_sweeper's reaper (which runs 24/7) can requeue a stuck
+        # lead into the same situation. Both dial real people in the middle of
+        # the night with nothing to stop them.
+        #
+        # Back to 'pending' rather than returning with the lead left 'queued':
+        # nothing else ever transitions 'queued' -> 'pending', so leaving it
+        # would strand the lead permanently (due_leads selects 'pending'
+        # only). No attempt is burned — record_dial_attempt hasn't run.
+        if not within_calling_hours():
+            logger.warning(
+                f"[worker] lead {lead_id}: outside calling hours at dial time — "
+                "returning it to 'pending' instead of dialling"
+            )
+            await leads_db.mark_result(lead.lead_id, "pending")
             return
 
         # Reserve-before-act (module docstring point 2).
@@ -267,6 +322,20 @@ async def process_one(lead_id: str) -> None:
         # let a later tick dial someone who is already on the phone.
         call_placed = True
 
+        # Record THIS attempt's provider call id, so the slot-release guard in
+        # call_routes can tell attempt 2 apart from attempt 1. Keyed writes
+        # here rather than relying solely on /calls/answer because this is the
+        # same code path that acquired the slot, so it is authoritative even
+        # if Plivo's answer callback never arrives or its form fails to parse.
+        # Best-effort: a Redis blip here must not fail a call that is already
+        # ringing, and the guard degrades to lead_id scope without it.
+        if result.call_uuid:
+            try:
+                await r.set(f"call:uuid:{lead_id}", result.call_uuid,
+                            ex=CALL_UUID_TTL_S)
+            except Exception:
+                logger.warning(f"[worker] could not record call uuid for {lead_id}")
+
         # el_conversation_id is NULL here on purpose: with Plivo placing the
         # call there is no ElevenLabs conversation yet — one is created when
         # the audio bridge connects, and call_routes.py fills it in then.
@@ -342,6 +411,9 @@ async def run_worker(stop_event: asyncio.Event) -> None:
     consecutive_failures = 0
     while not stop_event.is_set():
         try:
+            await redis_client.get_redis().set(
+                HEARTBEAT_KEY, datetime.now(timezone.utc).isoformat(), ex=HEARTBEAT_TTL_S,
+            )
             lead_id = await _reserve_next(timeout_s=2)
             if lead_id is not None:
                 await process_one(lead_id)

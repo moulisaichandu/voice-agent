@@ -23,24 +23,33 @@ async def upsert_lead(
     language_pref: str = "auto",
     consent_basis: str | None = None,
     consent_at: datetime | None = None,
+    dial_order: int | None = None,
 ) -> Lead:
     """Insert or update, keyed on (phone_e164, campaign_id) — re-importing the
-    same sheet never creates duplicates or resets a lead already in progress."""
+    same sheet never creates duplicates or resets a lead already in progress.
+
+    *dial_order* is the lead's position in the file it was imported from; see
+    migrations/0002 and due_leads(). It is preserved rather than overwritten
+    when the caller passes None, so a Google-Sheet sync of a lead that
+    originally came from an uploaded file doesn't silently wipe its position
+    and drop it to the back of the calling order."""
     pool = await get_pool()
     row = await pool.fetchrow(
         """
         insert into leads (sheet_row, name, phone_e164, campaign_id,
-                            language_pref, consent_basis, consent_at)
-        values ($1, $2, $3, $4, $5, $6, $7)
+                            language_pref, consent_basis, consent_at, dial_order)
+        values ($1, $2, $3, $4, $5, $6, $7, $8)
         on conflict (phone_e164, campaign_id) do update
             set sheet_row = excluded.sheet_row,
                 name = excluded.name,
                 language_pref = excluded.language_pref,
                 consent_basis = excluded.consent_basis,
-                consent_at = excluded.consent_at
+                consent_at = excluded.consent_at,
+                dial_order = coalesce(excluded.dial_order, leads.dial_order)
         returning *
         """,
-        sheet_row, name, phone_e164, campaign_id, language_pref, consent_basis, consent_at,
+        sheet_row, name, phone_e164, campaign_id, language_pref, consent_basis,
+        consent_at, dial_order,
     )
     return _row_to_lead(row)
 
@@ -69,6 +78,13 @@ async def due_leads(limit: int, campaign_id: UUID | None = None) -> list[Lead]:
     lead with no consent record on file is exactly as dial-ineligible as a
     DND one.
 
+    Ordered by dial_order (a lead's position in the file it was uploaded from)
+    so a campaign calls its list top-to-bottom the way the operator wrote it,
+    falling back to created_at for leads that came from the Google Sheet or the
+    single-lead form and therefore have no file position. See migrations/0002 —
+    created_at alone could not express this, because a bulk import writes every
+    row in the same instant and upsert deliberately never rewrites created_at.
+
     The consent check is deliberately pure Python, not duplicated into SQL,
     so there's exactly one place (compliance/consent.py, already unit-tested)
     that decides what counts as valid consent. That means over-fetching
@@ -93,7 +109,7 @@ async def due_leads(limit: int, campaign_id: UUID | None = None) -> list[Lead]:
         where l.status = 'pending' and l.dnd = false and c.active = true
           and l.attempts < c.max_attempts
           and ($2::uuid is null or l.campaign_id = $2)
-        order by l.created_at
+        order by l.dial_order nulls last, l.created_at
         limit $1
         """,
         candidate_limit, campaign_id,
@@ -151,11 +167,51 @@ async def mark_result(lead_id: UUID, status: str) -> None:
     await pool.execute("update leads set status = $2 where lead_id = $1", lead_id, status)
 
 
-async def mark_dnd(lead_id: UUID) -> None:
+async def mark_result_if_calling(lead_id: UUID, status: str) -> bool:
+    """Guarded transition, in the same family as mark_queued/mark_calling:
+    only a lead still in 'calling' can be resolved, and only once.
+
+    Two independent code paths report the end of the same call —
+    call_routes._finalise_call (from the audio stream closing) and
+    /calls/hangup (from Plivo's post) — with no ordering guarantee between
+    them. Both used the unguarded mark_result, so the later one silently
+    overwrote the earlier. Plivo reports Duration 0 for a call that connected
+    but lasted under a second, and hangup writes 'pending' on Duration 0: a
+    completed call could therefore be reset to 'pending' and dialled again,
+    or a genuine no-connect marked 'failed' and never retried.
+
+    With the guard, the first writer wins and the second no-ops — correct in
+    both orders, since either outcome is a truthful description of a call that
+    both connected and ended almost immediately. Returns whether this call is
+    the one that resolved the lead."""
     pool = await get_pool()
-    await pool.execute(
-        "update leads set dnd = true, status = 'dnd' where lead_id = $1", lead_id
+    result = await pool.execute(
+        "update leads set status = $2 where lead_id = $1 and status = 'calling'",
+        lead_id, status,
     )
+    return result.endswith("1")
+
+
+async def mark_dnd(lead_id: UUID) -> str | None:
+    """Flag this lead — and every OTHER lead row sharing its phone number — as
+    do-not-call. Returns the phone that was opted out (None if the lead is
+    gone), so the caller can push it into the Redis dial-time set.
+
+    Cross-campaign on purpose. `leads` is unique (phone_e164, campaign_id), so
+    one person enrolled in two campaigns is two rows, and due_leads' `l.dnd =
+    false` filter is per ROW. Flagging only the row the operator clicked left
+    the person fully dial-eligible on every other campaign — they ask to never
+    be called again, and the next tick calls them from the other campaign. A
+    person opts out of being called, not out of one spreadsheet row."""
+    pool = await get_pool()
+    row = await pool.fetchrow("select phone_e164 from leads where lead_id = $1", lead_id)
+    if row is None:
+        return None
+    phone = row["phone_e164"]
+    await pool.execute(
+        "update leads set dnd = true, status = 'dnd' where phone_e164 = $1", phone
+    )
+    return phone
 
 
 async def list_leads_for_campaign(campaign_id: UUID) -> list[Lead]:
@@ -163,6 +219,55 @@ async def list_leads_for_campaign(campaign_id: UUID) -> list[Lead]:
     pool = await get_pool()
     rows = await pool.fetch(
         "select * from leads where campaign_id = $1 order by created_at desc", campaign_id,
+    )
+    return [_row_to_lead(r) for r in rows]
+
+
+async def lead_status_counts(campaign_id: UUID | None = None) -> dict[str, int]:
+    """Lead counts grouped by status, optionally scoped to one campaign — the
+    admin dashboard's pipeline view. A status with zero leads is simply
+    absent from the result; callers fill in zero for anything missing."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        """
+        select status, count(*) as n from leads
+        where $1::uuid is null or campaign_id = $1
+        group by status
+        """,
+        campaign_id,
+    )
+    return {r["status"]: r["n"] for r in rows}
+
+
+async def lead_status_counts_for_active_campaigns() -> dict[str, int]:
+    """Same idea as lead_status_counts(), scoped to active campaigns only —
+    the admin dashboard's pipeline view. A dev database that's had the
+    integration suite run against it accumulates hundreds of leads on
+    deactivated test-*/pipeline-* campaigns (see admin/campaigns.list_campaigns'
+    docstring for the identical problem solved there), which would otherwise
+    dominate the numbers and make the dashboard look nothing like reality."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        """
+        select l.status, count(*) as n
+        from leads l
+        join campaigns c on c.campaign_id = l.campaign_id
+        where c.active = true
+        group by l.status
+        """
+    )
+    return {r["status"]: r["n"] for r in rows}
+
+
+async def search_leads_by_phone(phone_e164: str) -> list[Lead]:
+    """Every lead across every campaign with this phone number — the admin
+    API's global lookup ("someone rang back, what do we know about them?").
+    Exact match, not fuzzy: callers should normalize with
+    compliance.dnd.normalize_phone_e164() first, and a normalized E.164
+    number is unambiguous."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "select * from leads where phone_e164 = $1 order by created_at desc", phone_e164,
     )
     return [_row_to_lead(r) for r in rows]
 

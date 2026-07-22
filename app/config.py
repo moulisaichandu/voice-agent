@@ -4,6 +4,7 @@ All other modules import from here; nothing else reads os.environ directly.
 """
 
 import logging
+import math
 import os
 
 from dotenv import load_dotenv
@@ -35,18 +36,44 @@ def _float(name: str, default: float) -> float:
     if raw is None or not raw.strip():
         return default
     try:
-        return float(raw.strip())
+        value = float(raw.strip())
     except ValueError:
         logger.warning(f"{name}={raw!r} is not a number — using default {default}.")
         return default
+    # nan/inf parse cleanly but poison every comparison downstream. A
+    # RAG_MIN_SCORE of nan makes `score >= min_score` False for every chunk,
+    # so the agent silently answers "no relevant material" to everything.
+    if not math.isfinite(value):
+        logger.warning(f"{name}={raw!r} is not finite — using default {default}.")
+        return default
+    return value
+
+
+_TRUE_VALUES = ("1", "true", "yes", "on")
+_FALSE_VALUES = ("0", "false", "no", "off")
 
 
 def _bool(name: str, default: bool = False) -> bool:
-    """Parse a boolean env var. True for 1/true/yes/on (case-insensitive)."""
+    """Parse a boolean env var. True for 1/true/yes/on, False for 0/false/no/off
+    (case-insensitive). Anything else warns and falls back to *default*.
+
+    That fallback matters: this used to be `raw.lower() in (...)`, which
+    returned False for every unrecognised value and ignored *default*
+    entirely — silently, with no warning, breaking CLAUDE.md's "malformed
+    override -> warn + default" rule. WORKER_ENABLED=enabled (or =y, or
+    =True_) therefore turned the call worker OFF while campaign_tick kept
+    filling calls:queue with leads nothing would ever consume: a total
+    outbound-dialling outage whose only symptom was silence."""
     raw = os.getenv(name)
     if raw is None or not raw.strip():
         return default
-    return raw.strip().lower() in ("1", "true", "yes", "on")
+    cleaned = raw.strip().lower()
+    if cleaned in _TRUE_VALUES:
+        return True
+    if cleaned in _FALSE_VALUES:
+        return False
+    logger.warning(f"{name}={raw!r} is not a boolean — using default {default}.")
+    return default
 
 
 def _list(name: str, default: tuple[str, ...] = ()) -> list[str]:
@@ -86,8 +113,39 @@ PLIVO_FROM_NUMBER: str | None = os.getenv("PLIVO_FROM_NUMBER")
 # finds the URL — app/main.py's startup check refuses to boot in that state.
 CALL_WEBHOOK_SECRET: str | None = os.getenv("CALL_WEBHOOK_SECRET")
 
+# Guards POST /rag/search, the two-way agent's live tool. Same shape as
+# CALL_WEBHOOK_SECRET and for the same reason: ElevenLabs calls that endpoint
+# from its own servers and cannot send APP_AUTH_TOKEN, so a dedicated shared
+# secret is the only thing standing in front of it. Sent as the
+# X-RAG-Token HEADER, not a query param — the audit found query strings land
+# verbatim in uvicorn's access log, and this one would be logged on every tool
+# call of every conversation.
+#
+# Unguarded on a public URL, anyone who finds the URL can burn OpenAI credit
+# (each request is a paid embedding, plus a paid completion on a miss) and
+# extract the course corpus verbatim, four chunks at a time. app/main.py's
+# startup check refuses to boot in that state.
+RAG_TOOL_SECRET: str | None = os.getenv("RAG_TOOL_SECRET")
+
 CALL_RING_TIMEOUT_S = _int("CALL_RING_TIMEOUT_S", 30)
 CALL_MAX_DURATION_S = _int("CALL_MAX_DURATION_S", 300)
+
+# How a ONE-WAY call knows it is over. A one-way bridge never forwards the
+# lead's audio, so ElevenLabs gets no turn-end signal and never closes its
+# socket — nothing else sets the bridge's stop event either. Without these the
+# bridge sat on CALL_MAX_DURATION_S (300s) for every one-way call: the lead
+# heard a 20-second message and then four and a half minutes of silence, and
+# we paid Plivo airtime plus an ElevenLabs conversation for all of it.
+#
+# TAIL: silence after the agent's queued audio has finished playing before the
+# call is ended. Long enough not to clip the last syllable (play_end is an
+# estimate from the base64 byte count, not a report from Plivo), short enough
+# not to be a noticeable pause.
+ONEWAY_SILENCE_TAIL_S = _int("ONEWAY_SILENCE_TAIL_S", 2)
+# And the backstop: an agent that never emits any audio at all (misconfigured
+# prompt, a dynamic variable the agent is waiting on) should cost seconds, not
+# the full CALL_MAX_DURATION_S.
+ONEWAY_MAX_SILENT_S = _int("ONEWAY_MAX_SILENT_S", 30)
 
 # On an outbound call the lead's first sound is almost always them answering
 # ("Hello?") — an acknowledgement, not an interruption. Without a grace window
