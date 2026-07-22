@@ -195,12 +195,23 @@ async def _compute_preflight() -> dict:
 
     passing: list = []
     failing: list[tuple[object, str]] = []
+    # Which DISTINCT (agent_id, language, mode) configurations produced each
+    # reason — the only evidence this function has for telling "infrastructure
+    # is down" apart from "this campaign's configuration is wrong". A reason
+    # is checked once per configuration (the grouping above), so if a reason
+    # only ever came from ONE configuration — whether that's because there's
+    # only one failing campaign, or because many failing campaigns all share
+    # one identical setup — there is nothing here that couldn't be explained
+    # by that single configuration being wrong. Only a reason that recurs
+    # across configurations that DIFFER rules that out.
+    configs_by_reason: dict[str, set[tuple[str, str | None, str | None]]] = {}
     for key in checked_keys:
         agent_id, call_language, mode = key
         reason = await preflight_module.preflight(agent_id, call_language, mode=mode)
         campaigns_in_group = groups[key]
         if reason:
             failing.extend((c, reason) for c in campaigns_in_group)
+            configs_by_reason.setdefault(reason, set()).add(key)
         else:
             passing.extend(campaigns_in_group)
 
@@ -237,14 +248,29 @@ async def _compute_preflight() -> dict:
     )
 
     if not passing:
-        # NONE pass. A single shared reason across every active campaign is
-        # almost certainly infrastructure (dead tunnel, missing key) rather
-        # than N separate misconfigurations — say so once, not N times.
+        # NONE pass. Do NOT infer scope from the count alone — "all N
+        # campaigns are blocked" is exactly the same observation whether N is
+        # 1, or N campaigns that all happen to share one identical
+        # configuration. Neither case is evidence of anything beyond "this
+        # one configuration is wrong". The only real evidence of a shared/
+        # infrastructure cause is a reason that recurs across configurations
+        # that DIFFER — if the same reason blocks two-plus DISTINCT
+        # (agent_id, language, mode) combinations, no single campaign's setup
+        # can explain that, so it's safe to call it infrastructure. Otherwise
+        # say what's actually known: these campaigns, this reason — no claim
+        # about the cause.
+        shared_reason = None
         if len(by_reason) == 1:
-            reason = next(iter(by_reason))
+            only_reason = next(iter(by_reason))
+            if len(configs_by_reason[only_reason]) >= 2:
+                shared_reason = only_reason
+
+        if shared_reason is not None:
+            distinct_configs = len(configs_by_reason[shared_reason])
             detail = (f"All {checked_total} active campaign(s) are blocked by the SAME "
-                      f"reason — this looks like an infrastructure problem, not a "
-                      f"per-campaign one: {reason}{truncation_note}")
+                      f"reason across {distinct_configs} different configurations — this "
+                      f"looks like an infrastructure problem, not a per-campaign one: "
+                      f"{shared_reason}{truncation_note}")
         else:
             detail = f"All {checked_total} active campaign(s) are blocked. {blocked_desc}" \
                       f"{truncation_note}"
@@ -341,18 +367,22 @@ async def _build_readiness(*, force_refresh: bool) -> ReadinessResponse:
 
     checks = [ReadinessCheck(**c) for c in [*cheap, preflight_check, billing_check]]
 
-    # can_dial means "is this system CAPABLE of dialling right now" — a
-    # narrower, more honest question than "did every single check come back
-    # green", which is what this used to compute (any warning at all flipped
-    # it false). Two real "warning" cases are NOT capability problems and
-    # must not gate it:
+    # can_dial means "is this system STRUCTURALLY CAPABLE of dialling" —
+    # would a call go out the moment one is due — NOT "would a call be placed
+    # in the next second". That's a narrower, more honest question than "did
+    # every single check come back green", which is what this used to compute
+    # (any warning at all flipped it false). Two real "warning" cases are NOT
+    # capability problems and must not gate it:
     #
     #   - calling_hours is a warning for ~14 hours of every single day
     #     (outside 10:00-19:00 IST), which is the normal state of a healthy
-    #     system overnight — not a fault. The calling_hours check already
-    #     says "will not dial until it reopens" on its own; can_dial does not
-    #     need to repeat that by going false too, which would make a
-    #     perfectly healthy overnight system look identical to a broken one.
+    #     system overnight — not a fault: nothing is broken, dialling is just
+    #     scheduled not to happen right now. can_dial stays true through that
+    #     window on purpose, even though literally zero calls will be placed
+    #     until it reopens — that fact is already stated once, by the
+    #     calling_hours check itself ("will not dial until it reopens").
+    #     can_dial repeating it by going false too would make a perfectly
+    #     healthy overnight system look identical to a broken one.
     #   - preflight is a warning when SOME active campaigns pass and others
     #     don't (see _compute_preflight's "mixed" outcome) — one
     #     misconfigured campaign does not stop the system from placing calls

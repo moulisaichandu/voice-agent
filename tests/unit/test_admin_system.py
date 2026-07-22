@@ -358,6 +358,98 @@ def test_preflight_all_active_campaigns_failing_same_reason_states_it_once(clien
     assert r.json()["can_dial"] is False
 
 
+def test_preflight_one_active_campaign_blocked_names_it_not_infrastructure(client, monkeypatch):
+    """The exact operator report this fix exists for: ONE active campaign,
+    misconfigured as 'twoway' in 'te'. "All active campaigns fail" and "my
+    one campaign is misconfigured" are the same observation when there is
+    only one campaign — the count carries no evidence of a shared cause, so
+    the message must point at the campaign, not assert an infrastructure
+    fault."""
+    _mock_all_healthy(monkeypatch)
+
+    async def one_campaign():
+        return [_campaign(name="Broken Telugu", agent_id="agent_3", mode="twoway",
+                          language="te")]
+
+    monkeypatch.setattr(admin_system.campaigns_db, "list_active_campaigns", one_campaign)
+
+    async def fails(agent_id, language=None, mode=None):
+        return ("This campaign is 'twoway' in 'te', but that language's voice backend "
+                "(OpenAI Realtime) only supports one-way calls today")
+
+    monkeypatch.setattr(admin_system.preflight_module, "preflight", fails)
+
+    r = client.get("/admin/readiness")
+    body = r.json()
+    preflight_check = next(c for c in body["checks"] if c["key"] == "preflight")
+    assert preflight_check["status"] == "critical"
+    assert "Broken Telugu" in preflight_check["detail"]
+    assert "infrastructure" not in preflight_check["detail"].lower()
+    assert body["can_dial"] is False
+
+
+def test_preflight_many_campaigns_sharing_one_config_failing_is_not_infrastructure(
+    client, monkeypatch,
+):
+    """Several campaigns that all share the SAME (agent_id, language, mode)
+    are, for evidence purposes, one configuration wearing several names —
+    "all of them fail" still carries no information about a shared cause,
+    because there is only one distinct configuration under test. Must not be
+    reported as infrastructure."""
+    _mock_all_healthy(monkeypatch)
+
+    async def five_campaigns_same_shape():
+        return [_campaign(name=f"Clone {i}", agent_id="agent_1", mode="oneway")
+                for i in range(5)]
+
+    monkeypatch.setattr(admin_system.campaigns_db, "list_active_campaigns",
+                        five_campaigns_same_shape)
+
+    async def fails(agent_id, language=None, mode=None):
+        return "misconfigured agent_id"
+
+    monkeypatch.setattr(admin_system.preflight_module, "preflight", fails)
+
+    r = client.get("/admin/readiness")
+    body = r.json()
+    preflight_check = next(c for c in body["checks"] if c["key"] == "preflight")
+    assert preflight_check["status"] == "critical"
+    assert "infrastructure" not in preflight_check["detail"].lower()
+    assert "misconfigured agent_id" in preflight_check["detail"]
+    assert body["can_dial"] is False
+
+
+def test_preflight_different_configs_same_reason_may_claim_infrastructure(client, monkeypatch):
+    """Contrast with the two tests above: when campaigns with DIFFERENT
+    (agent_id, language, mode) configurations all fail for the exact same
+    reason, that reason cannot be caused by any one campaign's own
+    configuration — that IS evidence of a shared/infrastructure cause, and
+    is safe to describe as such."""
+    _mock_all_healthy(monkeypatch)
+
+    async def three_distinct_campaigns():
+        return [
+            _campaign(name="One", agent_id="agent_1", mode="oneway"),
+            _campaign(name="Two", agent_id="agent_2", mode="twoway"),
+            _campaign(name="Three", agent_id="agent_3", mode="oneway", language="te"),
+        ]
+
+    monkeypatch.setattr(admin_system.campaigns_db, "list_active_campaigns",
+                        three_distinct_campaigns)
+
+    async def all_fail_same_way(agent_id, language=None, mode=None):
+        return "PUBLIC_BASE_URL is unreachable (ConnectError). Is the tunnel running?"
+
+    monkeypatch.setattr(admin_system.preflight_module, "preflight", all_fail_same_way)
+
+    r = client.get("/admin/readiness")
+    body = r.json()
+    preflight_check = next(c for c in body["checks"] if c["key"] == "preflight")
+    assert preflight_check["status"] == "critical"
+    assert "infrastructure" in preflight_check["detail"].lower()
+    assert body["can_dial"] is False
+
+
 def test_preflight_dedups_shared_configuration_into_one_call(client, monkeypatch):
     """Many campaigns commonly share the same agent/language/mode — the dev
     DB scenario CLAUDE.md and app/admin/campaigns.py's list_campaigns
