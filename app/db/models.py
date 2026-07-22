@@ -9,6 +9,10 @@ from uuid import UUID
 from pydantic import BaseModel
 
 CampaignMode = Literal["oneway", "twoway"]
+# The six tokens in app/languages.py and in 0003's CHECK constraint. Kept as a
+# Literal rather than a bare str so an unknown language fails at the API
+# boundary, not at the ElevenLabs initiation frame mid-call.
+CampaignLanguage = Literal["auto", "en", "te", "tinglish", "hi", "hinglish"]
 LeadStatus = Literal["pending", "queued", "calling", "done", "failed", "dnd"]
 # NOT a narrow Literal on purpose: migrations/0001_init.sql's calls.status is
 # unconstrained `text`, and the real ElevenLabs webhook only confirms "done" as
@@ -25,6 +29,7 @@ class Campaign(BaseModel):
     mode: CampaignMode
     agent_id: str
     script: str | None = None
+    language: CampaignLanguage = "auto"
     max_attempts: int = 2
     active: bool = True
     created_at: datetime

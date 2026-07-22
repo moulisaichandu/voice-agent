@@ -13,7 +13,7 @@ from app.admin import campaigns as admin_campaigns
 def _campaign(**overrides):
     defaults = dict(
         campaign_id=uuid4(), name="Demo", mode="twoway", agent_id="agent_1",
-        script=None, max_attempts=2, active=True,
+        script=None, language="auto", max_attempts=2, active=True,
         created_at=datetime.now(timezone.utc),
     )
     defaults.update(overrides)
@@ -239,3 +239,51 @@ def test_update_campaign_active_404s_for_an_unknown_campaign(client, monkeypatch
     r = client.patch(f"/admin/campaigns/{uuid4()}", json={"active": False})
     assert r.status_code == 404
 
+
+# ── language ─────────────────────────────────────────────────────────────────
+
+def test_create_campaign_defaults_to_auto_language(client, monkeypatch):
+    """The safety default. Every campaign created before this field existed
+    reads back as 'auto', which sends no override — so nothing that works
+    today changes."""
+    created = {}
+
+    async def fake_create(**kwargs):
+        created.update(kwargs)
+        return _campaign()
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
+    monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID", "agent_1")
+
+    r = client.post("/admin/campaigns", json={"name": "Demo"})
+    assert r.status_code == 201
+    assert created["language"] == "auto"
+
+
+def test_create_campaign_persists_the_chosen_language(client, monkeypatch):
+    created = {}
+
+    async def fake_create(**kwargs):
+        created.update(kwargs)
+        return _campaign(language="tinglish")
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
+    monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID", "agent_1")
+
+    r = client.post("/admin/campaigns", json={"name": "Demo", "language": "tinglish"})
+    assert r.status_code == 201
+    assert created["language"] == "tinglish"
+    assert r.json()["language"] == "tinglish"
+
+
+def test_an_unknown_language_is_rejected_at_the_boundary(client, monkeypatch):
+    """422 here, not a mid-call ElevenLabs error. An unknown language must not
+    reach the initiation frame — the failure would be a dropped call."""
+    async def fake_create(**kwargs):
+        raise AssertionError("must not reach the DB with an invalid language")
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
+    monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID", "agent_1")
+
+    r = client.post("/admin/campaigns", json={"name": "Demo", "language": "klingon"})
+    assert r.status_code == 422

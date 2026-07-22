@@ -23,7 +23,7 @@ def _row_to_campaign(row) -> Campaign:
 
 async def create_campaign(
     *, name: str, mode: CampaignMode, agent_id: str, script: str | None = None,
-    max_attempts: int = 2,
+    max_attempts: int = 2, language: str = "auto",
 ) -> Campaign:
     # Validated BEFORE any DB access, deliberately: a rejected script must
     # never reach the calls table, and callers get a fast, DB-free failure.
@@ -43,11 +43,11 @@ async def create_campaign(
     pool = await get_pool()
     row = await pool.fetchrow(
         """
-        insert into campaigns (name, mode, agent_id, script, max_attempts)
-        values ($1, $2, $3, $4, $5)
+        insert into campaigns (name, mode, agent_id, script, max_attempts, language)
+        values ($1, $2, $3, $4, $5, $6)
         returning *
         """,
-        name, mode, agent_id, script, max_attempts,
+        name, mode, agent_id, script, max_attempts, language,
     )
     return _row_to_campaign(row)
 

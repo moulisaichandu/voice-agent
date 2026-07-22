@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 
 from app import config as app_config
 from app.db import campaigns as campaigns_db
-from app.db.models import Campaign
+from app.db.models import Campaign, CampaignLanguage
 
 router = APIRouter()
 
@@ -36,6 +36,14 @@ class CampaignCreate(BaseModel):
                     "An explicit value still wins.",
     )
     script: str | None = None
+    language: CampaignLanguage = Field(
+        default="auto",
+        description="The language this campaign's calls run in. 'auto' sends "
+                    "no override and uses whatever the ElevenLabs agent is "
+                    "configured with — the behaviour of every campaign created "
+                    "before this field existed. A lead's own language column "
+                    "still overrides this per row.",
+    )
     max_attempts: int = Field(default=2, ge=1, le=10)
 
 
@@ -90,6 +98,7 @@ async def create_campaign(body: CampaignCreate) -> Campaign:
         return await campaigns_db.create_campaign(
             name=body.name, mode=body.mode, agent_id=agent_id,
             script=body.script, max_attempts=body.max_attempts,
+            language=body.language,
         )
     except ValueError as exc:
         # The oneway-needs-a-script and AI-disclosure checks in
