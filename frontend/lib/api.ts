@@ -41,6 +41,12 @@ export function languageLabel(value: string): string {
   return CAMPAIGN_LANGUAGES.find((l) => l.value === value)?.label ?? value;
 }
 
+/** Mirrors app/languages.py's _BACKEND_BY_TOKEN. Telugu and Tinglish run on
+ * OpenAI Realtime because ElevenLabs Agents does not offer Telugu at all. */
+export function backendFor(language: string): "ElevenLabs" | "OpenAI Realtime" {
+  return language === "te" || language === "tinglish" ? "OpenAI Realtime" : "ElevenLabs";
+}
+
 export type Campaign = {
   campaign_id: string;
   name: string;

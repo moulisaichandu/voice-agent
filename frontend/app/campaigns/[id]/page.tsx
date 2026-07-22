@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { useParams } from "next/navigation";
 import {
   api,
+  backendFor,
   errorMessage,
   languageLabel,
   type Call,
@@ -173,6 +174,7 @@ export default function CampaignDetailPage() {
           <Badge tone={campaign.language === "auto" ? "neutral" : "accent"}>
             {languageLabel(campaign.language)}
           </Badge>
+          <Badge tone="neutral">{backendFor(campaign.language)}</Badge>
           <Badge tone={campaign.active ? "good" : "neutral"}>
             {campaign.active ? "active" : "inactive"}
           </Badge>
