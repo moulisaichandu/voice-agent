@@ -38,6 +38,7 @@ sentence` check gets wrong:
 from __future__ import annotations
 
 import re
+import unicodedata
 
 _SENTENCE_END = re.compile(r"[.!?\n]")
 
@@ -71,8 +72,21 @@ _DISCLOSURE_MARKERS = (
     "कृत्रिम बुद्धिमत्ता",  # Hindi: "artificial intelligence"
     "स्वचालित कॉल",  # Hindi: "automated call"
     "स्वचालित आवाज़",  # Hindi: "automated voice"
-    "वॉइस असिस्टेंट",  # Hindi: "voice assistant" (transliterated)
+    "वॉइस असिस्टेंट",  # Hindi: "voice assistant" (transliterated, इ spelling)
+    "वॉयस असिस्टेंट",  # Hindi: "voice assistant" (transliterated, य spelling)
 )
+
+# Devanagari nukta letters (e.g. ज़) have two encodings that render identically
+# — a precomposed codepoint, or a base letter + combining nukta (U+093C) — and
+# ordinary Indian-language keyboards produce both interchangeably. NFC is the
+# right normalization even though a nukta letter's composition is a Unicode
+# "script-specific exclusion": NFC's decompose-then-recompose pipeline still
+# canonically DEcomposes both forms and then skips recomposing the excluded
+# character, so both encodings land on the same decomposed result. Applying it
+# to both the script under test and these marker literals means a marker
+# written in one encoding still matches a script typed in the other — see
+# tests/unit/test_disclosure.py's nukta tests.
+_DISCLOSURE_MARKERS = tuple(unicodedata.normalize("NFC", marker) for marker in _DISCLOSURE_MARKERS)
 
 
 def _strip_brand_names(text: str) -> str:
@@ -117,5 +131,8 @@ def has_ai_disclosure(script: str | None) -> bool:
     opening = _strip_brand_names(_opening(script))
     if _AI_WORD.search(opening):
         return True
-    lowered = opening.lower()
+    # NFC both sides: the script under test may use either encoding of a
+    # nukta letter, and _DISCLOSURE_MARKERS was normalized once at import
+    # time above — see the comment there.
+    lowered = unicodedata.normalize("NFC", opening).lower()
     return any(marker in lowered for marker in _DISCLOSURE_MARKERS)

@@ -130,3 +130,49 @@ def test_hindi_automated_call_disclosing_the_caller_passes():
     """The disambiguated marker must still accept a script that pairs the
     automation word with a noun that makes the CALLER the automated thing."""
     assert has_ai_disclosure("नमस्ते! यह एक स्वचालित कॉल है, डिजिटल ब्रॉली की ओर से।")
+
+
+# ── Unicode normalization (nukta) ────────────────────────────────────────────
+#
+# The nukta character (Devanagari combining mark ़, U+093C) has two encodings
+# that render IDENTICALLY: a base letter followed by a combining nukta
+# (decomposed — e.g. ja U+091C + nukta U+093C), or a single precomposed
+# codepoint (e.g. za U+095B). Ordinary Indian-language keyboards and IMEs
+# produce both forms interchangeably, and Devanagari nukta letters are a
+# Unicode "composition exclusion" — NFC does not silently recompose one into
+# the other by accident, so an exact substring match on ONE encoding rejects
+# a script typed in the other, even though a human reading both sees no
+# difference at all. The marker literal "स्वचालित आवाज़" in
+# _DISCLOSURE_MARKERS happens to use the decomposed form; unnormalized
+# comparison meant a script that used the precomposed spelling of the same
+# word failed disclosure with no visible reason to the operator.
+
+_DECOMPOSED_AAWAZ = "आवाज़"  # आ + व + ा + ja + nukta
+_PRECOMPOSED_AAWAZ = "आवाज़"  # आ + व + ा + za (precomposed)
+
+
+def test_precomposed_nukta_spelling_of_automated_voice_passes():
+    """REGRESSION. Same word, same meaning, same disclosure — spelled with the
+    single precomposed nukta codepoint instead of the decomposed marker
+    literal. Before NFC normalization this failed even though it reads
+    identically to the accepted decomposed spelling below."""
+    assert has_ai_disclosure(
+        f"नमस्ते! यह एक स्वचालित {_PRECOMPOSED_AAWAZ} है, डिजिटल ब्रॉली की ओर से।"
+    )
+
+
+def test_decomposed_nukta_spelling_of_automated_voice_still_passes():
+    """The pre-existing (decomposed) spelling must keep working after adding
+    normalization — this guards against the fix only handling one direction."""
+    assert has_ai_disclosure(
+        f"नमस्ते! यह एक स्वचालित {_DECOMPOSED_AAWAZ} है, डिजिटल ब्रॉली की ओर से।"
+    )
+
+
+def test_both_spellings_of_voice_assistant_are_accepted():
+    """वॉयस and वॉइस are both common transliterated spellings of "voice" in
+    real Hindi scripts (the Devanagari glide य vs. the vowel sign इ). Only
+    "वॉइस असिस्टेंट" was in _DISCLOSURE_MARKERS; "वॉयस असिस्टेंट" is exactly
+    as valid a disclosure and must not be rejected for a spelling choice."""
+    assert has_ai_disclosure("नमस्ते! मैं एक वॉइस असिस्टेंट हूँ, डिजिटल ब्रॉली की ओर से।")
+    assert has_ai_disclosure("नमस्ते! मैं एक वॉयस असिस्टेंट हूँ, डिजिटल ब्रॉली की ओर से।")
