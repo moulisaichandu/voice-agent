@@ -95,14 +95,46 @@ LANGUAGES: dict[str, Language] = {
 
 TOKENS: tuple[str, ...] = tuple(LANGUAGES)
 
-# ISO codes absent from ElevenLabs Flash/Turbo v2.5's 32-language list
-# (en ja zh de hi fr ko pt it es id nl tr fil pl sv bg ro ar cs el fi hr ms sk
-#  da ta uk ru hu no vi) and available only on Eleven v3 / v3 Conversational.
+# Every language the ElevenLabs AGENTS platform will accept, verified against
+# the live API on 2026-07-22 by asking it to add Telugu and reading the
+# validation error it returned:
 #
-# This is not trivia. An agent left on a v2.5-class model cannot pronounce
-# Telugu at all: asked to, it produces garbled audio and drifts back to
-# English. That was the cause of this project's failed Telugu two-way test,
-# and it is invisible from the outside — which is why preflight checks it.
+#   "Preset languages must be one of en, zh, es, hi, pt, fr, de, ja, ar, ko,
+#    id, it, nl, tr, pl, ru, sv, tl, ms, ro, uk, el, cs, da, fi, bg, hr, sk,
+#    ta, vi, no, hu, pt-br, fil but got te"
+#
+# Tamil is there. TELUGU IS NOT — and no plan tier or model setting changes
+# that, because the platform simply does not offer it as an agent language.
+# That is the real reason this project's Telugu calls failed, and it is why
+# Telugu needs a different voice backend entirely rather than more ElevenLabs
+# configuration.
+#
+# Used ONLY to word a failure honestly. The authoritative check is always what
+# the agent itself reports as configured — so if ElevenLabs adds Telugu later
+# and an operator enables it, that succeeds before this list is ever consulted
+# and no code change is needed here.
+ELEVENLABS_AGENT_LANGUAGES = frozenset({
+    "en", "zh", "es", "hi", "pt", "fr", "de", "ja", "ar", "ko", "id", "it",
+    "nl", "tr", "pl", "ru", "sv", "tl", "ms", "ro", "uk", "el", "cs", "da",
+    "fi", "bg", "hr", "sk", "ta", "vi", "no", "hu", "pt-br", "fil",
+})
+
+
+def elevenlabs_can_speak(iso: str | None) -> bool:
+    """Whether the ElevenLabs Agents platform offers *iso* at all.
+
+    False means no amount of dashboard configuration will help — the operator
+    should be told that, not sent to look for a setting that doesn't exist.
+    """
+    return bool(iso) and iso in ELEVENLABS_AGENT_LANGUAGES
+
+
+# ISO codes ElevenLabs' Flash/Turbo v2.5 models cannot pronounce, kept as a
+# backstop on the model rather than the language. Largely superseded by
+# ELEVENLABS_AGENT_LANGUAGES above: 'te' is refused as an agent language before
+# any model question arises, so this gate is unreachable for Telugu today. It
+# stays because the model is derived from the language by ElevenLabs, not set
+# by us, and a future language they add could reintroduce the mismatch.
 V3_ONLY_ISO = frozenset({"te"})
 
 # Free-text spellings seen in real uploaded files, mapped to canonical tokens.

@@ -124,6 +124,20 @@ async def _check_language_support(agent_id: str, language: str) -> None:
             ),
         )
     if support["languages"] and iso not in support["languages"]:
+        # Distinguish "you haven't configured it yet" from "it cannot be
+        # configured". Sending an operator to look for a Telugu option that
+        # ElevenLabs does not offer wastes their time and makes them doubt
+        # themselves rather than the tool.
+        if not languages_module.elevenlabs_can_speak(iso):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"ElevenLabs Agents does not support {languages_module.display(language)} "
+                    "at all — it is not one of the languages the platform offers, "
+                    "so no dashboard setting, model change or plan upgrade will "
+                    "enable it. Choose a different language for this campaign."
+                ),
+            )
         raise HTTPException(
             status_code=422,
             detail=(

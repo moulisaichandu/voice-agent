@@ -346,11 +346,14 @@ def test_create_campaign_rejects_a_language_the_agent_does_not_support(client, m
         lambda agent_id: _support(languages={"en"}),
     )
 
-    r = client.post("/admin/campaigns", json={"name": "Demo", "language": "te"})
+    # Hindi deliberately: ElevenLabs DOES offer Hindi, so this is the
+    # "you haven't configured it yet" branch, whose advice is actionable.
+    # Telugu takes a different branch — see the regression test below.
+    r = client.post("/admin/campaigns", json={"name": "Demo", "language": "hi"})
     assert r.status_code == 422
     detail = r.json()["detail"]
-    assert "te" in detail
-    assert "en" in detail
+    assert "hi" in detail
+    assert "Additional Languages" in detail
 
 
 def test_create_campaign_rejects_when_the_override_is_disabled(client, monkeypatch):
@@ -385,3 +388,29 @@ def test_create_campaign_is_not_blocked_by_a_language_lookup_failure(client, mon
 
     r = client.post("/admin/campaigns", json={"name": "Demo", "language": "hi"})
     assert r.status_code == 201
+
+
+def test_create_campaign_says_telugu_is_unsupported_rather_than_naming_a_setting(
+    client, monkeypatch
+):
+    """REGRESSION. ElevenLabs Agents does not offer Telugu at all — its API
+    rejects 'te' outright. Telling the operator to "add it under Additional
+    Languages" sent them hunting for a dashboard option that cannot exist."""
+    async def boom(**kwargs):
+        raise AssertionError("must not create a campaign in an unsupportable language")
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", boom)
+    monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID", "agent_1")
+    monkeypatch.setattr(
+        admin_campaigns, "agent_language_support",
+        lambda agent_id: {"override_allowed": True, "languages": {"en", "hi"},
+                          "tts_model": "eleven_flash_v2"},
+    )
+
+    r = client.post("/admin/campaigns", json={"name": "Demo", "language": "te"})
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert "does not support" in detail
+    assert "Additional Languages" not in detail, (
+        "must not name a dashboard setting that cannot exist"
+    )

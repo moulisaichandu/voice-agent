@@ -207,9 +207,12 @@ async def test_preflight_blocks_when_the_override_is_disabled(monkeypatch):
 
 
 async def test_preflight_blocks_when_the_language_is_not_on_the_agent(monkeypatch):
+    """Uses Hindi deliberately: ElevenLabs DOES offer Hindi, so "add it under
+    Additional Languages" is real, actionable advice. Telugu would be wrong
+    here — see the regression test at the end of this file."""
     _configured(monkeypatch)
     _support(monkeypatch, languages={"en"})
-    result = await pf.preflight("agent_1", "te")
+    result = await pf.preflight("agent_1", "hi")
     assert result and "Additional Languages" in result
 
 
@@ -243,3 +246,31 @@ async def test_a_language_lookup_failure_does_not_block_the_campaign(monkeypatch
 
     monkeypatch.setattr(pf, "agent_language_support", boom)
     assert await pf.preflight("agent_1", "te") is None
+
+
+# ── the message must not send an operator after a setting that cannot exist ──
+
+async def test_an_unsupported_language_says_so_instead_of_naming_a_setting(monkeypatch):
+    """REGRESSION. This message used to read "Add it under Additional
+    Languages in the agent's settings" for EVERY unconfigured language —
+    including Telugu, which ElevenLabs does not offer at all. The operator
+    went hunting in the dashboard for an option that cannot exist and
+    reasonably concluded they were doing it wrong, not that the tool was."""
+    _configured(monkeypatch)
+    _support(monkeypatch, languages={"en", "hi"})
+    result = await pf.preflight("agent_1", "te")
+    assert result is not None
+    assert "does not support" in result
+    assert "Additional Languages" not in result, (
+        "must not send the operator to a dashboard setting that cannot exist"
+    )
+
+
+async def test_a_supported_but_unconfigured_language_still_names_the_setting(monkeypatch):
+    """The other half of the same branch: Hindi IS offered by ElevenLabs, so
+    naming the setting is correct and must survive the fix above."""
+    _configured(monkeypatch)
+    _support(monkeypatch, languages={"en"})
+    result = await pf.preflight("agent_1", "hi")
+    assert result is not None
+    assert "Additional Languages" in result

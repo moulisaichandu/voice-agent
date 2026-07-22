@@ -162,3 +162,35 @@ def test_for_call_sends_nothing_for_auto():
     lang, dyn = languages.for_call(None, None)
     assert lang is None
     assert dyn == {}
+
+
+# ── what ElevenLabs Agents can actually speak ────────────────────────────────
+
+def test_telugu_is_not_an_elevenlabs_agent_language():
+    """The whole reason Telugu needs a different voice backend. Verified
+    against the live API, which rejects 'te' outright — this is not a plan
+    tier or a model setting, the platform does not offer it."""
+    assert not languages.elevenlabs_can_speak("te")
+
+
+def test_hindi_and_tamil_are_elevenlabs_agent_languages():
+    """Guards against over-correcting: the platform DOES offer these, so a
+    campaign in Hindi must not be told its language is impossible."""
+    assert languages.elevenlabs_can_speak("hi")
+    assert languages.elevenlabs_can_speak("ta")
+    assert languages.elevenlabs_can_speak("en")
+
+
+def test_an_absent_language_is_not_claimed_as_speakable():
+    assert not languages.elevenlabs_can_speak(None)
+    assert not languages.elevenlabs_can_speak("")
+
+
+def test_every_catalogue_iso_is_either_speakable_or_knowingly_not():
+    """Every language we OFFER must resolve to a definite answer, so the
+    operator is never told something vague about a language they picked."""
+    for token in languages.TOKENS:
+        iso = languages.iso_code(token)
+        if iso is None:
+            continue
+        assert isinstance(languages.elevenlabs_can_speak(iso), bool)

@@ -134,6 +134,18 @@ async def preflight(agent_id: str, language: str | None = None) -> str | None:
                 "the agent's Security tab and enable the 'language' override."
             )
         if support["languages"] and language not in support["languages"]:
+            # Two very different failures wear the same shape here, and telling
+            # them apart is the difference between a 30-second fix and an hour
+            # spent hunting for a dashboard setting that does not exist.
+            if not languages_module.elevenlabs_can_speak(language):
+                return (
+                    f"ElevenLabs Agents does not support '{language}' at all — it "
+                    "is not one of the languages the platform offers, so no "
+                    "dashboard setting, model change or plan upgrade will enable "
+                    f"it. Agent {agent_id} cannot dial this campaign. Use a "
+                    "backend that supports this language, or change the "
+                    "campaign's language."
+                )
             return (
                 f"Agent {agent_id} is not configured for '{language}' "
                 f"(it has: {', '.join(sorted(support['languages'])) or 'none'}). "
