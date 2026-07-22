@@ -113,6 +113,7 @@ async def _signed_url(agent_id: str) -> str:
 
 async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
                  dynamic_variables: dict | None = None,
+                 language: str | None = None,
                  one_way: bool = False, outcome: dict | None = None) -> dict:
     """Bridge one answered call until either side ends.
 
@@ -122,6 +123,13 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
 
     one_way: deliver the message and hang up without listening. The caller's
     audio is never forwarded, so the agent cannot respond to it.
+
+    language: an ISO code ('te', 'hi', 'en') for ElevenLabs to run the
+    conversation in, or None to send no override at all. None is not the same
+    as 'the default language': ElevenLabs RAISES if an override arrives for a
+    field that is not enabled in the agent's Security tab, so a campaign that
+    never asked for a language must send a frame with no override key in it.
+    See app/languages.py.
 
     *outcome*: an optional dict for the caller to OWN, populated in place as
     the call progresses. It exists because this function's results used to be
@@ -170,10 +178,14 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
 
     try:
         async with websockets.connect(signed, max_size=16 * 1024 * 1024) as el_ws:
-            await el_ws.send(json.dumps({
+            init: dict = {
                 "type": "conversation_initiation_client_data",
                 "dynamic_variables": dynamic_variables or {},
-            }))
+            }
+            if language:
+                # Only when a language was actually chosen — see the docstring.
+                init["conversation_config_override"] = {"agent": {"language": language}}
+            await el_ws.send(json.dumps(init))
 
             # ── Plivo → ElevenLabs ───────────────────────────────────────────────
             async def from_plivo() -> None:

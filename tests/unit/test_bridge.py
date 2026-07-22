@@ -244,3 +244,61 @@ async def test_a_mid_call_failure_still_yields_what_was_collected(bridged):
     assert outcome["conversation_id"] == "conv_test_1"
     assert outcome["turns"] == 1
     assert [t.text for t in outcome["transcript"]] == ["Hello."]
+
+
+# ── the language override ────────────────────────────────────────────────────
+
+def _initiation(el_ws) -> dict:
+    """The first frame the bridge sends — the initiation payload."""
+    return json.loads(el_ws.sent[0])
+
+
+async def test_no_language_sends_no_override(bridged):
+    """THE regression guard for this whole feature. ElevenLabs raises if an
+    override arrives for a field that isn't enabled in the agent's Security
+    tab, so a campaign left on 'auto' must send exactly what it always sent —
+    otherwise enabling this feature breaks every existing campaign."""
+    el_ws = _FakeElevenLabsWS([_metadata(), _agent_says("Hi."), _audio()])
+    bridged(el_ws)
+
+    await asyncio.wait_for(
+        bridge.bridge(_FakePlivoWS(), agent_id="agent_1", lead_id="lead-1",
+                      one_way=True),
+        timeout=5,
+    )
+
+    assert "conversation_config_override" not in _initiation(el_ws)
+
+
+async def test_a_language_is_sent_as_a_conversation_config_override(bridged):
+    el_ws = _FakeElevenLabsWS([_metadata(), _agent_says("Hi."), _audio()])
+    bridged(el_ws)
+
+    await asyncio.wait_for(
+        bridge.bridge(_FakePlivoWS(), agent_id="agent_1", lead_id="lead-1",
+                      language="te", one_way=True),
+        timeout=5,
+    )
+
+    assert _initiation(el_ws)["conversation_config_override"] == {
+        "agent": {"language": "te"}
+    }
+
+
+async def test_the_override_does_not_disturb_the_dynamic_variables(bridged):
+    """Both travel in the same frame; adding one must not drop the other —
+    lead_id in particular is how the transcript maps back to a lead."""
+    el_ws = _FakeElevenLabsWS([_metadata(), _agent_says("Hi."), _audio()])
+    bridged(el_ws)
+
+    await asyncio.wait_for(
+        bridge.bridge(_FakePlivoWS(), agent_id="agent_1", lead_id="lead-1",
+                      dynamic_variables={"lead_id": "lead-1"},
+                      language="hi", one_way=True),
+        timeout=5,
+    )
+
+    frame = _initiation(el_ws)
+    assert frame["dynamic_variables"] == {"lead_id": "lead-1"}
+    assert frame["conversation_config_override"]["agent"]["language"] == "hi"
+    assert frame["type"] == "conversation_initiation_client_data"
