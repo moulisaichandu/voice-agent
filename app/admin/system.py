@@ -24,7 +24,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 
 from app import config as app_config
-from app import redis_client
+from app import languages, redis_client
 from app import scheduler as scheduler_module
 from app.compliance.calling_hours import within_calling_hours
 from app.config import CALLING_HOURS_END, CALLING_HOURS_START, CALLING_HOURS_TZ
@@ -148,7 +148,17 @@ async def _compute_preflight() -> dict:
         return {"key": "preflight", "status": "warning", "label": "Preflight",
                 "detail": "No active campaigns to check — create or activate one first"}
     campaign = active[0]
-    reason = await preflight_module.preflight(campaign.agent_id)
+    # No specific lead at dashboard time, only a campaign — resolve with the
+    # campaign's language alone, the same call the worker makes per-lead (see
+    # worker.py's own preflight call) collapsed to its campaign-only case.
+    # Without this, a campaign misconfigured for its language (e.g. pointed at
+    # a v2.5 agent that can't speak Telugu) stayed green here while the dial
+    # path correctly refused every call — leads then cycled
+    # queued -> calling -> pending with the reason visible only in a
+    # container log, exactly the diagnostic cycle this dashboard exists to
+    # prevent.
+    call_language = languages.iso_code(languages.resolve(None, campaign.language))
+    reason = await preflight_module.preflight(campaign.agent_id, call_language)
     if reason:
         return {"key": "preflight", "status": "critical", "label": "Preflight", "detail": reason}
     return {"key": "preflight", "status": "good", "label": "Preflight",

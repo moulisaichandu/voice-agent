@@ -77,7 +77,7 @@ def _mock_all_healthy(monkeypatch, *, redis: _FakeRedis | None = None) -> _FakeR
 
     monkeypatch.setattr(admin_system.campaigns_db, "list_active_campaigns", fake_active_campaigns)
 
-    async def fake_preflight(agent_id):
+    async def fake_preflight(agent_id, language=None):
         return None  # None = passing, per preflight()'s own contract
 
     monkeypatch.setattr(admin_system.preflight_module, "preflight", fake_preflight)
@@ -173,6 +173,40 @@ def test_readiness_with_no_active_campaigns_warns_instead_of_running_preflight(c
     assert "No active campaigns" in preflight_check["detail"]
 
 
+def test_readiness_preflight_passes_the_campaign_language(client, monkeypatch):
+    """_compute_preflight() used to call preflight(campaign.agent_id) with no
+    language at all, so the readiness dashboard stayed green for a campaign
+    misconfigured for its language — the dial path (worker.py) already passed
+    it and refused correctly, but the operator never saw why leads were
+    silently cycling queued -> calling -> pending.
+
+    There is no specific lead at dashboard time, only a campaign, so this must
+    resolve with the campaign's language alone (languages.resolve(None, ...)),
+    the correct campaign-level question for a readiness check. A 'tinglish'
+    campaign must reach preflight as the ISO code 'te', not the raw token —
+    preflight only understands ISO codes."""
+    _mock_all_healthy(monkeypatch)
+
+    async def fake_active_campaigns():
+        return [_campaign(language="tinglish")]
+
+    monkeypatch.setattr(admin_system.campaigns_db, "list_active_campaigns", fake_active_campaigns)
+
+    received = {}
+
+    async def capturing_preflight(agent_id, language=None):
+        received["agent_id"] = agent_id
+        received["language"] = language
+        return None
+
+    monkeypatch.setattr(admin_system.preflight_module, "preflight", capturing_preflight)
+
+    r = client.get("/admin/readiness")
+
+    assert r.status_code == 200
+    assert received["language"] == "te"
+
+
 def test_readiness_database_down_is_critical(client, monkeypatch):
     _mock_all_healthy(monkeypatch)
 
@@ -199,7 +233,7 @@ def test_readiness_caches_the_expensive_checks_across_requests(client, monkeypat
     _mock_all_healthy(monkeypatch)
     calls = {"preflight": 0, "billing": 0}
 
-    async def counted_preflight(agent_id):
+    async def counted_preflight(agent_id, language=None):
         calls["preflight"] += 1
         return None
 
@@ -222,7 +256,7 @@ def test_readiness_refresh_bypasses_the_cache(client, monkeypatch):
     _mock_all_healthy(monkeypatch)
     calls = {"preflight": 0}
 
-    async def counted_preflight(agent_id):
+    async def counted_preflight(agent_id, language=None):
         calls["preflight"] += 1
         return None
 
