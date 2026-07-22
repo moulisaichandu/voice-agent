@@ -132,6 +132,28 @@ def test_hindi_automated_call_disclosing_the_caller_passes():
     assert has_ai_disclosure("नमस्ते! यह एक स्वचालित कॉल है, डिजिटल ब्रॉली की ओर से।")
 
 
+def test_telugu_bare_automated_describing_a_fee_payment_system_is_not_a_disclosure():
+    """REGRESSION. The pre-existing bare Telugu marker "ఆటోమేటెడ్" ("automated")
+    had the identical defect this branch fixed in Hindi: it matches an
+    unrelated automated PROCESS, not the caller, so a script describing an
+    automated fee-payment system was wrongly accepted as disclosing the
+    caller is AI. Pinned to the exact sentence a reviewer reported."""
+    assert not has_ai_disclosure(
+        "నమస్తే! మా కోర్సు ఇప్పుడు ఆటోమేటెడ్ ఫీజు చెల్లింపు విధానంతో అందుబాటులో ఉంది."
+    )
+
+
+def test_telugu_automated_call_disclosing_the_caller_passes():
+    """The disambiguated marker must still accept a script that pairs the
+    automation word with a noun that makes the CALLER the automated thing —
+    mirrors the Hindi "स्वचालित कॉल" test above."""
+    assert has_ai_disclosure("నమస్తే! ఇది ఒక ఆటోమేటెడ్ కాల్, డిజిటల్ బ్రోలీ నుండి.")
+
+
+def test_telugu_automated_voice_disclosing_the_caller_passes():
+    assert has_ai_disclosure("నమస్తే! ఇది ఒక ఆటోమేటెడ్ వాయిస్, డిజిటల్ బ్రోలీ నుండి.")
+
+
 # ── Unicode normalization (nukta) ────────────────────────────────────────────
 #
 # The nukta character (Devanagari combining mark ़, U+093C) has two encodings

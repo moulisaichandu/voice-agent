@@ -67,7 +67,8 @@ _DISCLOSURE_MARKERS = (
     "voice bot",
     "virtual assistant",
     "కృత్రిమ మేధ",  # Telugu: "artificial intelligence"
-    "ఆటోమేటెడ్",  # Telugu: "automated"
+    "ఆటోమేటెడ్ కాల్",  # Telugu: "automated call"
+    "ఆటోమేటెడ్ వాయిస్",  # Telugu: "automated voice"
     "एआई",  # Hindi: "AI" spelled out in Devanagari
     "कृत्रिम बुद्धिमत्ता",  # Hindi: "artificial intelligence"
     "स्वचालित कॉल",  # Hindi: "automated call"
