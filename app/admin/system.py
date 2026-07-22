@@ -310,6 +310,13 @@ async def _refresh_check(key: str, compute: Callable[[], Awaitable[dict]]) -> di
     return result
 
 
+# can_dial-gating exceptions — see the comment inline at can_dial's
+# computation in _build_readiness() for the full reasoning. Module-level (not
+# inline in the set literal) so it reads as a considered, named policy rather
+# than a throwaway expression, matching _REQUIRED_FOR_DIALING's convention.
+_CAN_DIAL_IGNORED_WARNING_KEYS = {"calling_hours", "preflight"}
+
+
 async def _build_readiness(*, force_refresh: bool) -> ReadinessResponse:
     now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -333,7 +340,41 @@ async def _build_readiness(*, force_refresh: bool) -> ReadinessResponse:
         billing_check = await _cached_check("billing", _compute_billing)
 
     checks = [ReadinessCheck(**c) for c in [*cheap, preflight_check, billing_check]]
-    can_dial = not any(c.status in ("warning", "serious", "critical") for c in checks)
+
+    # can_dial means "is this system CAPABLE of dialling right now" — a
+    # narrower, more honest question than "did every single check come back
+    # green", which is what this used to compute (any warning at all flipped
+    # it false). Two real "warning" cases are NOT capability problems and
+    # must not gate it:
+    #
+    #   - calling_hours is a warning for ~14 hours of every single day
+    #     (outside 10:00-19:00 IST), which is the normal state of a healthy
+    #     system overnight — not a fault. The calling_hours check already
+    #     says "will not dial until it reopens" on its own; can_dial does not
+    #     need to repeat that by going false too, which would make a
+    #     perfectly healthy overnight system look identical to a broken one.
+    #   - preflight is a warning when SOME active campaigns pass and others
+    #     don't (see _compute_preflight's "mixed" outcome) — one
+    #     misconfigured campaign does not stop the system from placing calls
+    #     for every OTHER active campaign, so it must not gate can_dial
+    #     either. (preflight is still "critical" — and so still gates this —
+    #     when NO active campaign can dial.)
+    #
+    # Everything else stays a hard gate: "critical" (dead database, dead
+    # tunnel, missing key, an ElevenLabs account past due, every active
+    # campaign refusing to dial) and "serious" (unused today, but reserved
+    # for a future check that's worse than a warning and less than critical)
+    # both mean a real call would actually fail right now. If a future check
+    # ever needs a "warning" that SHOULD gate can_dial, that must be a
+    # deliberate addition to this comment and set (_CAN_DIAL_IGNORED_WARNING_KEYS,
+    # module-level above), not a side effect of adding another warning-tone
+    # check elsewhere.
+    can_dial = not any(
+        c.status == "critical"
+        or c.status == "serious"
+        or (c.status == "warning" and c.key not in _CAN_DIAL_IGNORED_WARNING_KEYS)
+        for c in checks
+    )
     return ReadinessResponse(can_dial=can_dial, checked_at=now_iso, checks=checks)
 
 

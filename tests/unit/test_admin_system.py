@@ -135,6 +135,13 @@ def test_readiness_can_dial_false_on_elevenlabs_billing_past_due(client, monkeyp
 
 
 def test_readiness_outside_calling_hours_is_a_warning_not_a_fault(client, monkeypatch):
+    """can_dial answers "is this system CAPABLE of dialling", not "will it
+    dial in the next second" — outside the calling-hours window is the
+    normal, correct state of a healthy system for ~14 hours of every day, and
+    the calling_hours check already says so clearly on its own. can_dial must
+    not also go false here, or a perfectly healthy overnight system becomes
+    indistinguishable from a genuinely broken one — the exact defect this
+    fix removes. See the can_dial comment in app/admin/system.py."""
     _mock_all_healthy(monkeypatch)
     monkeypatch.setattr(admin_system, "within_calling_hours", lambda: False)
 
@@ -142,7 +149,62 @@ def test_readiness_outside_calling_hours_is_a_warning_not_a_fault(client, monkey
     body = r.json()
     hours_check = next(c for c in body["checks"] if c["key"] == "calling_hours")
     assert hours_check["status"] == "warning"
-    assert body["can_dial"] is False  # nothing WILL dial right now, honestly
+    assert body["can_dial"] is True
+
+
+def test_can_dial_true_when_one_campaign_is_blocked_among_several(client, monkeypatch):
+    """One misconfigured campaign among several healthy ones does not stop
+    the SYSTEM from dialling — the other campaigns still can. This is the
+    operator's actual reported case: a 'twoway'-in-'te' test campaign made
+    the whole dashboard read can_dial: false even though two other campaigns,
+    and every infrastructure check, were fine."""
+    _mock_all_healthy(monkeypatch)
+
+    async def three_campaigns():
+        return [
+            _campaign(name="Healthy One", agent_id="agent_1", mode="oneway"),
+            _campaign(name="Healthy Two", agent_id="agent_2", mode="oneway"),
+            _campaign(name="Broken Telugu", agent_id="agent_3", mode="twoway", language="te"),
+        ]
+
+    monkeypatch.setattr(admin_system.campaigns_db, "list_active_campaigns", three_campaigns)
+
+    async def fails_only_broken(agent_id, language=None, mode=None):
+        if agent_id == "agent_3":
+            return "twoway in te is not supported by this backend"
+        return None
+
+    monkeypatch.setattr(admin_system.preflight_module, "preflight", fails_only_broken)
+
+    r = client.get("/admin/readiness")
+    body = r.json()
+    preflight_check = next(c for c in body["checks"] if c["key"] == "preflight")
+    assert preflight_check["status"] == "warning"
+    assert body["can_dial"] is True
+
+
+def test_can_dial_false_when_every_active_campaign_is_blocked(client, monkeypatch):
+    """Contrast with the mixed case above: when NOTHING can dial, can_dial
+    must still say so — this fix narrows what gates it, it does not disable
+    the gate."""
+    _mock_all_healthy(monkeypatch)
+
+    async def two_campaigns():
+        return [
+            _campaign(name="One", agent_id="agent_1"),
+            _campaign(name="Two", agent_id="agent_2"),
+        ]
+
+    monkeypatch.setattr(admin_system.campaigns_db, "list_active_campaigns", two_campaigns)
+
+    async def always_fails(agent_id, language=None, mode=None):
+        return "tunnel is down"
+
+    monkeypatch.setattr(admin_system.preflight_module, "preflight", always_fails)
+
+    r = client.get("/admin/readiness")
+    body = r.json()
+    assert body["can_dial"] is False
 
 
 def test_readiness_reports_missing_config_by_name(client, monkeypatch):
