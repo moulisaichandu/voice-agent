@@ -1,5 +1,12 @@
 """telephony/bridge.py — Bridge a live Plivo call to an ElevenLabs agent.
 
+Everything here is ElevenLabs-specific: the signed-URL handshake, that
+vendor's WebSocket wire protocol, and the translation of its events into
+audio on the line and transcript turns. The call itself — the answer XML,
+sending and clearing audio, and the one-way watchdog that ends a call once
+its message has been delivered — lives in app/telephony/plivo_stream.py, so
+a second voice backend can reuse it verbatim.
+
 Plivo Audio Streams carry 8 kHz G.711 mu-law both ways, and the ElevenLabs
 agents are configured with ulaw_8000 for BOTH directions — so this is a direct
 base64 passthrough with no resampling or transcoding. That is what CLAUDE.md's
@@ -28,73 +35,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from xml.sax.saxutils import escape
 
 import websockets
-from fastapi import WebSocket, WebSocketDisconnect
+from fastapi import WebSocket
 
-from app.config import (
-    CALL_MAX_DURATION_S,
-    CALL_WEBHOOK_SECRET,
-    ELEVENLABS_API_KEY,
-    ONEWAY_MAX_SILENT_S,
-    ONEWAY_SILENCE_TAIL_S,
-    PLIVO_GREETING_GRACE_MS,
-    PUBLIC_BASE_URL,
-)
+from app.config import ELEVENLABS_API_KEY
 from app.db.models import TranscriptTurn
 from app.telephony.elevenlabs_client import get_client
+from app.telephony.plivo_stream import PlivoCall
 
 logger = logging.getLogger(__name__)
-
-# mu-law at 8 kHz is 8000 bytes/sec, and base64 inflates by 4/3 — so decoded
-# bytes = len(b64) * 3/4, and seconds = that / 8000. Used to estimate when
-# audio already handed to Plivo will finish playing.
-_ULAW_BYTES_PER_S = 8000.0
-
-# How often the one-way watchdog re-checks whether the message has finished.
-# Fine-grained enough that the poll adds no audible tail of its own.
-_ONEWAY_POLL_S = 0.25
-
-
-def answer_xml(lead_id: str) -> str:
-    """The XML Plivo fetches on answer: open a bidirectional mu-law stream back
-    to this server.
-
-    keepCallAlive keeps the call up while the stream runs; without it Plivo
-    treats the (empty) rest of the XML document as the whole call and hangs up
-    the moment the stream is established.
-    """
-    base = (PUBLIC_BASE_URL or "").rstrip("/")
-    wss = base.replace("https://", "wss://").replace("http://", "ws://")
-    from urllib.parse import quote
-    url = (f"{wss}/calls/stream?token={quote(CALL_WEBHOOK_SECRET or '')}"
-           f"&lead={quote(lead_id)}")
-    return (
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        "<Response>"
-        '<Stream bidirectional="true" keepCallAlive="true" '
-        f'contentType="audio/x-mulaw;rate=8000">{escape(url)}</Stream>'
-        "</Response>"
-    )
-
-
-async def _play(plivo_ws: WebSocket, payload_b64: str) -> None:
-    """Send agent audio into the call."""
-    await plivo_ws.send_text(json.dumps({
-        "event": "playAudio",
-        "media": {"contentType": "audio/x-mulaw", "sampleRate": 8000,
-                  "payload": payload_b64},
-    }))
-
-
-async def _clear(plivo_ws: WebSocket, stream_id: str | None) -> None:
-    """Drop audio already buffered on the call, so barge-in is immediate rather
-    than waiting for the agent's queued speech to drain."""
-    msg: dict = {"event": "clearAudio"}
-    if stream_id:
-        msg["streamId"] = stream_id
-    await plivo_ws.send_text(json.dumps(msg))
 
 
 async def _signed_url(agent_id: str) -> str:
@@ -149,32 +99,10 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
         outcome["status"] = "failed"
         return outcome
 
-    loop = asyncio.get_running_loop()
     signed = await _signed_url(agent_id)
 
-    stop = asyncio.Event()
-    state = {
-        "stream_id": None,
-        # Loop-time at which audio already sent to Plivo finishes playing. The
-        # agent can emit audio faster than real time, so a graceful hangup must
-        # wait on this rather than a fixed sleep, or the last words are cut off.
-        "play_end": 0.0,
-        # The lead's first sound on an outbound call is almost always "Hello?" —
-        # an acknowledgement, not an interruption. Cancelling the greeting on it
-        # made the agent restart from the top. Barge-in is live after this.
-        "grace_until": 0.0,
-        # Whether ANY agent audio has arrived yet. Tracked separately from
-        # play_end because that starts at 0.0, which the one-way watchdog
-        # cannot tell apart from "the message already finished playing" — it
-        # would hang up before the agent had said a word.
-        "audio_seen": False,
-        "exit_reason": "unknown",
-    }
+    call = PlivoCall(plivo_ws, lead_id=lead_id, one_way=one_way)
     turns: list[TranscriptTurn] = []
-
-    def _exit(reason: str) -> None:
-        if state["exit_reason"] == "unknown":
-            state["exit_reason"] = reason
 
     try:
         async with websockets.connect(signed, max_size=16 * 1024 * 1024) as el_ws:
@@ -188,44 +116,14 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
             await el_ws.send(json.dumps(init))
 
             # ── Plivo → ElevenLabs ───────────────────────────────────────────────
-            async def from_plivo() -> None:
-                try:
-                    while not stop.is_set():
-                        raw = await plivo_ws.receive_text()
-                        try:
-                            msg = json.loads(raw)
-                        except (ValueError, TypeError):
-                            continue
-                        ev = msg.get("event")
-                        if ev == "start":
-                            st = msg.get("start") or {}
-                            state["stream_id"] = msg.get("streamId") or st.get("streamId")
-                            if not one_way and PLIVO_GREETING_GRACE_MS > 0:
-                                state["grace_until"] = (
-                                    loop.time() + PLIVO_GREETING_GRACE_MS / 1000.0
-                                )
-                        elif ev == "media":
-                            if one_way:
-                                continue  # never listen on a one-way call
-                            payload = (msg.get("media") or {}).get("payload")
-                            if payload:
-                                await el_ws.send(json.dumps({"user_audio_chunk": payload}))
-                        elif ev == "stop":
-                            _exit("plivo_stop")
-                            break
-                except WebSocketDisconnect:
-                    _exit("plivo_disconnect")
-                except Exception as exc:
-                    _exit(f"error:{type(exc).__name__}")
-                    logger.info(f"[bridge] Plivo reader stopped: {type(exc).__name__}: {exc}")
-                finally:
-                    stop.set()
+            async def to_elevenlabs(payload_b64: str) -> None:
+                await el_ws.send(json.dumps({"user_audio_chunk": payload_b64}))
 
             # ── ElevenLabs → Plivo ───────────────────────────────────────────────
             async def from_elevenlabs() -> None:
                 try:
                     async for raw in el_ws:
-                        if stop.is_set():
+                        if call.stop.is_set():
                             break
                         try:
                             event = json.loads(raw)
@@ -236,10 +134,7 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
                         if etype == "audio":
                             b64 = (event.get("audio_event") or {}).get("audio_base_64")
                             if b64:
-                                await _play(plivo_ws, b64)
-                                dur = (len(b64) * 3 / 4) / _ULAW_BYTES_PER_S
-                                state["play_end"] = max(state["play_end"], loop.time()) + dur
-                                state["audio_seen"] = True
+                                await call.play(b64)
                         elif etype == "agent_response":
                             text = (event.get("agent_response_event") or {}).get("agent_response")
                             if text:
@@ -251,9 +146,7 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
                                 turns.append(TranscriptTurn(role="lead", text=text.strip()))
                         elif etype == "interruption":
                             # Honour barge-in, except during the greeting window.
-                            if loop.time() >= state["grace_until"]:
-                                await _clear(plivo_ws, state["stream_id"])
-                                state["play_end"] = 0.0
+                            await call.interrupt()
                         elif etype == "ping":
                             # Unanswered pings cause the server to drop the socket.
                             ev = event.get("ping_event") or {}
@@ -272,73 +165,21 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
                                     "agent's audio format in ElevenLabs."
                                 )
                 except websockets.exceptions.ConnectionClosed as exc:
-                    _exit(f"elevenlabs_closed:{exc.code}")
+                    call.note_exit(f"elevenlabs_closed:{exc.code}")
                     # 1002 with a payment message is a billing stop, not a bug —
                     # surface it plainly rather than as a generic disconnect.
                     logger.warning(f"[bridge] ElevenLabs closed the socket: {exc}")
                 except Exception as exc:
-                    _exit(f"error:{type(exc).__name__}")
+                    call.note_exit(f"error:{type(exc).__name__}")
                     logger.error(f"[bridge] ElevenLabs reader failed: "
                                  f"{type(exc).__name__}: {exc}")
                 finally:
-                    stop.set()
+                    call.stop.set()
 
-            # ── One-way: end the call when the message has been delivered ────────
-            async def oneway_watchdog() -> None:
-                """Nothing else can end a one-way call.
-
-                A one-way bridge never forwards the lead's audio (see from_plivo),
-                so ElevenLabs receives no turn-end signal and never closes its
-                socket; from_plivo only returns if the lead hangs up first. That
-                left `stop` unset and the bridge parked on CALL_MAX_DURATION_S —
-                300 seconds of billed Plivo airtime and a 300-second ElevenLabs
-                conversation for a 20-second message, with the lead listening to
-                silence for the remainder.
-
-                So: wait for the agent's audio to drain, allow a short tail, then
-                end the call ourselves. Bounded at both ends — an agent that never
-                speaks at all costs ONEWAY_MAX_SILENT_S, not the full duration.
-                """
-                started = loop.time()
-                while not stop.is_set():
-                    await asyncio.sleep(_ONEWAY_POLL_S)
-                    now = loop.time()
-                    if not state["audio_seen"]:
-                        if now - started >= ONEWAY_MAX_SILENT_S:
-                            logger.warning(
-                                f"[bridge] lead={lead_id} one-way agent produced no audio "
-                                f"in {ONEWAY_MAX_SILENT_S}s — ending the call. Check the "
-                                "agent's prompt and its dynamic variables."
-                            )
-                            _exit("oneway_no_audio")
-                            break
-                        continue
-                    if now >= state["play_end"] + ONEWAY_SILENCE_TAIL_S:
-                        _exit("oneway_complete")
-                        break
-                stop.set()
-
-            tasks = [from_plivo(), from_elevenlabs()]
-            if one_way:
-                tasks.append(oneway_watchdog())
-            reader = asyncio.gather(*tasks, return_exceptions=True)
-            try:
-                # A call that never ends would hold a concurrency slot forever, so
-                # the whole bridge is bounded rather than trusting either side.
-                await asyncio.wait_for(stop.wait(), timeout=CALL_MAX_DURATION_S)
-            except asyncio.TimeoutError:
-                _exit("max_duration")
-                stop.set()
-            finally:
-                # Let the agent's final words play out before the line drops.
-                remaining = state["play_end"] - loop.time()
-                if remaining > 0:
-                    await asyncio.sleep(min(remaining + 0.3, 15))
-                reader.cancel()
-                try:
-                    await reader
-                except (asyncio.CancelledError, Exception):
-                    pass
+            # PlivoCall.run adds the one-way watchdog itself, bounds the whole
+            # call at CALL_MAX_DURATION_S, and lets queued audio drain before
+            # the line drops.
+            await call.run(call.read_events(to_elevenlabs), from_elevenlabs())
     finally:
         # In a `finally` so a mid-call exception — a ConnectionClosed escaping
         # the `async with` above, say — still hands the caller everything
@@ -350,13 +191,8 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
         outcome["transcript"] = turns
         # "done" only when the call ran its course; a bridge that fell over
         # should not look like a completed conversation in the calls table.
-        # oneway_complete belongs here: it IS the natural end of a one-way
-        # call, and without it every successful one-way call would be stored
-        # 'failed', mark its lead 'failed', and burn a retry attempt.
-        outcome["status"] = ("done" if state["exit_reason"] in
-                             ("plivo_stop", "plivo_disconnect", "max_duration",
-                              "oneway_complete")
-                             else "failed")
-        logger.info(f"[bridge] lead={lead_id} ended reason={state['exit_reason']} "
+        # See PlivoCall.ran_its_course for which reasons count.
+        outcome["status"] = "done" if call.ran_its_course else "failed"
+        logger.info(f"[bridge] lead={lead_id} ended reason={call.exit_reason} "
                     f"turns={len(turns)}")
     return outcome

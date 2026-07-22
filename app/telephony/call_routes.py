@@ -33,7 +33,7 @@ from app.db import campaigns as campaigns_db
 from app.db import leads as leads_db
 from app.db.models import Campaign, Lead
 from app.telephony import bridge as bridge_module
-from app.telephony import plivo_client
+from app.telephony import plivo_client, plivo_stream
 from app.telephony import worker as telephony_worker
 
 router = APIRouter(tags=["Telephony"])
@@ -159,7 +159,7 @@ async def answer(request: Request) -> Response:
                     ex=_SLOT_GUARD_TTL_S)
 
     logger.info(f"[calls] answered lead={lead_id} CallUUID={call_uuid}")
-    return Response(content=bridge_module.answer_xml(lead_id),
+    return Response(content=plivo_stream.answer_xml(lead_id),
                     media_type="application/xml")
 
 

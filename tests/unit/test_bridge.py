@@ -1,14 +1,15 @@
-"""Unit tests for telephony/bridge.py.
+"""Unit tests for telephony/bridge.py — the ElevenLabs side of a call.
 
-Two groups. The answer XML is pure and easy to get subtly wrong, and fails in
-a way that is very hard to diagnose from the outside (the call rings,
-connects, and is silent).
-
-The bridge loop itself is driven here against a pair of fake WebSockets. That
-is worth the fakes because the loop's two failure modes are both expensive and
+The bridge loop is driven here against a pair of fake WebSockets. That is
+worth the fakes because the loop's two failure modes are both expensive and
 both invisible in a passing call: a one-way call that never hangs up bills
 CALL_MAX_DURATION_S of silence to every lead, and an exception mid-call used
 to throw away the transcript of a conversation that really happened.
+
+The Plivo side of the call — the answer XML, the audio channel and the one-way
+watchdog — now lives in app/telephony/plivo_stream.py and is tested in
+tests/unit/test_plivo_stream.py. The end-to-end behaviour of both together is
+still asserted below, through bridge() itself.
 """
 
 import asyncio
@@ -17,60 +18,7 @@ import json
 
 import pytest
 
-from app.telephony import bridge
-
-
-@pytest.fixture(autouse=True)
-def _public_url(monkeypatch):
-    monkeypatch.setattr(bridge, "PUBLIC_BASE_URL", "https://example.trycloudflare.com")
-    monkeypatch.setattr(bridge, "CALL_WEBHOOK_SECRET", "s3cret")
-
-
-def test_answer_xml_points_at_the_websocket_over_wss():
-    """https must become wss, not stay https — Plivo silently fails to open
-    the stream otherwise, and the call connects to silence."""
-    xml = bridge.answer_xml("lead-123")
-    assert "wss://example.trycloudflare.com/calls/stream" in xml
-    assert "https://" not in xml
-
-
-def test_answer_xml_declares_mulaw_8000():
-    """Plivo must be told the stream is mu-law 8 kHz. Any other framing and
-    the caller hears noise, because the agent's audio really is mu-law."""
-    xml = bridge.answer_xml("lead-123")
-    assert 'contentType="audio/x-mulaw;rate=8000"' in xml
-
-
-def test_answer_xml_is_bidirectional_and_keeps_the_call_alive():
-    """Without keepCallAlive Plivo treats the rest of the (empty) document as
-    the whole call and hangs up the moment the stream is established."""
-    xml = bridge.answer_xml("lead-123")
-    assert 'bidirectional="true"' in xml
-    assert 'keepCallAlive="true"' in xml
-
-
-def test_answer_xml_carries_the_lead_and_token():
-    xml = bridge.answer_xml("lead-123")
-    assert "lead=lead-123" in xml
-    assert "token=s3cret" in xml
-
-
-def test_answer_xml_escapes_the_url():
-    """The URL goes inside an XML element, so & between query params must be
-    escaped or Plivo's parser rejects the document."""
-    xml = bridge.answer_xml("lead-123")
-    assert "&amp;" in xml
-    # A bare & would mean the ampersand was left unescaped.
-    assert "&lead=" not in xml.replace("&amp;lead=", "")
-
-
-def test_answer_xml_handles_a_http_base_url(monkeypatch):
-    monkeypatch.setattr(bridge, "PUBLIC_BASE_URL", "http://localhost:8091")
-    xml = bridge.answer_xml("lead-1")
-    assert "ws://localhost:8091/calls/stream" in xml
-
-
-# ── the bridge loop ──────────────────────────────────────────────────────────
+from app.telephony import bridge, plivo_stream
 
 # 80 ms of mu-law: long enough to be realistic, short enough that waiting for
 # it to "play out" costs the test nothing.
@@ -143,8 +91,8 @@ class _FakePlivoWS:
 def bridged(monkeypatch):
     """Wire bridge() to fakes and make the one-way timings test-fast."""
     monkeypatch.setattr(bridge, "ELEVENLABS_API_KEY", "sk-test")
-    monkeypatch.setattr(bridge, "ONEWAY_SILENCE_TAIL_S", 0)
-    monkeypatch.setattr(bridge, "ONEWAY_MAX_SILENT_S", 0)
+    monkeypatch.setattr(plivo_stream, "ONEWAY_SILENCE_TAIL_S", 0)
+    monkeypatch.setattr(plivo_stream, "ONEWAY_MAX_SILENT_S", 0)
 
     async def fake_signed_url(agent_id):
         return "wss://elevenlabs.invalid/signed"
@@ -201,7 +149,7 @@ async def test_a_two_way_call_is_not_ended_by_the_watchdog(bridged, monkeypatch)
     """The watchdog must run for one-way calls ONLY. On a two-way call the
     silence after the agent's greeting is the lead thinking about their reply;
     hanging up on it would cut off every conversation at hello."""
-    monkeypatch.setattr(bridge, "CALL_MAX_DURATION_S", 1)
+    monkeypatch.setattr(plivo_stream, "CALL_MAX_DURATION_S", 1)
     el_ws = _FakeElevenLabsWS([_metadata(), _audio()])
     bridged(el_ws)
 

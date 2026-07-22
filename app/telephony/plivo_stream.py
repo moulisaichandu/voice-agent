@@ -1,0 +1,276 @@
+"""telephony/plivo_stream.py — the Plivo side of one answered call.
+
+Everything here is about the CALL, not about whichever model is speaking on
+it. Plivo Audio Streams carry 8 kHz G.711 mu-law both ways; every voice
+backend we bridge to is configured for ulaw_8000 in both directions, so audio
+is a direct base64 passthrough with no resampling or transcoding. That is what
+CLAUDE.md's "keep TTS output format ulaw_8000 for the phone path" rule is for.
+
+    Plivo call  --(media: base64 mu-law)-->  read_events(on_media=...)
+    Plivo call  <--(playAudio: base64)-----  PlivoCall.play(...)
+
+This module was split out of bridge.py so a second voice backend (OpenAI
+Realtime, for Telugu — a language ElevenLabs cannot speak at all) can reuse
+the call plumbing without copying it. The piece that must never exist in two
+hand-maintained copies is `PlivoCall.oneway_watchdog`: read its docstring.
+
+Observed Plivo client messages on the stream socket:
+
+    start   {streamId, start: {streamId, ...}}
+    media   {media: {payload: <base64 mu-law>}}
+    stop    {}
+
+Server messages we send back: playAudio and clearAudio.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from collections.abc import Awaitable, Callable
+from urllib.parse import quote
+from xml.sax.saxutils import escape
+
+from fastapi import WebSocket, WebSocketDisconnect
+
+from app.config import (
+    CALL_MAX_DURATION_S,
+    CALL_WEBHOOK_SECRET,
+    ONEWAY_MAX_SILENT_S,
+    ONEWAY_SILENCE_TAIL_S,
+    PLIVO_GREETING_GRACE_MS,
+    PUBLIC_BASE_URL,
+)
+
+logger = logging.getLogger(__name__)
+
+# mu-law at 8 kHz is 8000 bytes/sec, and base64 inflates by 4/3 — so decoded
+# bytes = len(b64) * 3/4, and seconds = that / 8000. Used to estimate when
+# audio already handed to Plivo will finish playing.
+_ULAW_BYTES_PER_S = 8000.0
+
+# How often the one-way watchdog re-checks whether the message has finished.
+# Fine-grained enough that the poll adds no audible tail of its own.
+_ONEWAY_POLL_S = 0.25
+
+# Exit reasons that mean the call ran its course rather than fell over. Kept
+# here because they are all decided on the Plivo side, and every backend has
+# to grade its calls the same way. oneway_complete belongs in this set: it IS
+# the natural end of a one-way call, and without it every successful one-way
+# call would be stored 'failed', mark its lead 'failed', and burn a retry.
+_CLEAN_EXITS = ("plivo_stop", "plivo_disconnect", "max_duration", "oneway_complete")
+
+
+def answer_xml(lead_id: str) -> str:
+    """The XML Plivo fetches on answer: open a bidirectional mu-law stream back
+    to this server.
+
+    keepCallAlive keeps the call up while the stream runs; without it Plivo
+    treats the (empty) rest of the XML document as the whole call and hangs up
+    the moment the stream is established.
+    """
+    base = (PUBLIC_BASE_URL or "").rstrip("/")
+    wss = base.replace("https://", "wss://").replace("http://", "ws://")
+    url = (f"{wss}/calls/stream?token={quote(CALL_WEBHOOK_SECRET or '')}"
+           f"&lead={quote(lead_id)}")
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        '<Stream bidirectional="true" keepCallAlive="true" '
+        f'contentType="audio/x-mulaw;rate=8000">{escape(url)}</Stream>'
+        "</Response>"
+    )
+
+
+class PlivoCall:
+    """One answered Plivo call's audio channel and lifecycle.
+
+    Owns the per-call mutable state that the audio path and the lifecycle
+    share, and the `stop` event that every task on the call watches. A voice
+    backend drives it: `read_events` for the inbound leg, `play` / `interrupt`
+    for the outbound one, and `run` to supervise the whole thing.
+    """
+
+    def __init__(self, ws: WebSocket, *, lead_id: str, one_way: bool = False) -> None:
+        self.ws = ws
+        self.lead_id = lead_id
+        self.one_way = one_way
+        self._loop = asyncio.get_running_loop()
+
+        # Set by whichever task ends the call; every other task watches it.
+        self.stop: asyncio.Event = asyncio.Event()
+
+        self.stream_id: str | None = None
+        # Loop-time at which audio already sent to Plivo finishes playing. The
+        # agent can emit audio faster than real time, so a graceful hangup must
+        # wait on this rather than a fixed sleep, or the last words are cut off.
+        self.play_end: float = 0.0
+        # The lead's first sound on an outbound call is almost always "Hello?" —
+        # an acknowledgement, not an interruption. Cancelling the greeting on it
+        # made the agent restart from the top. Barge-in is live after this.
+        self.grace_until: float = 0.0
+        # Whether ANY agent audio has arrived yet. Tracked separately from
+        # play_end because that starts at 0.0, which the one-way watchdog
+        # cannot tell apart from "the message already finished playing" — it
+        # would hang up before the agent had said a word.
+        self.audio_seen: bool = False
+        self.exit_reason: str = "unknown"
+
+    # ── lifecycle bookkeeping ────────────────────────────────────────────────
+
+    def note_exit(self, reason: str) -> None:
+        """Record why the call ended. First reason wins — it is the cause;
+        anything after it is a consequence of the socket being torn down."""
+        if self.exit_reason == "unknown":
+            self.exit_reason = reason
+
+    @property
+    def ran_its_course(self) -> bool:
+        """Whether this call ended normally, as opposed to falling over.
+
+        A bridge that failed part-way must not look like a completed
+        conversation in the calls table — see _CLEAN_EXITS.
+        """
+        return self.exit_reason in _CLEAN_EXITS
+
+    # ── outbound audio ───────────────────────────────────────────────────────
+
+    async def play(self, payload_b64: str) -> None:
+        """Send agent audio into the call, and account for how long it will
+        take to play out."""
+        await self.ws.send_text(json.dumps({
+            "event": "playAudio",
+            "media": {"contentType": "audio/x-mulaw", "sampleRate": 8000,
+                      "payload": payload_b64},
+        }))
+        dur = (len(payload_b64) * 3 / 4) / _ULAW_BYTES_PER_S
+        self.play_end = max(self.play_end, self._loop.time()) + dur
+        self.audio_seen = True
+
+    async def clear(self) -> None:
+        """Drop audio already buffered on the call, so barge-in is immediate
+        rather than waiting for the agent's queued speech to drain.
+
+        Nothing queued is left to play, so play_end resets with it."""
+        msg: dict = {"event": "clearAudio"}
+        if self.stream_id:
+            msg["streamId"] = self.stream_id
+        await self.ws.send_text(json.dumps(msg))
+        self.play_end = 0.0
+
+    async def interrupt(self) -> bool:
+        """Honour barge-in, except during the greeting window. Returns whether
+        the buffered audio was actually dropped."""
+        if self._loop.time() < self.grace_until:
+            return False
+        await self.clear()
+        return True
+
+    # ── inbound audio ────────────────────────────────────────────────────────
+
+    async def read_events(self, on_media: Callable[[str], Awaitable[None]]) -> None:
+        """Read the Plivo stream socket until the call ends.
+
+        *on_media* receives each base64 mu-law payload from the lead, and is
+        the one backend-specific thing here. It is never called on a one-way
+        call: those deliver a message and do not listen.
+        """
+        try:
+            while not self.stop.is_set():
+                raw = await self.ws.receive_text()
+                try:
+                    msg = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                ev = msg.get("event")
+                if ev == "start":
+                    st = msg.get("start") or {}
+                    self.stream_id = msg.get("streamId") or st.get("streamId")
+                    if not self.one_way and PLIVO_GREETING_GRACE_MS > 0:
+                        self.grace_until = (
+                            self._loop.time() + PLIVO_GREETING_GRACE_MS / 1000.0
+                        )
+                elif ev == "media":
+                    if self.one_way:
+                        continue  # never listen on a one-way call
+                    payload = (msg.get("media") or {}).get("payload")
+                    if payload:
+                        await on_media(payload)
+                elif ev == "stop":
+                    self.note_exit("plivo_stop")
+                    break
+        except WebSocketDisconnect:
+            self.note_exit("plivo_disconnect")
+        except Exception as exc:
+            self.note_exit(f"error:{type(exc).__name__}")
+            logger.info(f"[plivo] Plivo reader stopped: {type(exc).__name__}: {exc}")
+        finally:
+            self.stop.set()
+
+    # ── one-way: end the call when the message has been delivered ────────────
+
+    async def oneway_watchdog(self) -> None:
+        """Nothing else can end a one-way call.
+
+        A one-way bridge never forwards the lead's audio (see read_events),
+        so the voice backend receives no turn-end signal and never closes its
+        socket; read_events only returns if the lead hangs up first. That
+        left `stop` unset and the bridge parked on CALL_MAX_DURATION_S —
+        300 seconds of billed Plivo airtime and a 300-second ElevenLabs
+        conversation for a 20-second message, with the lead listening to
+        silence for the remainder.
+
+        So: wait for the agent's audio to drain, allow a short tail, then
+        end the call ourselves. Bounded at both ends — an agent that never
+        speaks at all costs ONEWAY_MAX_SILENT_S, not the full duration.
+        """
+        started = self._loop.time()
+        while not self.stop.is_set():
+            await asyncio.sleep(_ONEWAY_POLL_S)
+            now = self._loop.time()
+            if not self.audio_seen:
+                if now - started >= ONEWAY_MAX_SILENT_S:
+                    logger.warning(
+                        f"[plivo] lead={self.lead_id} one-way agent produced no audio "
+                        f"in {ONEWAY_MAX_SILENT_S}s — ending the call. Check the "
+                        "agent's prompt and its dynamic variables."
+                    )
+                    self.note_exit("oneway_no_audio")
+                    break
+                continue
+            if now >= self.play_end + ONEWAY_SILENCE_TAIL_S:
+                self.note_exit("oneway_complete")
+                break
+        self.stop.set()
+
+    # ── supervision ──────────────────────────────────────────────────────────
+
+    async def run(self, *tasks: Awaitable[None]) -> None:
+        """Run *tasks* until the call ends, then drain and cancel them.
+
+        On a one-way call the watchdog is added here, so no backend can forget
+        it. Returns once the line is safe to drop; the caller is responsible
+        for whatever it collected along the way.
+        """
+        coros: list[Awaitable[None]] = list(tasks)
+        if self.one_way:
+            coros.append(self.oneway_watchdog())
+        reader = asyncio.gather(*coros, return_exceptions=True)
+        try:
+            # A call that never ends would hold a concurrency slot forever, so
+            # the whole bridge is bounded rather than trusting either side.
+            await asyncio.wait_for(self.stop.wait(), timeout=CALL_MAX_DURATION_S)
+        except asyncio.TimeoutError:
+            self.note_exit("max_duration")
+            self.stop.set()
+        finally:
+            # Let the agent's final words play out before the line drops.
+            remaining = self.play_end - self._loop.time()
+            if remaining > 0:
+                await asyncio.sleep(min(remaining + 0.3, 15))
+            reader.cancel()
+            try:
+                await reader
+            except (asyncio.CancelledError, Exception):
+                pass
