@@ -347,3 +347,80 @@ def test_a_rejected_row_does_not_leave_a_gap_in_the_dial_order(client, monkeypat
             "Phone\n+919876543210\n12345\n9812345678\n")
 
     assert [u["dial_order"] for u in upserted] == [1, 2]
+
+
+# ── language_pref normalization on single-lead add ─────────────────────────────
+
+def test_add_lead_normalizes_free_text_language_to_canonical_token(client, monkeypatch):
+    """leads.language_pref is CHECK-constrained to six tokens, and this
+    endpoint accepts free text like 'Telugu'. Without normalization, a POST
+    with language_pref='Telugu' would be a 500 instead of a working lead."""
+    campaign = _campaign()
+
+    async def get_campaign(cid):
+        return campaign
+
+    captured = {}
+
+    async def fake_upsert(**kwargs):
+        captured.update(kwargs)
+        return _lead(campaign_id=campaign.campaign_id, phone_e164=kwargs["phone_e164"],
+                     language_pref=kwargs["language_pref"])
+
+    monkeypatch.setattr(admin_leads.campaigns_db, "get_campaign", get_campaign)
+    monkeypatch.setattr(admin_leads.leads_db, "upsert_lead", fake_upsert)
+
+    r = client.post(f"/admin/campaigns/{campaign.campaign_id}/leads", json={
+        "phone": "09876543210", "name": "Sita", "language_pref": "Telugu",
+    })
+    assert r.status_code == 201
+    assert captured["language_pref"] == "te"
+
+
+def test_add_lead_unrecognised_language_falls_back_to_auto(client, monkeypatch):
+    """One junk cell must not fail the lead — it imports and dials in the
+    campaign's language."""
+    campaign = _campaign()
+
+    async def get_campaign(cid):
+        return campaign
+
+    captured = {}
+
+    async def fake_upsert(**kwargs):
+        captured.update(kwargs)
+        return _lead(campaign_id=campaign.campaign_id, phone_e164=kwargs["phone_e164"],
+                     language_pref=kwargs["language_pref"])
+
+    monkeypatch.setattr(admin_leads.campaigns_db, "get_campaign", get_campaign)
+    monkeypatch.setattr(admin_leads.leads_db, "upsert_lead", fake_upsert)
+
+    r = client.post(f"/admin/campaigns/{campaign.campaign_id}/leads", json={
+        "phone": "09876543210", "name": "Sita", "language_pref": "Klingon",
+    })
+    assert r.status_code == 201
+    assert captured["language_pref"] == "auto"
+
+
+def test_add_lead_omitted_language_defaults_to_auto(client, monkeypatch):
+    """Omitting language_pref must still result in 'auto' being stored."""
+    campaign = _campaign()
+
+    async def get_campaign(cid):
+        return campaign
+
+    captured = {}
+
+    async def fake_upsert(**kwargs):
+        captured.update(kwargs)
+        return _lead(campaign_id=campaign.campaign_id, phone_e164=kwargs["phone_e164"],
+                     language_pref=kwargs["language_pref"])
+
+    monkeypatch.setattr(admin_leads.campaigns_db, "get_campaign", get_campaign)
+    monkeypatch.setattr(admin_leads.leads_db, "upsert_lead", fake_upsert)
+
+    r = client.post(f"/admin/campaigns/{campaign.campaign_id}/leads", json={
+        "phone": "09876543210", "name": "Sita",
+    })
+    assert r.status_code == 201
+    assert captured["language_pref"] == "auto"

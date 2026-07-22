@@ -15,7 +15,7 @@ from uuid import UUID
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 
-from app import leads_import
+from app import languages, leads_import
 from app.compliance.consent import has_valid_consent
 from app.compliance.dnd import normalize_phone_e164
 from app.db import calls as calls_db
@@ -52,9 +52,13 @@ async def add_lead(campaign_id: UUID, body: LeadCreate) -> Lead:
     if not phone:
         raise HTTPException(status_code=400,
                             detail=f"{body.phone!r} is not a valid Indian phone number")
+    # leads.language_pref is CHECK-constrained to six canonical tokens, and this
+    # endpoint accepts free text from the caller (e.g. "Telugu"), so normalize it
+    # to one of those tokens before inserting — the same pattern as phone above.
+    language_pref = languages.normalize(body.language_pref)
     return await leads_db.upsert_lead(
         sheet_row=None, name=body.name, phone_e164=phone, campaign_id=campaign_id,
-        language_pref=body.language_pref,
+        language_pref=language_pref,
         consent_basis=body.consent_basis, consent_at=body.consent_at,
     )
 

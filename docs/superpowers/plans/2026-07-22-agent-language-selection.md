@@ -1542,5 +1542,5 @@ Append a short "Live verification" section to `docs/superpowers/specs/2026-07-22
 ## Notes for the implementer
 
 - **The agent prompt is not in this repo.** `{{language}}` and `{{language_style}}` are delivered as dynamic variables, but they only do something if the ElevenLabs agent's system prompt references them. Add a line like `{{language_style}}` to both agents' prompts in the dashboard. Task 9 Step 6 is where you find out if you forgot.
-- **Don't add a language column to the single-lead form** (`app/admin/leads.py`'s `LeadCreate` already has `language_pref`, and it now normalizes through the same `CHECK`). It works; it just isn't surfaced in the UI, and no one asked for it.
+- **Don't add a language column to the single-lead form** (`app/admin/leads.py`'s `LeadCreate` field exists and the endpoint normalizes hand-typed values via `app/languages.normalize()` before storing, so a POST with `language_pref: "Telugu"` becomes `"te"` in the database). It works; it just isn't surfaced in the UI, and no one asked for it.
 - **`place_outbound_call` in `elevenlabs_client.py` is the old SIP path** and is not on the live dial path (Plivo places calls now — see CLAUDE.md). Don't wire language into it.
