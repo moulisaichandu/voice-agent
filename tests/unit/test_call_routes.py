@@ -374,3 +374,29 @@ def test_build_call_language_sends_nothing_for_auto():
     lang, dyn = call_routes._call_language(*_lead_and_campaign())
     assert lang is None
     assert dyn == {}
+
+
+# ── backend dispatch ─────────────────────────────────────────────────────────
+#
+# The bridge FUNCTION for a call's language, not a branch: both bridges take
+# identical arguments and populate the identical outcome dict, so everything
+# downstream of the dial (_finalise_call, Sheets write-back, slot release)
+# never learns which one ran. See app/languages.py's backend_for() for which
+# languages route where.
+
+def test_backend_bridge_picks_openai_for_telugu():
+    assert call_routes._backend_bridge("te") is call_routes.openai_bridge.bridge
+
+
+def test_backend_bridge_picks_openai_for_tinglish():
+    assert call_routes._backend_bridge("tinglish") is call_routes.openai_bridge.bridge
+
+
+@pytest.mark.parametrize("token", ["auto", "en", "hi", "hinglish"])
+def test_backend_bridge_keeps_the_production_path_on_elevenlabs(token):
+    """THE most important test in this task. auto/en/hi/hinglish must keep
+    dialling through the ElevenLabs bridge exactly as they do today — routing
+    any of them to the OpenAI backend (one-way only, see openai_bridge's
+    module docstring) would silence every existing two-way campaign and every
+    production one-way campaign in these languages."""
+    assert call_routes._backend_bridge(token) is call_routes.bridge_module.bridge

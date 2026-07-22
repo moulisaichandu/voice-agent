@@ -33,7 +33,7 @@ from app.db import campaigns as campaigns_db
 from app.db import leads as leads_db
 from app.db.models import Campaign, Lead
 from app.telephony import bridge as bridge_module
-from app.telephony import plivo_client, plivo_stream
+from app.telephony import openai_bridge, plivo_client, plivo_stream
 from app.telephony import worker as telephony_worker
 
 router = APIRouter(tags=["Telephony"])
@@ -177,6 +177,27 @@ def _call_language(lead: Lead, campaign: Campaign) -> tuple[str | None, dict]:
     return languages.for_call(lead.language_pref, campaign.language)
 
 
+def _backend_bridge(token: str):
+    """The bridge FUNCTION for *token*'s voice backend — a reference, not a
+    branch.
+
+    Both app/telephony/bridge.py's bridge() (ElevenLabs) and
+    app/telephony/openai_bridge.py's bridge() (OpenAI Realtime) take
+    identical arguments and populate the identical `outcome` dict, by
+    deliberate design (see openai_bridge's module docstring), so picking
+    between them here is the ONLY backend-aware line in the dial path.
+    Everything downstream of the call this returns — _finalise_call, the
+    Sheets write-back queue, slot release — never learns which one ran.
+
+    See app/languages.py's backend_for() for which languages route where and
+    why; this must never diverge from that table, so it delegates to it
+    rather than repeating the language list here.
+    """
+    if languages.backend_for(token) == languages.OPENAI_REALTIME:
+        return openai_bridge.bridge
+    return bridge_module.bridge
+
+
 @router.websocket("/calls/stream")
 async def stream(ws: WebSocket) -> None:
     """The call's audio, bridged to the ElevenLabs agent."""
@@ -206,6 +227,14 @@ async def stream(ws: WebSocket) -> None:
         return
 
     call_language, language_vars = _call_language(lead, campaign)
+    # The resolved TOKEN (not the ISO code above) is what picks the backend —
+    # 'te' and 'tinglish' both resolve to iso 'te', but only the token tells
+    # _backend_bridge which voice backend can carry it. Recomputed here
+    # rather than threaded out of _call_language()/for_call() because both are
+    # pure, I/O-free functions shared with worker.py's preflight call, and
+    # changing their return shape would ripple into a site that has no use
+    # for a backend at all.
+    bridge_fn = _backend_bridge(languages.resolve(lead.language_pref, campaign.language))
 
     dynamic_variables = {"lead_id": str(lead.lead_id)}
     if lead.name:
@@ -223,7 +252,7 @@ async def stream(ws: WebSocket) -> None:
     outcome: dict = {"status": "failed", "turns": 0, "transcript": [],
                      "conversation_id": None}
     try:
-        await bridge_module.bridge(
+        await bridge_fn(
             ws,
             agent_id=campaign.agent_id,
             lead_id=str(lead.lead_id),
