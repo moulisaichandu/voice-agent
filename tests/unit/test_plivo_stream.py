@@ -146,10 +146,17 @@ async def test_play_end_accumulates_as_audio_is_queued_not_as_it_plays():
     call = PlivoCall(_FakePlivoWS(), lead_id="lead-1", one_way=True)
     loop = asyncio.get_running_loop()
 
+    # Measured from BEFORE the first chunk, not from "now" after the last one.
+    # Against `loop.time()` this asserts that under 100ms elapsed while queueing,
+    # which a stalled test runner can violate on a function whose whole point is
+    # that it does not depend on elapsed time. From t0 the expected value is
+    # exact at any machine speed, and still collapses to ~0.6 if play_end ever
+    # started tracking wall-clock instead of accumulating.
+    t0 = loop.time()
     for _ in range(3):
         await call.play(_LONG)
 
-    assert call.play_end - loop.time() >= 3 * 0.6 - 0.1
+    assert call.play_end - t0 >= 3 * 0.6 - 0.01
 
 
 async def test_clear_drops_buffered_audio_and_resets_play_end():
