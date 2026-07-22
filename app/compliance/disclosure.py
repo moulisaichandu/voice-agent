@@ -67,6 +67,9 @@ _DISCLOSURE_MARKERS = (
     "virtual assistant",
     "కృత్రిమ మేధ",  # Telugu: "artificial intelligence"
     "ఆటోమేటెడ్",  # Telugu: "automated"
+    "एआई",  # Hindi: "AI" spelled out in Devanagari
+    "कृत्रिम बुद्धिमत्ता",  # Hindi: "artificial intelligence"
+    "स्वचालित",  # Hindi: "automated"
 )
 
 

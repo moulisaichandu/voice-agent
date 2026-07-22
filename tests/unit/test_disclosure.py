@@ -71,3 +71,24 @@ def test_none_script_fails():
 
 def test_blank_script_fails():
     assert has_ai_disclosure("   ") is False
+
+
+def test_a_hindi_disclosure_in_devanagari_is_accepted():
+    """Offering Hindi means accepting a Hindi disclosure. Without a Devanagari
+    marker, a correctly-disclosing Hindi script is refused at campaign
+    creation and the operator has no way to comply."""
+    assert has_ai_disclosure(
+        "नमस्ते! यह एक स्वचालित एआई वॉइस असिस्टेंट है, डिजिटल ब्रॉली की ओर से।"
+    )
+
+
+def test_a_hindi_script_without_a_disclosure_still_fails():
+    """The marker list must not become a rubber stamp: ordinary Hindi with no
+    disclosure has to keep failing."""
+    assert not has_ai_disclosure(
+        "नमस्ते! हम डिजिटल ब्रॉली से बात कर रहे हैं। हमारा नया कोर्स शुरू हो रहा है।"
+    )
+
+
+def test_hindi_artificial_intelligence_spelled_out_is_accepted():
+    assert has_ai_disclosure("यह कॉल कृत्रिम बुद्धिमत्ता द्वारा की जा रही है।")
