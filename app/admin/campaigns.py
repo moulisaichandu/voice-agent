@@ -8,6 +8,8 @@ auth dependency shared by every admin submodule.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import Literal
 from uuid import UUID
 
@@ -15,10 +17,13 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app import config as app_config
+from app import languages as languages_module
 from app.db import campaigns as campaigns_db
 from app.db.models import Campaign, CampaignLanguage
+from app.telephony.elevenlabs_client import agent_language_support
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 class CampaignCreate(BaseModel):
@@ -74,6 +79,64 @@ def _resolve_agent_id(mode: str, supplied: str | None) -> str:
     return configured
 
 
+async def _check_language_support(agent_id: str, language: str) -> None:
+    """Move ElevenLabs' language-support check from the first dial (see
+    app/telephony/preflight.py's identical gate, which stays the
+    authoritative check applied again at dial time) to campaign creation, so
+    an operator learns an agent can't speak a language before importing leads
+    and recording consent for a campaign that can never ring.
+
+    'auto' sends no override and works on any agent — it must not gain a new
+    way to fail, so it returns immediately without an API call.
+
+    Fails OPEN: if the ElevenLabs lookup itself raises (network, auth, an SDK
+    shape change), the campaign is still created and a warning is logged.
+    This check is a convenience that surfaces a problem earlier; it must
+    never be the reason an operator can't create a campaign when the agent is
+    actually fine.
+    """
+    if language == languages_module.AUTO:
+        return
+
+    iso = languages_module.iso_code(language)
+
+    # Synchronous SDK call, off the event loop — this route shares its loop
+    # with every live audio bridge, exactly like preflight.py's identical
+    # call.
+    try:
+        support = await asyncio.to_thread(agent_language_support, agent_id)
+    except Exception as exc:
+        logger.warning(
+            f"[create_campaign] could not read agent {agent_id}'s language "
+            f"support ({type(exc).__name__}: {exc}) — creating the campaign anyway"
+        )
+        return
+
+    if not support["override_allowed"]:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"This campaign is set to '{language}', but agent {agent_id} "
+                "does not allow the language override. ElevenLabs rejects an "
+                "override for a field that isn't enabled, so every call would "
+                "fail. Open the agent's Security tab in the ElevenLabs "
+                "dashboard and enable the 'language' override."
+            ),
+        )
+    if support["languages"] and iso not in support["languages"]:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"This campaign is set to '{language}', but agent {agent_id} "
+                f"is not configured for it (it has: "
+                f"{', '.join(sorted(support['languages'])) or 'none'}). Add "
+                "it under Additional Languages in the agent's settings in "
+                "the ElevenLabs dashboard, or choose a different language "
+                "for this campaign."
+            ),
+        )
+
+
 class CampaignActiveUpdate(BaseModel):
     active: bool
 
@@ -94,6 +157,7 @@ async def list_campaigns(include_inactive: bool = False) -> list[Campaign]:
 @router.post("/campaigns", response_model=Campaign, status_code=201)
 async def create_campaign(body: CampaignCreate) -> Campaign:
     agent_id = _resolve_agent_id(body.mode, body.agent_id)
+    await _check_language_support(agent_id, body.language)
     try:
         return await campaigns_db.create_campaign(
             name=body.name, mode=body.mode, agent_id=agent_id,

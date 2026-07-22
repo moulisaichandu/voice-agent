@@ -269,6 +269,7 @@ def test_create_campaign_persists_the_chosen_language(client, monkeypatch):
 
     monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
     monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID", "agent_1")
+    monkeypatch.setattr(admin_campaigns, "agent_language_support", lambda agent_id: _support())
 
     r = client.post("/admin/campaigns", json={"name": "Demo", "language": "tinglish"})
     assert r.status_code == 201
@@ -287,3 +288,100 @@ def test_an_unknown_language_is_rejected_at_the_boundary(client, monkeypatch):
 
     r = client.post("/admin/campaigns", json={"name": "Demo", "language": "klingon"})
     assert r.status_code == 422
+
+
+# ── language SUPPORT gate (creation time) ───────────────────────────────────
+#
+# ElevenLabs Agents does not support every catalogue language — Telugu isn't
+# accepted at all — so an operator picking one the agent can't speak would
+# otherwise only find out at the first dial, after leads are imported and
+# consent recorded. This moves that failure to creation time. Mirrors
+# app/telephony/preflight.py's identical, already-shipped dial-time gate,
+# which stays the authoritative check and applies the same rules again.
+
+def _support(**overrides):
+    support = {"override_allowed": True, "languages": {"en", "te", "hi"},
+               "tts_model": "eleven_v3_conversational"}
+    support.update(overrides)
+    return support
+
+
+def test_create_campaign_does_not_consult_elevenlabs_for_auto(client, monkeypatch):
+    """'auto' sends no override and works on any agent — it must not gain a
+    new way to fail, and must not cost an API call."""
+    async def fake_create(**kwargs):
+        return _campaign()
+
+    def boom(agent_id):
+        raise AssertionError("must not query language support for an auto campaign")
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
+    monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID", "agent_1")
+    monkeypatch.setattr(admin_campaigns, "agent_language_support", boom)
+
+    r = client.post("/admin/campaigns", json={"name": "Demo", "language": "auto"})
+    assert r.status_code == 201
+
+
+def test_create_campaign_succeeds_when_the_agent_supports_the_language(client, monkeypatch):
+    async def fake_create(**kwargs):
+        return _campaign(language="tinglish")
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
+    monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID", "agent_1")
+    monkeypatch.setattr(admin_campaigns, "agent_language_support", lambda agent_id: _support())
+
+    r = client.post("/admin/campaigns", json={"name": "Demo", "language": "tinglish"})
+    assert r.status_code == 201
+
+
+def test_create_campaign_rejects_a_language_the_agent_does_not_support(client, monkeypatch):
+    async def boom(**kwargs):
+        raise AssertionError("must not create a campaign for a language the agent can't speak")
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", boom)
+    monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID", "agent_1")
+    monkeypatch.setattr(
+        admin_campaigns, "agent_language_support",
+        lambda agent_id: _support(languages={"en"}),
+    )
+
+    r = client.post("/admin/campaigns", json={"name": "Demo", "language": "te"})
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert "te" in detail
+    assert "en" in detail
+
+
+def test_create_campaign_rejects_when_the_override_is_disabled(client, monkeypatch):
+    async def boom(**kwargs):
+        raise AssertionError("must not create a campaign whose override the agent rejects")
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", boom)
+    monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID", "agent_1")
+    monkeypatch.setattr(
+        admin_campaigns, "agent_language_support",
+        lambda agent_id: _support(override_allowed=False),
+    )
+
+    r = client.post("/admin/campaigns", json={"name": "Demo", "language": "hi"})
+    assert r.status_code == 422
+    assert "Security" in r.json()["detail"]
+
+
+def test_create_campaign_is_not_blocked_by_a_language_lookup_failure(client, monkeypatch):
+    """Fail open: an ElevenLabs outage or SDK change must never be the reason
+    an operator cannot create a campaign for an agent that is actually fine —
+    preflight() remains the authoritative gate at dial time."""
+    async def fake_create(**kwargs):
+        return _campaign(language="hi")
+
+    def boom(agent_id):
+        raise RuntimeError("ElevenLabs is down")
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
+    monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID", "agent_1")
+    monkeypatch.setattr(admin_campaigns, "agent_language_support", boom)
+
+    r = client.post("/admin/campaigns", json={"name": "Demo", "language": "hi"})
+    assert r.status_code == 201
