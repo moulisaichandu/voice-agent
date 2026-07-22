@@ -115,3 +115,49 @@ def test_find_column_prefers_exact_match_over_substring():
     # "contact" is a phone-hint word too, so "Contact Person" would ALSO
     # substring-match — an exact "phone" header must still win over it.
     assert sync.find_column(["phone", "Contact Person"], sync.PHONE_HINTS) == "phone"
+
+
+# ── language normalization ───────────────────────────────────────────────────
+
+async def test_sync_normalizes_language_values_to_canonical_tokens(monkeypatch, campaign):
+    """The DB now CHECKs language_pref against six tokens, so a hand-typed
+    'Telugu' must become 'te' before it is inserted — otherwise the import
+    raises on a perfectly ordinary spreadsheet."""
+    records = [
+        {"Name": "Asha", "Phone": "9876543210", "Campaign": campaign.name, "Language": "Telugu"},
+        {"Name": "Ravi", "Phone": "9876543211", "Campaign": campaign.name, "Language": "tinglish"},
+        {"Name": "Sita", "Phone": "9876543212", "Campaign": campaign.name, "Language": "Hindi"},
+    ]
+    _, upserted = await _patch(monkeypatch, records, campaign)
+
+    n = await sync.sheets_sync()
+
+    assert n == 3
+    assert [u["language_pref"] for u in upserted] == ["te", "tinglish", "hi"]
+
+
+async def test_sync_normalizes_unrecognised_language_to_auto(monkeypatch, campaign):
+    """One junk cell must not fail the row — the lead still imports and dials
+    in the campaign's language."""
+    records = [
+        {"Name": "Asha", "Phone": "9876543210", "Campaign": campaign.name, "Language": "Klingon"},
+    ]
+    _, upserted = await _patch(monkeypatch, records, campaign)
+
+    n = await sync.sheets_sync()
+
+    assert n == 1
+    assert upserted[0]["language_pref"] == "auto"
+
+
+async def test_sync_normalizes_missing_language_to_auto(monkeypatch, campaign):
+    """A file with no Language column should default to auto."""
+    records = [
+        {"Name": "Asha", "Phone": "9876543210", "Campaign": campaign.name},
+    ]
+    _, upserted = await _patch(monkeypatch, records, campaign)
+
+    n = await sync.sheets_sync()
+
+    assert n == 1
+    assert upserted[0]["language_pref"] == "auto"

@@ -22,6 +22,7 @@ import io
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from app import languages
 from app.compliance.dnd import normalize_phone_e164
 from app.sheets.sync import (
     CONSENT_AT_HINTS,
@@ -184,9 +185,10 @@ def parse_leads_file(filename: str, data: bytes) -> ParsedLeads:
             row_number=i,
             phone_e164=phone,
             name=(str(row.get(name_col) or "").strip() or None) if name_col else None,
-            language_pref=(
-                (str(row.get(language_col) or "").strip() or "auto") if language_col else "auto"
-            ),
+            # Normalized here, at the boundary, because leads.language_pref is
+            # CHECK-constrained to the six canonical tokens (migrations/0003)
+            # and this column is typed by hand into a spreadsheet.
+            language_pref=languages.normalize(row.get(language_col) if language_col else None),
             consent_basis=(
                 (str(row.get(consent_basis_col) or "").strip().lower() or None)
                 if consent_basis_col else None

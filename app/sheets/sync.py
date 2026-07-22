@@ -14,6 +14,7 @@ import asyncio
 import logging
 from datetime import datetime
 
+from app import languages
 from app.compliance.dnd import normalize_phone_e164
 from app.db import campaigns as campaigns_db
 from app.db import leads as leads_db
@@ -111,7 +112,7 @@ async def sheets_sync() -> int:
             name=str(row.get(name_col) or "").strip() if name_col else None,
             phone_e164=phone,
             campaign_id=campaign.campaign_id,
-            language_pref=str(row.get(language_col) or "auto").strip() if language_col else "auto",
+            language_pref=languages.normalize(row.get(language_col) if language_col else None),
             consent_basis=str(row.get(consent_basis_col) or "").strip() or None
             if consent_basis_col else None,
             consent_at=parse_consent_at(row.get(consent_at_col)) if consent_at_col else None,

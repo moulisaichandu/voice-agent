@@ -168,3 +168,33 @@ def test_a_file_over_the_row_cap_is_rejected_rather_than_parsed():
     rows = "\n".join(f"+9198765{i:05d}" for i in range(leads_import.MAX_ROWS + 1))
     with pytest.raises(leads_import.LeadsFileError, match="limit"):
         leads_import.parse_leads_file("leads.csv", _csv(f"Phone\n{rows}\n"))
+
+
+# ── language normalization ───────────────────────────────────────────────────
+
+def test_a_language_column_is_normalized_to_a_canonical_token():
+    """The DB now CHECKs language_pref against six tokens, so a hand-typed
+    'Telugu' must become 'te' before it is inserted — otherwise the import
+    raises on a perfectly ordinary spreadsheet."""
+    csv = (
+        "Name,Phone,Language\n"
+        "Asha,9876543210,Telugu\n"
+        "Ravi,9876543211,tinglish\n"
+        "Sita,9876543212,Hindi\n"
+    )
+    parsed = leads_import.parse_leads_file("leads.csv", csv.encode())
+    assert [lead.language_pref for lead in parsed.leads] == ["te", "tinglish", "hi"]
+
+
+def test_an_unrecognised_language_value_imports_as_auto():
+    """One junk cell must not fail the row — the lead still imports and dials
+    in the campaign's language."""
+    csv = "Name,Phone,Language\nAsha,9876543210,Klingon\n"
+    parsed = leads_import.parse_leads_file("leads.csv", csv.encode())
+    assert parsed.leads[0].language_pref == "auto"
+
+
+def test_a_file_with_no_language_column_imports_as_auto():
+    csv = "Name,Phone\nAsha,9876543210\n"
+    parsed = leads_import.parse_leads_file("leads.csv", csv.encode())
+    assert parsed.leads[0].language_pref == "auto"
