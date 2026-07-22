@@ -400,3 +400,72 @@ def test_backend_bridge_keeps_the_production_path_on_elevenlabs(token):
     module docstring) would silence every existing two-way campaign and every
     production one-way campaign in these languages."""
     assert call_routes._backend_bridge(token) is call_routes.bridge_module.bridge
+
+
+# ── the disclosure that was actually spoken ──────────────────────────────────
+
+def _turn(role, text):
+    from app.db.models import TranscriptTurn
+    return TranscriptTurn(role=role, text=text)
+
+
+def test_a_spoken_telugu_disclosure_passes(caplog):
+    outcome = {"transcript": [_turn("agent", "నమస్తే! ఇది కృత్రిమ మేధ ద్వారా చేసే కాల్.")]}
+    assert call_routes._spoken_disclosure_ok(outcome) is True
+
+
+def test_a_missing_spoken_disclosure_is_flagged():
+    """The model dropped the legally-required disclosure. The call already
+    happened — this is a detective control, and its job is to make sure the
+    operator finds out."""
+    outcome = {"transcript": [_turn("agent", "నమస్తే! మా కొత్త కోర్సు గురించి చెప్తాను.")]}
+    assert call_routes._spoken_disclosure_ok(outcome) is False
+
+
+def test_only_the_first_agent_turn_counts():
+    """Disclosing in turn three is not disclosing. The rule is first line."""
+    outcome = {"transcript": [
+        _turn("agent", "నమస్తే! మా కొత్త కోర్సు గురించి చెప్తాను."),
+        _turn("agent", "ఇది కృత్రిమ మేధ ద్వారా చేసే కాల్."),
+    ]}
+    assert call_routes._spoken_disclosure_ok(outcome) is False
+
+
+def test_a_call_with_no_agent_turns_is_not_flagged():
+    """No speech means no call worth judging — the lead heard nothing, so
+    there is no disclosure failure to report, just a failed call."""
+    assert call_routes._spoken_disclosure_ok({"transcript": []}) is True
+
+
+async def test_a_failed_disclosure_check_still_records_the_call_and_queues_writeback(
+    redis, monkeypatch, caplog
+):
+    """The whole point of a DETECTIVE control: it must never become a
+    preventive one. A missing spoken disclosure must be logged loudly, but the
+    call recording and the Sheets write-back queue must both still happen
+    exactly as if the disclosure had passed."""
+    lead = _lead()
+    recorded = {}
+
+    async def fake_record(**kwargs):
+        recorded.update(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    async def fake_mark(lead_id, status):
+        pass
+
+    monkeypatch.setattr(call_routes.calls_db, "set_conversation_and_record", fake_record)
+    monkeypatch.setattr(call_routes.leads_db, "mark_result_if_calling", fake_mark)
+
+    with caplog.at_level("ERROR"):
+        await call_routes._finalise_call(lead, {
+            "status": "done", "turns": 1, "conversation_id": "conv_4",
+            "transcript": [_turn("agent", "నమస్తే! మా కొత్త కోర్సు గురించి చెప్తాను.")],
+        })
+
+    assert recorded["el_conversation_id"] == "conv_4"
+    assert redis.lists["sheets:writeback:queue"] == [str(lead.lead_id)]
+    assert any(
+        record.levelname == "ERROR" and str(lead.lead_id) in record.message
+        for record in caplog.records
+    )

@@ -27,6 +27,7 @@ from fastapi import APIRouter, Request, WebSocket
 from fastapi.responses import Response
 
 from app import languages, redis_client
+from app.compliance.disclosure import has_ai_disclosure
 from app.config import CALL_WEBHOOK_SECRET
 from app.db import calls as calls_db
 from app.db import campaigns as campaigns_db
@@ -301,6 +302,22 @@ async def _end_plivo_leg(lead_id: str) -> None:
     await plivo_client.hangup(call_uuid)
 
 
+def _spoken_disclosure_ok(outcome: dict) -> bool:
+    """Whether the agent's FIRST spoken turn disclosed that it is an AI.
+
+    campaigns.script is validated at creation, but on the OpenAI backend the
+    operator may write English and the model renders it into Telugu — so the
+    validated text is not the spoken text. This checks what was actually said.
+
+    A call where the agent never spoke returns True: the lead heard nothing,
+    so there is no disclosure failure to report, only a failed call.
+    """
+    for turn in outcome.get("transcript") or []:
+        if turn.role == "agent":
+            return has_ai_disclosure(turn.text)
+    return True
+
+
 async def _finalise_call(lead, outcome: dict) -> None:
     """Record the transcript and queue the Sheets write-back.
 
@@ -337,6 +354,23 @@ async def _finalise_call(lead, outcome: dict) -> None:
         logger.exception(f"[calls] could not record outcome for lead "
                          f"{lead.lead_id}: {type(exc).__name__}: {exc}")
         return
+
+    try:
+        if not _spoken_disclosure_ok(outcome):
+            # Loud on purpose. This is a compliance failure on a call that has
+            # already happened to a real person — it cannot be prevented here,
+            # only surfaced, and it must never be silent.
+            logger.error(
+                f"[compliance] lead={lead.lead_id} the agent's FIRST SPOKEN LINE did "
+                "not disclose AI. India telecom rules require it. Review this "
+                "campaign's script and the agent prompt before dialling more leads."
+            )
+    except Exception as exc:
+        # This is a detective control, not a preventive one — a bug in the
+        # check itself must never stop the call from being recorded or the
+        # Sheets write-back from being queued below.
+        logger.exception(f"[calls] could not check the spoken disclosure for "
+                         f"lead {lead.lead_id}: {type(exc).__name__}: {exc}")
 
     try:
         r = redis_client.get_redis()
