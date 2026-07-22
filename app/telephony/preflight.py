@@ -18,9 +18,11 @@ fails once, loudly, instead of identically on every lead.
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import httpx
 
+from app import languages as languages_module
 from app.config import (
     CALL_WEBHOOK_SECRET,
     ELEVENLABS_API_KEY,
@@ -29,12 +31,14 @@ from app.config import (
     PLIVO_FROM_NUMBER,
     PUBLIC_BASE_URL,
 )
-from app.telephony.elevenlabs_client import agent_exists
+from app.telephony.elevenlabs_client import agent_exists, agent_language_support
 
 _HEALTH_CHECK_TIMEOUT_S = 10.0
 
+logger = logging.getLogger(__name__)
 
-async def preflight(agent_id: str) -> str | None:
+
+async def preflight(agent_id: str, language: str | None = None) -> str | None:
     """None = safe to dial; a string = the human-readable reason not to.
 
     Never raises: an exception here would abort process_one mid-reservation
@@ -104,5 +108,45 @@ async def preflight(agent_id: str) -> str | None:
     except Exception as exc:
         return (f"Could not verify the agent with ElevenLabs ({type(exc).__name__}: "
                 f"{exc}). Not dialling while the platform's state is unknown.")
+
+    # Language, last: only reached when the chain is otherwise sound, and only
+    # when a language was actually requested. An 'auto' campaign overrides
+    # nothing and so cannot fail here — it must not gain a new way to not dial.
+    if language:
+        try:
+            support = await asyncio.to_thread(agent_language_support, agent_id)
+        except Exception as exc:
+            # Deliberately NOT a refusal. This check is an extra guard over a
+            # correctly-configured agent; an SDK or API change must not become
+            # a dial-stopping outage when the call would have worked fine.
+            # Every check above still applies.
+            logger.warning(
+                f"[preflight] could not read agent {agent_id}'s language support "
+                f"({type(exc).__name__}: {exc}) — dialling anyway"
+            )
+            return None
+
+        if not support["override_allowed"]:
+            return (
+                f"This campaign dials in '{language}', but agent {agent_id} does "
+                "not allow the language override. ElevenLabs rejects an override "
+                "for a field that isn't enabled, so every call would fail. Open "
+                "the agent's Security tab and enable the 'language' override."
+            )
+        if support["languages"] and language not in support["languages"]:
+            return (
+                f"Agent {agent_id} is not configured for '{language}' "
+                f"(it has: {', '.join(sorted(support['languages'])) or 'none'}). "
+                "Add it under Additional Languages in the agent's settings."
+            )
+        model = (support["tts_model"] or "").lower()
+        if language in languages_module.V3_ONLY_ISO and model and "v3" not in model:
+            return (
+                f"Agent {agent_id} runs the '{support['tts_model']}' TTS model, "
+                f"which cannot speak '{language}' — Flash/Turbo v2.5's 32 "
+                "languages do not include Telugu. The call would produce garbled "
+                "audio and fall back to English. Switch the agent's model to "
+                "Eleven v3 Conversational."
+            )
 
     return None

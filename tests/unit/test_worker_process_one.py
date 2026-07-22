@@ -42,14 +42,15 @@ def _returns(result):
 def _lead(**overrides):
     defaults = dict(
         lead_id=uuid4(), phone_e164="+919876543210", campaign_id=uuid4(),
-        status="queued", attempts=0, dnd=False,
+        status="queued", attempts=0, dnd=False, language_pref="auto",
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
 
 
 def _campaign(**overrides):
-    defaults = dict(campaign_id=uuid4(), mode="twoway", agent_id="agent_1", active=True)
+    defaults = dict(campaign_id=uuid4(), mode="twoway", agent_id="agent_1", active=True,
+                    language="auto")
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
 
@@ -103,7 +104,7 @@ def mocks(monkeypatch):
 
     monkeypatch.setattr(worker, "_ack", fake_ack)
 
-    async def no_preflight_error(agent_id):
+    async def no_preflight_error(agent_id, language=None):
         return None
 
     monkeypatch.setattr(worker.preflight_module, "preflight", no_preflight_error)
@@ -209,7 +210,7 @@ async def test_preflight_failure_releases_reservation_without_counting_attempt(
 ):
     monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
 
-    async def failing_preflight(agent_id):
+    async def failing_preflight(agent_id, language=None):
         return "PUBLIC_BASE_URL is unreachable"
 
     monkeypatch.setattr(worker.preflight_module, "preflight", failing_preflight)
@@ -330,7 +331,7 @@ async def test_preflight_failure_releases_the_dialing_lock(mocks, monkeypatch):
     r = _FakeRedis()
     monkeypatch.setattr(worker.redis_client, "get_redis", lambda: r)
 
-    async def failing_preflight(agent_id):
+    async def failing_preflight(agent_id, language=None):
         return "PUBLIC_BASE_URL is unreachable"
 
     monkeypatch.setattr(worker.preflight_module, "preflight", failing_preflight)
@@ -415,7 +416,7 @@ async def test_unhandled_error_before_dialling_releases_the_lead(mocks, monkeypa
     r = _FakeRedis()
     monkeypatch.setattr(worker.redis_client, "get_redis", lambda: r)
 
-    async def boom(agent_id):
+    async def boom(agent_id, language=None):
         raise RuntimeError("Postgres went away")
 
     monkeypatch.setattr(worker.preflight_module, "preflight", boom)
@@ -457,7 +458,7 @@ async def test_lead_is_left_for_the_reaper_when_recovery_itself_fails(mocks, mon
     entry must stay in calls:processing for the reaper instead."""
     monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
 
-    async def boom(agent_id):
+    async def boom(agent_id, language=None):
         raise RuntimeError("Postgres went away")
 
     async def also_boom(lead_id, status):

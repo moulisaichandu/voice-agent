@@ -65,7 +65,7 @@ import logging
 from datetime import datetime, timezone
 from uuid import UUID
 
-from app import redis_client
+from app import languages, redis_client
 from app.compliance.calling_hours import within_calling_hours
 from app.config import DIALING_LOCK_TTL_S, MAX_CONCURRENT_CALLS
 from app.db import calls as calls_db
@@ -252,7 +252,10 @@ async def process_one(lead_id: str) -> None:
             return
         lock_key = f"dialing:{lead.phone_e164}"
 
-        reachability_error = await preflight_module.preflight(campaign.agent_id)
+        reachability_error = await preflight_module.preflight(
+            campaign.agent_id,
+            languages.iso_code(languages.resolve(lead.language_pref, campaign.language)),
+        )
         if reachability_error:
             logger.error(f"[worker] preflight failed, not dialing: {reachability_error}")
             # Release the dialing lock: it exists to stop the same number

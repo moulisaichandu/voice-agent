@@ -136,6 +136,54 @@ def subscription_status() -> dict:
     }
 
 
+def agent_language_support(agent_id: str) -> dict:
+    """What languages this agent can actually be asked to speak.
+
+    Returns {"override_allowed": bool, "languages": set[str],
+             "tts_model": str | None}.
+
+    Read with getattr chains rather than direct attribute access on purpose:
+    this reaches four levels into an SDK response whose shape is not part of
+    any contract we control, and a missing intermediate must degrade to "I
+    don't know" rather than raise inside preflight — see this module's
+    docstring on why the SDK's type stubs are not trusted here.
+
+    Paths verified 2026-07-22 by dumping a real two-way agent's config
+    (elevenlabs==2.58.0):
+      agent.conversation_config.agent.language              -> "en"
+      agent.conversation_config.language_presets             -> {} (dict, key
+                                                                  = iso code)
+      agent.conversation_config.tts.model_id                -> "eleven_flash_v2"
+      agent.platform_settings.overrides.conversation_config_override
+          .agent.language                                   -> False
+    """
+    agent = get_client().conversational_ai.agents.get(agent_id)
+
+    conv = getattr(agent, "conversation_config", None)
+    agent_cfg = getattr(conv, "agent", None)
+    tts_cfg = getattr(conv, "tts", None)
+
+    languages_: set[str] = set()
+    default = getattr(agent_cfg, "language", None)
+    if default:
+        languages_.add(str(default))
+    presets = getattr(conv, "language_presets", None) or {}
+    try:
+        languages_.update(str(k) for k in presets)
+    except TypeError:
+        pass
+
+    overrides = getattr(getattr(agent, "platform_settings", None), "overrides", None)
+    ov_conv = getattr(overrides, "conversation_config_override", None)
+    ov_agent = getattr(ov_conv, "agent", None)
+
+    return {
+        "override_allowed": bool(getattr(ov_agent, "language", False)),
+        "languages": languages_,
+        "tts_model": getattr(tts_cfg, "model_id", None),
+    }
+
+
 def construct_webhook_event(raw_body: str, sig_header: str, secret: str) -> dict:
     """Verifies the ElevenLabs-Signature HMAC and returns the parsed payload.
     Raises on a missing/invalid/expired signature — callers must not catch
