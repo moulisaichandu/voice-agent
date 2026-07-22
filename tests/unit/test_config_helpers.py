@@ -98,3 +98,15 @@ def test_int_warns_and_defaults_on_garbage(monkeypatch, caplog):
 def test_list_strips_and_drops_empty_entries(monkeypatch):
     monkeypatch.setenv("SOME_LIST", " a , ,b,  ")
     assert config._list("SOME_LIST") == ["a", "b"]
+
+
+# ── OpenAI Realtime config tests ──────────────────────────────────────────────
+
+def test_a_malformed_realtime_threshold_warns_and_keeps_the_default(monkeypatch, caplog):
+    """CLAUDE.md's config rule: a malformed override warns and falls back, it
+    never crashes at import. A voice agent that won't boot because someone
+    typo'd a VAD threshold is worse than one running the default."""
+    monkeypatch.setenv("OPENAI_REALTIME_VAD_THRESHOLD", "not-a-number")
+    with caplog.at_level("WARNING"):
+        assert config._float("OPENAI_REALTIME_VAD_THRESHOLD", 0.5) == 0.5
+    assert "OPENAI_REALTIME_VAD_THRESHOLD" in caplog.text

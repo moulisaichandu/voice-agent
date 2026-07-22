@@ -166,6 +166,30 @@ ELEVENLABS_TWOWAY_AGENT_ID: str | None = os.getenv("ELEVENLABS_TWOWAY_AGENT_ID")
 # Kept so switching back doesn't need a config change.
 ELEVENLABS_AGENT_PHONE_NUMBER_ID: str | None = os.getenv("ELEVENLABS_AGENT_PHONE_NUMBER_ID")
 
+# ── OpenAI Realtime (the Telugu voice backend) ──────────────────────────────
+# OPENAI_API_KEY is declared below — the RAG embedder uses the same key.
+OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2.1")
+# Every Realtime voice is English-first; there is no Telugu-native voice. The
+# sibling project chose theirs by generating the same Telugu sentence in each
+# voice at real phone quality (8 kHz mu-law) and listening. Blank uses the
+# API default.
+OPENAI_REALTIME_VOICE = os.getenv("OPENAI_REALTIME_VOICE", "")
+OPENAI_REALTIME_STT_MODEL = os.getenv("OPENAI_REALTIME_STT_MODEL", "gpt-4o-transcribe")
+# THE most load-bearing value here. On 8 kHz telephony audio, automatic
+# language detection was observed guessing Croatian and Urdu for Telugu
+# speech — the lead is then transcribed as nonsense and the model answers
+# nonsense. Pinning the language is what stops that. Blank restores
+# auto-detection, which is almost never what you want on a phone call.
+OPENAI_REALTIME_STT_LANGUAGE = os.getenv("OPENAI_REALTIME_STT_LANGUAGE", "te")
+# Energy-gated VAD, standard for telephony. The threshold is a "voice radius":
+# higher means only louder/nearer speech ends a turn, rejecting background.
+OPENAI_REALTIME_VAD_THRESHOLD = _float("OPENAI_REALTIME_VAD_THRESHOLD", 0.5)
+# How long a lead may pause before the model takes its turn. Too low and it
+# interrupts someone mid-sentence; the sibling floors this at 600ms.
+OPENAI_REALTIME_SILENCE_MS = _int("OPENAI_REALTIME_SILENCE_MS", 700)
+# Suppress background noise before it reaches the model. Blank disables.
+OPENAI_REALTIME_NOISE_REDUCTION = os.getenv("OPENAI_REALTIME_NOISE_REDUCTION", "near_field")
+
 # ── EMBEDDINGS (OpenAI text-embedding-3-small) ────────────────────────────────
 # A separate credential from ElevenLabs — text-embedding-3-small is an OpenAI
 # model. RAG ingestion/search cannot run for real without this; code + tests run
