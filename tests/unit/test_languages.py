@@ -5,9 +5,39 @@ in, and every failure mode here is silent: a mis-normalized spreadsheet cell
 doesn't raise, it just calls someone in the wrong language.
 """
 
+from pathlib import Path
+from typing import get_args
+
 import pytest
 
 from app import languages
+from app.db.models import CampaignLanguage
+
+
+def test_tokens_match_the_campaign_language_literal():
+    """The six tokens are duplicated on purpose — SQL and TypeScript can't
+    import from Python, so app/languages.py's LANGUAGES dict,
+    app/db/models.py's CampaignLanguage Literal, migrations/0003's two CHECK
+    constraints, and frontend/lib/api.ts's CampaignLanguage union all repeat
+    the same six strings by hand. Nothing enforces that they agree except this
+    test: add a language to the catalogue and forget the Literal, and a valid
+    campaign gets a silent 422 at the API boundary instead of dialling."""
+    assert set(languages.TOKENS) == set(get_args(CampaignLanguage))
+
+
+def test_tokens_all_appear_in_the_migration_check_constraints():
+    """migrations/0003_campaign_language.sql hand-writes the same six tokens
+    into two CHECK constraints (campaigns.language and leads.language_pref).
+    A token present in app/languages.py but missing from the migration would
+    pass every Python-side check and then blow up as a Postgres constraint
+    violation (a 500) the first time a campaign or lead actually used it —
+    a failure mode invisible until it reaches a real database."""
+    migration_path = (
+        Path(__file__).resolve().parents[2] / "migrations" / "0003_campaign_language.sql"
+    )
+    sql = migration_path.read_text(encoding="utf-8")
+    for token in languages.TOKENS:
+        assert token in sql, f"{token!r} is missing from {migration_path.name}"
 
 
 def test_auto_sends_no_override():

@@ -16,7 +16,16 @@ export type CampaignMode = "oneway" | "twoway";
 /** Mirrors app/languages.py's TOKENS and migrations/0003's CHECK constraint.
  * "auto" sends no override to ElevenLabs and uses whatever the agent is
  * configured with — the behaviour of every campaign created before this
- * existed. */
+ * existed.
+ *
+ * TypeScript can't import from Python, so this union is a hand-kept copy.
+ * If you add or rename a token here, also update the other three places that
+ * must change together — tests/unit/test_languages.py pins the first two
+ * against each other, but this union isn't reachable from Python:
+ *   - app/languages.py's LANGUAGES dict (the source of truth)
+ *   - app/db/models.py's CampaignLanguage Literal
+ *   - migrations/0003_campaign_language.sql's two CHECK constraints
+ */
 export type CampaignLanguage = "auto" | "en" | "te" | "tinglish" | "hi" | "hinglish";
 
 export const CAMPAIGN_LANGUAGES: { value: CampaignLanguage; label: string }[] = [
