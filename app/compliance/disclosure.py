@@ -71,7 +71,6 @@ _DISCLOSURE_MARKERS = (
     "कृत्रिम बुद्धिमत्ता",  # Hindi: "artificial intelligence"
     "स्वचालित कॉल",  # Hindi: "automated call"
     "स्वचालित आवाज़",  # Hindi: "automated voice"
-    "स्वचालित सहायक",  # Hindi: "automated assistant"
     "वॉइस असिस्टेंट",  # Hindi: "voice assistant" (transliterated)
 )
 

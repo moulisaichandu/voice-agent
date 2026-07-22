@@ -113,6 +113,19 @@ def test_hindi_bare_automated_describing_admission_process_is_not_a_disclosure()
     )
 
 
+def test_hindi_automated_assistant_describing_a_product_is_not_a_disclosure():
+    """REGRESSION. The marker "स्वचालित सहायक" (automated assistant) is a
+    generic role noun that describes any unattended helper role, not the
+    CALLER. A script advertising a product the business offers (in this case,
+    an automated assistant tool for admissions) was wrongly accepted as
+    disclosing the caller is AI. Unlike "automated call" or "automated voice",
+    there is no English counterpart in the markers — we have "voice assistant",
+    "voice bot", "virtual assistant", never bare "automated assistant"."""
+    assert not has_ai_disclosure(
+        "नमस्ते! हमारा कॉलेज अब एक स्वचालित सहायक का उपयोग करता है जो प्रवेश में मदद करता है।"
+    )
+
+
 def test_hindi_automated_call_disclosing_the_caller_passes():
     """The disambiguated marker must still accept a script that pairs the
     automation word with a noun that makes the CALLER the automated thing."""
