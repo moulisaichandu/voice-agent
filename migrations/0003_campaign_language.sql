@@ -18,14 +18,19 @@ alter table campaigns
 -- BEFORE constraining it. These rows came from hand-typed "Language" columns,
 -- so anything is possible; anything unrecognised becomes 'auto', which means
 -- "use the agent's configured language" and is the safe unknown answer.
+--
+-- This CASE mirrors app/languages.py's _ALIASES dict and MUST be kept in step
+-- with it. Any free-text variant that app/languages.py's normalize() accepts
+-- must appear in the appropriate WHEN branch here, otherwise a pre-existing lead
+-- typed in native script loses their preference during migration.
 update leads set language_pref = case
     when lower(btrim(coalesce(language_pref, ''))) in ('en', 'eng', 'english')
       then 'en'
-    when lower(btrim(coalesce(language_pref, ''))) in ('te', 'tel', 'telugu', 'telegu')
+    when lower(btrim(coalesce(language_pref, ''))) in ('te', 'tel', 'telugu', 'telegu', 'తెలుగు')
       then 'te'
     when lower(btrim(coalesce(language_pref, ''))) in ('tinglish', 'tenglish', 'telugish', 'te-en')
       then 'tinglish'
-    when lower(btrim(coalesce(language_pref, ''))) in ('hi', 'hin', 'hindi')
+    when lower(btrim(coalesce(language_pref, ''))) in ('hi', 'hin', 'hindi', 'हिंदी', 'हिन्दी')
       then 'hi'
     when lower(btrim(coalesce(language_pref, ''))) in ('hinglish', 'hi-en')
       then 'hinglish'
