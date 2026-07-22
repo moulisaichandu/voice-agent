@@ -142,12 +142,25 @@ async def _check_queue_depth(*, worker_ok: bool) -> dict:
             "detail": f"{depth} lead(s) waiting"}
 
 
+# Bound on how many DISTINCT (agent_id, language, mode) configurations are
+# actually round-tripped to preflight() per computation. preflight() costs a
+# real HTTP round-trip to our own /calls/answer plus, for a languaged
+# campaign, a synchronous ElevenLabs API call — cheap for a handful of active
+# campaigns, but a dev database that has had the integration suite run
+# against it can carry hundreds of active test-*/pipeline-* campaigns (see
+# app/admin/campaigns.py's list_campaigns docstring), and checking every one
+# individually would make this 60s-cached check visibly slow to compute.
+# Looked up live (module global, not a frozen import) so a test can lower it
+# without a process restart — same convention as _REQUIRED_FOR_DIALING above.
+_MAX_PREFLIGHT_CONFIGURATIONS = 20
+
+
 async def _compute_preflight() -> dict:
     active = await campaigns_db.list_active_campaigns()
     if not active:
         return {"key": "preflight", "status": "warning", "label": "Preflight",
                 "detail": "No active campaigns to check — create or activate one first"}
-    campaign = active[0]
+
     # No specific lead at dashboard time, only a campaign — resolve with the
     # campaign's language alone, the same call the worker makes per-lead (see
     # worker.py's own preflight call) collapsed to its campaign-only case.
@@ -157,14 +170,93 @@ async def _compute_preflight() -> dict:
     # queued -> calling -> pending with the reason visible only in a
     # container log, exactly the diagnostic cycle this dashboard exists to
     # prevent.
-    call_language = languages.iso_code(languages.resolve(None, campaign.language))
-    reason = await preflight_module.preflight(
-        campaign.agent_id, call_language, mode=campaign.mode,
+    #
+    # preflight()'s result depends ONLY on (agent_id, resolved ISO language,
+    # mode) — many active campaigns commonly share all three (see the cap's
+    # own comment above), so every campaign is grouped onto the ONE
+    # preflight() call that answers for all of them, instead of repeating an
+    # expensive round-trip once per campaign. This also fixes the original
+    # defect: checking active[0] alone let one arbitrary campaign speak for
+    # every other active campaign, whether or not they shared its
+    # configuration.
+    groups: dict[tuple[str, str | None, str | None], list] = {}
+    for c in active:
+        call_language = languages.iso_code(languages.resolve(None, c.language))
+        key = (c.agent_id, call_language, c.mode)
+        groups.setdefault(key, []).append(c)
+
+    # Check the configurations covering the MOST campaigns first, so that if
+    # the cap below is hit, the combinations affecting the fewest campaigns
+    # are the ones skipped — not an arbitrary/insertion-order subset.
+    ordered_keys = sorted(groups, key=lambda k: len(groups[k]), reverse=True)
+    checked_keys = ordered_keys[:_MAX_PREFLIGHT_CONFIGURATIONS]
+    skipped_keys = ordered_keys[_MAX_PREFLIGHT_CONFIGURATIONS:]
+    skipped_campaign_count = sum(len(groups[k]) for k in skipped_keys)
+
+    passing: list = []
+    failing: list[tuple[object, str]] = []
+    for key in checked_keys:
+        agent_id, call_language, mode = key
+        reason = await preflight_module.preflight(agent_id, call_language, mode=mode)
+        campaigns_in_group = groups[key]
+        if reason:
+            failing.extend((c, reason) for c in campaigns_in_group)
+        else:
+            passing.extend(campaigns_in_group)
+
+    checked_total = len(passing) + len(failing)
+    truncation_note = ""
+    if skipped_campaign_count:
+        truncation_note = (
+            f" ({skipped_campaign_count} other active campaign(s) across "
+            f"{len(skipped_keys)} more configuration(s) were NOT checked this "
+            f"run — capped at {_MAX_PREFLIGHT_CONFIGURATIONS} distinct "
+            "configurations per refresh. Deactivate unused campaigns, or wait "
+            "for a later refresh, to confirm the rest.)"
+        )
+
+    if not failing:
+        if skipped_campaign_count:
+            return {"key": "preflight", "status": "warning", "label": "Preflight",
+                    "detail": f"All {checked_total} checked active campaign(s) "
+                              f"passing.{truncation_note}"}
+        return {"key": "preflight", "status": "good", "label": "Preflight",
+                "detail": f"All {checked_total} active campaign(s) passing preflight."}
+
+    # Group failures by their exact reason text: several campaigns sharing a
+    # configuration always share a reason (they were checked together above),
+    # but distinct configurations can still fail identically — e.g. every
+    # campaign refused by the same dead tunnel. Naming that reason once,
+    # against every campaign it affects, is what tells "infrastructure is
+    # down" apart from "campaign X in particular is misconfigured".
+    by_reason: dict[str, list[str]] = {}
+    for c, reason in failing:
+        by_reason.setdefault(reason, []).append(c.name)
+    blocked_desc = "; ".join(
+        f"{', '.join(repr(n) for n in names)} — {reason}" for reason, names in by_reason.items()
     )
-    if reason:
-        return {"key": "preflight", "status": "critical", "label": "Preflight", "detail": reason}
-    return {"key": "preflight", "status": "good", "label": "Preflight",
-            "detail": f"Passing (checked against {campaign.name!r})"}
+
+    if not passing:
+        # NONE pass. A single shared reason across every active campaign is
+        # almost certainly infrastructure (dead tunnel, missing key) rather
+        # than N separate misconfigurations — say so once, not N times.
+        if len(by_reason) == 1:
+            reason = next(iter(by_reason))
+            detail = (f"All {checked_total} active campaign(s) are blocked by the SAME "
+                      f"reason — this looks like an infrastructure problem, not a "
+                      f"per-campaign one: {reason}{truncation_note}")
+        else:
+            detail = f"All {checked_total} active campaign(s) are blocked. {blocked_desc}" \
+                      f"{truncation_note}"
+        return {"key": "preflight", "status": "critical", "label": "Preflight", "detail": detail}
+
+    # SOME pass, some fail — the operator's actual reported case. Naming the
+    # blocked campaigns and reasons, AND how many can still dial, is what
+    # makes "my dialer is broken" and "one campaign needs attention"
+    # distinguishable at a glance instead of both reading as "critical".
+    detail = (f"{len(passing)} of {checked_total} active campaign(s) can dial right now. "
+              f"Blocked: {blocked_desc}{truncation_note}")
+    return {"key": "preflight", "status": "warning", "label": "Preflight", "detail": detail}
 
 
 _GOOD_SUBSCRIPTION_STATUSES = {"active", "trialing"}

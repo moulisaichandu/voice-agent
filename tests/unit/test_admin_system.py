@@ -213,6 +213,149 @@ def test_readiness_preflight_passes_the_campaign_language(client, monkeypatch):
     assert received["mode"] == "twoway"
 
 
+def test_preflight_all_active_campaigns_passing_is_good(client, monkeypatch):
+    _mock_all_healthy(monkeypatch)
+
+    async def three_campaigns():
+        return [
+            _campaign(name="Alpha", agent_id="agent_1", mode="twoway"),
+            _campaign(name="Beta", agent_id="agent_2", mode="oneway"),
+            _campaign(name="Gamma", agent_id="agent_3", mode="oneway"),
+        ]
+
+    monkeypatch.setattr(admin_system.campaigns_db, "list_active_campaigns", three_campaigns)
+
+    async def always_passes(agent_id, language=None, mode=None):
+        return None
+
+    monkeypatch.setattr(admin_system.preflight_module, "preflight", always_passes)
+
+    r = client.get("/admin/readiness")
+    preflight_check = next(c for c in r.json()["checks"] if c["key"] == "preflight")
+    assert preflight_check["status"] == "good"
+    assert "3" in preflight_check["detail"]
+
+
+def test_preflight_mixed_pass_fail_is_a_warning_naming_the_blocked_campaign(client, monkeypatch):
+    """The operator's actual reported case: one misconfigured campaign among
+    several healthy ones must read as 'one campaign needs attention', not as
+    a system-wide failure."""
+    _mock_all_healthy(monkeypatch)
+
+    async def three_campaigns():
+        return [
+            _campaign(name="Healthy One", agent_id="agent_1", mode="oneway"),
+            _campaign(name="Healthy Two", agent_id="agent_2", mode="oneway"),
+            _campaign(name="Broken Telugu", agent_id="agent_3", mode="twoway", language="te"),
+        ]
+
+    monkeypatch.setattr(admin_system.campaigns_db, "list_active_campaigns", three_campaigns)
+
+    async def fails_only_broken(agent_id, language=None, mode=None):
+        if agent_id == "agent_3":
+            return ("This campaign is 'twoway' in 'te', but that language's voice "
+                    "backend (OpenAI Realtime) only supports one-way calls today")
+        return None
+
+    monkeypatch.setattr(admin_system.preflight_module, "preflight", fails_only_broken)
+
+    r = client.get("/admin/readiness")
+    body = r.json()
+    preflight_check = next(c for c in body["checks"] if c["key"] == "preflight")
+    assert preflight_check["status"] == "warning"
+    assert "Broken Telugu" in preflight_check["detail"]
+    assert "2" in preflight_check["detail"]  # 2 of 3 can still dial
+    # can_dial semantics for this exact scenario are pinned separately below,
+    # by test_can_dial_true_when_one_campaign_is_blocked_among_several
+    # (Fix 2) — this test is about the preflight check's own status/detail.
+
+
+def test_preflight_all_active_campaigns_failing_same_reason_states_it_once(client, monkeypatch):
+    _mock_all_healthy(monkeypatch)
+
+    async def three_campaigns():
+        return [
+            _campaign(name="One", agent_id="agent_1"),
+            _campaign(name="Two", agent_id="agent_2"),
+            _campaign(name="Three", agent_id="agent_3"),
+        ]
+
+    monkeypatch.setattr(admin_system.campaigns_db, "list_active_campaigns", three_campaigns)
+
+    async def all_fail_same_way(agent_id, language=None, mode=None):
+        return "PUBLIC_BASE_URL is unreachable (ConnectError). Is the tunnel running?"
+
+    monkeypatch.setattr(admin_system.preflight_module, "preflight", all_fail_same_way)
+
+    r = client.get("/admin/readiness")
+    preflight_check = next(c for c in r.json()["checks"] if c["key"] == "preflight")
+    assert preflight_check["status"] == "critical"
+    # Stated once, not once per campaign — three campaigns failing the same
+    # way must not produce three repeats of an infrastructure-level message.
+    assert preflight_check["detail"].count("tunnel running") == 1
+    assert r.json()["can_dial"] is False
+
+
+def test_preflight_dedups_shared_configuration_into_one_call(client, monkeypatch):
+    """Many campaigns commonly share the same agent/language/mode — the dev
+    DB scenario CLAUDE.md and app/admin/campaigns.py's list_campaigns
+    docstring both call out (hundreds of throwaway test-*/pipeline-*
+    campaigns). preflight() is a real ElevenLabs + HTTP round-trip; it must
+    run once per distinct (agent_id, language, mode), not once per campaign."""
+    _mock_all_healthy(monkeypatch)
+
+    async def five_campaigns_same_shape():
+        return [_campaign(name=f"Clone {i}", agent_id="agent_1", mode="oneway")
+                for i in range(5)]
+
+    monkeypatch.setattr(admin_system.campaigns_db, "list_active_campaigns",
+                        five_campaigns_same_shape)
+
+    calls = {"n": 0}
+
+    async def counted(agent_id, language=None, mode=None):
+        calls["n"] += 1
+        return None
+
+    monkeypatch.setattr(admin_system.preflight_module, "preflight", counted)
+
+    r = client.get("/admin/readiness")
+    assert calls["n"] == 1
+    preflight_check = next(c for c in r.json()["checks"] if c["key"] == "preflight")
+    assert preflight_check["status"] == "good"
+    assert "5" in preflight_check["detail"]
+
+
+def test_preflight_truncates_beyond_the_configuration_cap_and_says_so(client, monkeypatch):
+    """Bounds the work: a database full of active campaigns with genuinely
+    distinct configurations must not make this endpoint hang making dozens of
+    real preflight() round-trips. A truncation must be visible in the
+    detail — a silent cap would read as 'everything checked out fine'."""
+    _mock_all_healthy(monkeypatch)
+    monkeypatch.setattr(admin_system, "_MAX_PREFLIGHT_CONFIGURATIONS", 2)
+
+    async def four_distinct_campaigns():
+        return [_campaign(name=f"C{i}", agent_id=f"agent_{i}", mode="oneway")
+                for i in range(4)]
+
+    monkeypatch.setattr(admin_system.campaigns_db, "list_active_campaigns",
+                        four_distinct_campaigns)
+
+    calls = {"n": 0}
+
+    async def counted(agent_id, language=None, mode=None):
+        calls["n"] += 1
+        return None
+
+    monkeypatch.setattr(admin_system.preflight_module, "preflight", counted)
+
+    r = client.get("/admin/readiness")
+    assert calls["n"] == 2  # capped at _MAX_PREFLIGHT_CONFIGURATIONS
+    preflight_check = next(c for c in r.json()["checks"] if c["key"] == "preflight")
+    assert "not checked" in preflight_check["detail"].lower()
+    assert "2" in preflight_check["detail"]  # the 2 skipped campaigns
+
+
 def test_readiness_database_down_is_critical(client, monkeypatch):
     _mock_all_healthy(monkeypatch)
 
