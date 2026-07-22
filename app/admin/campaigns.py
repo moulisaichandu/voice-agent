@@ -79,6 +79,42 @@ def _resolve_agent_id(mode: str, supplied: str | None) -> str:
     return configured
 
 
+def _check_twoway_capable(mode: str, language: str) -> None:
+    """Refuse a two-way campaign whose language routes to a backend that
+    cannot hold a conversation.
+
+    app/telephony/openai_bridge.py (the te/tinglish backend — see
+    app/languages.py's backend_for()) is ONE-WAY ONLY; Milestone B gates
+    two-way support on a live one-way call first. Routing a two-way campaign
+    there today would deliver one message and hang up on a lead who was told
+    they could ask questions — the exact "campaigns.mode silently produces
+    calls leads couldn't respond to" failure CLAUDE.md documents from the
+    sibling project, which is why mode is admin-set and never inferred.
+
+    Checked at CREATION, where the operator can still choose 'oneway' or a
+    different language — not at dial time, when the only options left are
+    "let it ring wrong" or "silently downgrade the mode the operator
+    explicitly chose" (also not acceptable — CLAUDE.md again).
+
+    Pure logic, no I/O: nothing to fail open on, unlike
+    _check_language_support below.
+    """
+    if mode != "twoway":
+        return
+    if languages_module.backend_for(language) != languages_module.ELEVENLABS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Two-way calling is not yet available for "
+                f"{languages_module.display(language)} — its voice backend "
+                "only supports one-way calls today (turn detection and "
+                "in-call conversation are a later milestone). Create this "
+                "campaign with mode='oneway' instead, or choose a different "
+                "language for a two-way campaign."
+            ),
+        )
+
+
 async def _check_language_support(agent_id: str, language: str) -> None:
     """Move ElevenLabs' language-support check from the first dial (see
     app/telephony/preflight.py's identical gate, which stays the
@@ -89,6 +125,16 @@ async def _check_language_support(agent_id: str, language: str) -> None:
     'auto' sends no override and works on any agent — it must not gain a new
     way to fail, so it returns immediately without an API call.
 
+    Only meaningful for ElevenLabs-backed languages. For anything else (today:
+    te/tinglish) the ElevenLabs agent is never dialled to carry this call at
+    all — app/telephony/call_routes._backend_bridge() sends it to
+    openai_bridge instead — so asking THIS agent whether it speaks Telugu
+    answers a question that has nothing to do with whether the campaign will
+    work, and answers it wrong: no ElevenLabs agent speaks Telugu (see
+    app/languages.py's ELEVENLABS_AGENT_LANGUAGES), so this would reject every
+    such campaign outright, including the one-way ones the OpenAI backend
+    exists to carry.
+
     Fails OPEN: if the ElevenLabs lookup itself raises (network, auth, an SDK
     shape change), the campaign is still created and a warning is logged.
     This check is a convenience that surfaces a problem earlier; it must
@@ -96,6 +142,8 @@ async def _check_language_support(agent_id: str, language: str) -> None:
     actually fine.
     """
     if language == languages_module.AUTO:
+        return
+    if languages_module.backend_for(language) != languages_module.ELEVENLABS:
         return
 
     iso = languages_module.iso_code(language)
@@ -170,6 +218,7 @@ async def list_campaigns(include_inactive: bool = False) -> list[Campaign]:
 
 @router.post("/campaigns", response_model=Campaign, status_code=201)
 async def create_campaign(body: CampaignCreate) -> Campaign:
+    _check_twoway_capable(body.mode, body.language)
     agent_id = _resolve_agent_id(body.mode, body.agent_id)
     await _check_language_support(agent_id, body.language)
     try:

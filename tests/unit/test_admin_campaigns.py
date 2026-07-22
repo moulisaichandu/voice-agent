@@ -261,17 +261,23 @@ def test_create_campaign_defaults_to_auto_language(client, monkeypatch):
 
 
 def test_create_campaign_persists_the_chosen_language(client, monkeypatch):
+    """Tinglish routes to a one-way-only backend (see the two-way guard tests
+    below), so this exercises mode='oneway' explicitly rather than the
+    (two-way) default."""
     created = {}
 
     async def fake_create(**kwargs):
         created.update(kwargs)
-        return _campaign(language="tinglish")
+        return _campaign(mode="oneway", language="tinglish")
 
     monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
-    monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID", "agent_1")
+    monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_ONEWAY_AGENT_ID", "agent_1")
     monkeypatch.setattr(admin_campaigns, "agent_language_support", lambda agent_id: _support())
 
-    r = client.post("/admin/campaigns", json={"name": "Demo", "language": "tinglish"})
+    r = client.post("/admin/campaigns", json={
+        "name": "Demo", "mode": "oneway", "language": "tinglish",
+        "script": "This is an automated AI call from Digital Brolly.",
+    })
     assert r.status_code == 201
     assert created["language"] == "tinglish"
     assert r.json()["language"] == "tinglish"
@@ -324,14 +330,17 @@ def test_create_campaign_does_not_consult_elevenlabs_for_auto(client, monkeypatc
 
 
 def test_create_campaign_succeeds_when_the_agent_supports_the_language(client, monkeypatch):
+    """'hi' (not 'tinglish'/'te'): this exercises the ElevenLabs
+    language-support-success path, which only applies to ElevenLabs-backed
+    languages — te/tinglish skip it entirely (see the tests above)."""
     async def fake_create(**kwargs):
-        return _campaign(language="tinglish")
+        return _campaign(language="hi")
 
     monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
     monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID", "agent_1")
     monkeypatch.setattr(admin_campaigns, "agent_language_support", lambda agent_id: _support())
 
-    r = client.post("/admin/campaigns", json={"name": "Demo", "language": "tinglish"})
+    r = client.post("/admin/campaigns", json={"name": "Demo", "language": "hi"})
     assert r.status_code == 201
 
 
@@ -390,27 +399,124 @@ def test_create_campaign_is_not_blocked_by_a_language_lookup_failure(client, mon
     assert r.status_code == 201
 
 
-def test_create_campaign_says_telugu_is_unsupported_rather_than_naming_a_setting(
+def test_check_language_support_skips_elevenlabs_entirely_for_a_non_elevenlabs_backend(
     client, monkeypatch
 ):
-    """REGRESSION. ElevenLabs Agents does not offer Telugu at all — its API
-    rejects 'te' outright. Telling the operator to "add it under Additional
-    Languages" sent them hunting for a dashboard option that cannot exist."""
+    """REGRESSION / supersedes the old "Telugu is unsupported" test. Before
+    app/telephony/openai_bridge.py existed, ElevenLabs was the only backend,
+    so ANY Telugu campaign was correctly rejected here — the API rejects 'te'
+    outright. Now that te/tinglish route to the OpenAI Realtime backend (see
+    app/languages.py's backend_for()), asking the ElevenLabs agent whether it
+    speaks Telugu is asking the wrong question: that agent is never dialled
+    for this call at all. Consulting it anyway would block the very campaigns
+    this backend exists to carry."""
+    async def fake_create(**kwargs):
+        return _campaign(mode="oneway", language="te")
+
+    # A COUNTER, not a raising stub: _check_language_support fails OPEN on an
+    # exception from agent_language_support, which would swallow a raising
+    # stub too and make this pass for the wrong reason (an API failure that
+    # merely happened to occur) rather than for the right one (never called).
+    calls = []
+
+    def spy(agent_id):
+        calls.append(agent_id)
+        return _support()
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
+    monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_ONEWAY_AGENT_ID", "agent_1")
+    monkeypatch.setattr(admin_campaigns, "agent_language_support", spy)
+
+    r = client.post("/admin/campaigns", json={
+        "name": "Telugu Oneway", "mode": "oneway", "language": "te",
+        "script": "This is an automated AI call from Digital Brolly.",
+    })
+    assert r.status_code == 201
+    assert calls == [], "must not consult ElevenLabs for a language it never dials with"
+
+
+# ── two-way requires a backend that can hold a conversation ─────────────────
+#
+# openai_bridge (the Telugu/Tinglish backend) is ONE-WAY ONLY — Milestone B
+# gates two-way support on a live one-way call first. Routing a two-way
+# campaign there would deliver one message and hang up on a lead who was told
+# they could ask questions: the exact "campaigns.mode silently produces calls
+# leads couldn't respond to" failure CLAUDE.md documents from the sibling
+# project. Refused HERE, at creation, where the operator can act on it.
+
+def test_create_campaign_rejects_twoway_telugu_with_a_next_step(client, monkeypatch):
     async def boom(**kwargs):
-        raise AssertionError("must not create a campaign in an unsupportable language")
+        raise AssertionError(
+            "must not create a two-way campaign on a one-way-only backend"
+        )
 
     monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", boom)
     monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID", "agent_1")
-    monkeypatch.setattr(
-        admin_campaigns, "agent_language_support",
-        lambda agent_id: {"override_allowed": True, "languages": {"en", "hi"},
-                          "tts_model": "eleven_flash_v2"},
-    )
 
-    r = client.post("/admin/campaigns", json={"name": "Demo", "language": "te"})
+    r = client.post("/admin/campaigns", json={
+        "name": "Telugu Twoway", "mode": "twoway", "language": "te",
+    })
     assert r.status_code == 422
     detail = r.json()["detail"]
-    assert "does not support" in detail
-    assert "Additional Languages" not in detail, (
-        "must not name a dashboard setting that cannot exist"
+    assert "two-way" in detail.lower() and "not" in detail.lower()
+    assert "one-way" in detail.lower(), (
+        "the operator needs a next step, not a dead end"
     )
+
+
+def test_create_campaign_rejects_twoway_tinglish_too(client, monkeypatch):
+    """Tinglish shares Telugu's backend — same one-way-only limitation."""
+    async def boom(**kwargs):
+        raise AssertionError("tinglish shares te's backend and its limitation")
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", boom)
+    monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID", "agent_1")
+
+    r = client.post("/admin/campaigns", json={
+        "name": "Tinglish Twoway", "mode": "twoway", "language": "tinglish",
+    })
+    assert r.status_code == 422
+
+
+def test_create_campaign_allows_oneway_telugu(client, monkeypatch):
+    """The operator's next step from the rejection above must actually work."""
+    async def fake_create(**kwargs):
+        return _campaign(mode="oneway", language="te")
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
+    monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_ONEWAY_AGENT_ID", "agent_1")
+
+    r = client.post("/admin/campaigns", json={
+        "name": "Telugu Oneway", "mode": "oneway", "language": "te",
+        "script": "This is an automated AI call from Digital Brolly.",
+    })
+    assert r.status_code == 201
+
+
+def test_create_campaign_still_allows_twoway_hindi(client, monkeypatch):
+    """The production path must not move: Hindi is ElevenLabs-backed and
+    two-way-capable there, so the new guard must not touch it."""
+    async def fake_create(**kwargs):
+        return _campaign(mode="twoway", language="hi")
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
+    monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID", "agent_1")
+    monkeypatch.setattr(
+        admin_campaigns, "agent_language_support", lambda agent_id: _support()
+    )
+
+    r = client.post("/admin/campaigns", json={
+        "name": "Hindi Twoway", "mode": "twoway", "language": "hi",
+    })
+    assert r.status_code == 201
+
+
+def test_create_campaign_still_allows_twoway_auto(client, monkeypatch):
+    async def fake_create(**kwargs):
+        return _campaign(mode="twoway", language="auto")
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
+    monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID", "agent_1")
+
+    r = client.post("/admin/campaigns", json={"name": "Auto Twoway", "mode": "twoway"})
+    assert r.status_code == 201
