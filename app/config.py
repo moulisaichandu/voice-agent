@@ -189,6 +189,15 @@ OPENAI_REALTIME_VAD_THRESHOLD = _float("OPENAI_REALTIME_VAD_THRESHOLD", 0.5)
 OPENAI_REALTIME_SILENCE_MS = _int("OPENAI_REALTIME_SILENCE_MS", 700)
 # Suppress background noise before it reaches the model. Blank disables.
 OPENAI_REALTIME_NOISE_REDUCTION = os.getenv("OPENAI_REALTIME_NOISE_REDUCTION", "near_field")
+# Two-way (conversational) Telugu/Tinglish is fully built — turn detection,
+# barge-in truncation, RAG — but the plan that shipped it gates real use on a
+# human confirming it on a LIVE call first (Milestone B's own verification
+# task), the same discipline the AI-disclosure and mode rules already apply
+# to anything a lead could be harmed by getting wrong. False refuses two-way
+# for that backend at campaign creation and at dial time; flip to true only
+# once a live two-way Telugu call has been placed and judged. One-way is
+# never affected by this flag.
+OPENAI_TWOWAY_ENABLED = _bool("OPENAI_TWOWAY_ENABLED", False)
 
 # ── EMBEDDINGS (OpenAI text-embedding-3-small) ────────────────────────────────
 # A separate credential from ElevenLabs — text-embedding-3-small is an OpenAI

@@ -437,21 +437,23 @@ def test_check_language_support_skips_elevenlabs_entirely_for_a_non_elevenlabs_b
 
 # ── two-way requires a backend that can hold a conversation ─────────────────
 #
-# openai_bridge (the Telugu/Tinglish backend) is ONE-WAY ONLY — Milestone B
-# gates two-way support on a live one-way call first. Routing a two-way
-# campaign there would deliver one message and hang up on a lead who was told
-# they could ask questions: the exact "campaigns.mode silently produces calls
-# leads couldn't respond to" failure CLAUDE.md documents from the sibling
-# project. Refused HERE, at creation, where the operator can act on it.
+# openai_bridge (the Telugu/Tinglish backend) fully implements two-way
+# conversation, but OPENAI_TWOWAY_ENABLED gates real use on a human having
+# confirmed it on a live call first — the same discipline CLAUDE.md already
+# applies to AI disclosure and to mode never being inferred. With the flag
+# off (the default), routing a two-way campaign there is refused HERE, at
+# creation, where the operator can act on it; with it on, the campaign is
+# created like any other.
 
 def test_create_campaign_rejects_twoway_telugu_with_a_next_step(client, monkeypatch):
     async def boom(**kwargs):
         raise AssertionError(
-            "must not create a two-way campaign on a one-way-only backend"
+            "must not create a two-way campaign before the backend is enabled"
         )
 
     monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", boom)
     monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID", "agent_1")
+    monkeypatch.setattr(admin_campaigns.app_config, "OPENAI_TWOWAY_ENABLED", False)
 
     r = client.post("/admin/campaigns", json={
         "name": "Telugu Twoway", "mode": "twoway", "language": "te",
@@ -462,6 +464,28 @@ def test_create_campaign_rejects_twoway_telugu_with_a_next_step(client, monkeypa
     assert "one-way" in detail.lower(), (
         "the operator needs a next step, not a dead end"
     )
+
+
+def test_create_campaign_allows_twoway_telugu_once_the_flag_is_enabled(client, monkeypatch):
+    """The flip side: OPENAI_TWOWAY_ENABLED=true is the operator's own
+    confirmation that a live call has been judged and the guard should stand
+    aside — proves the flag genuinely gates the check rather than the check
+    being unconditional with the flag as dead code."""
+    created = {}
+
+    async def fake_create(**kwargs):
+        created.update(kwargs)
+        return _campaign(mode="twoway", language="te")
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
+    monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID", "agent_1")
+    monkeypatch.setattr(admin_campaigns.app_config, "OPENAI_TWOWAY_ENABLED", True)
+
+    r = client.post("/admin/campaigns", json={
+        "name": "Telugu Twoway", "mode": "twoway", "language": "te",
+    })
+    assert r.status_code == 201
+    assert created["mode"] == "twoway" and created["language"] == "te"
 
 
 def test_create_campaign_rejects_twoway_tinglish_too(client, monkeypatch):

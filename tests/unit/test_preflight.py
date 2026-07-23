@@ -338,21 +338,26 @@ async def test_hindi_still_runs_the_elevenlabs_checks(monkeypatch):
     assert "Security" in reason
 
 
-# ── refuse a two-way call the backend cannot hold, AT DIAL TIME ──────────────
+# ── refuse a two-way call on a backend not yet PROVEN on a live call ─────────
 #
-# openai_bridge.py is ONE-WAY ONLY; two-way is Milestone B. Task 4's
-# creation-time guard (app/admin/campaigns.py's _check_twoway_capable) cannot
-# catch a campaign that already existed when this feature shipped. Undialled
-# today, such a campaign would connect to OpenAI, never speak (no
-# turn-detection cue), never listen, sit in dead silence for the full
-# CALL_MAX_DURATION_S of billed Plivo airtime, and then be recorded as a
-# SUCCESSFUL zero-turn call because max_duration counts as a clean exit —
-# worse than the silent-mismatch bug CLAUDE.md warns about by name, because at
-# least a monologue is audible.
+# openai_bridge.py fully implements two-way conversation, but
+# OPENAI_TWOWAY_ENABLED gates real use on a human having confirmed it on a
+# live call — CLAUDE.md's discipline for anything this consequential to get
+# wrong. Task 4's creation-time guard (app/admin/campaigns.py's
+# _check_twoway_capable) cannot catch a campaign that already existed before
+# the flag was flipped either way, so this dial-time copy is still
+# load-bearing. With the flag off, such a campaign would connect to OpenAI,
+# get an unverified conversational experience, and if that experience were
+# actually broken (as the sibling project's own unresolved barge-in bug shows
+# can happen silently), sit in dead silence for the full CALL_MAX_DURATION_S
+# and be recorded as a SUCCESSFUL zero-turn call because max_duration counts
+# as a clean exit — worse than the silent-mismatch bug CLAUDE.md warns about
+# by name, because at least a monologue is audible.
 
-async def test_a_twoway_openai_backed_campaign_is_refused(monkeypatch):
+async def test_a_twoway_openai_backed_campaign_is_refused_while_the_flag_is_off(monkeypatch):
     _configured(monkeypatch)
     monkeypatch.setattr(pf, "OPENAI_API_KEY", "sk-test")
+    monkeypatch.setattr(pf, "OPENAI_TWOWAY_ENABLED", False)
     reason = await pf.preflight("agent_1", "te", mode="twoway")
     assert reason is not None
     assert "twoway" in reason
@@ -360,10 +365,24 @@ async def test_a_twoway_openai_backed_campaign_is_refused(monkeypatch):
     assert "one-way" in reason.lower()
 
 
-async def test_a_oneway_openai_backed_campaign_is_not_refused(monkeypatch):
+async def test_a_twoway_openai_backed_campaign_dials_once_the_flag_is_on(monkeypatch):
+    """The flip side: the flag genuinely gates the check, not just documents
+    an intention — proves the guard actually reads OPENAI_TWOWAY_ENABLED
+    rather than always refusing regardless of it."""
     _configured(monkeypatch)
     monkeypatch.setattr(pf, "OPENAI_API_KEY", "sk-test")
-    assert await pf.preflight("agent_1", "te", mode="oneway") is None
+    monkeypatch.setattr(pf, "OPENAI_TWOWAY_ENABLED", True)
+    assert await pf.preflight("agent_1", "te", mode="twoway") is None
+
+
+async def test_a_oneway_openai_backed_campaign_is_never_refused_by_this_guard(monkeypatch):
+    """One-way is unaffected by the flag in either direction — it was always
+    the proven, available path."""
+    _configured(monkeypatch)
+    monkeypatch.setattr(pf, "OPENAI_API_KEY", "sk-test")
+    for flag in (False, True):
+        monkeypatch.setattr(pf, "OPENAI_TWOWAY_ENABLED", flag)
+        assert await pf.preflight("agent_1", "te", mode="oneway") is None
 
 
 async def test_a_twoway_elevenlabs_backed_campaign_is_not_refused(monkeypatch):

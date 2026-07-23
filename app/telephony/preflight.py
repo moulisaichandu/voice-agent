@@ -27,6 +27,7 @@ from app.config import (
     CALL_WEBHOOK_SECRET,
     ELEVENLABS_API_KEY,
     OPENAI_API_KEY,
+    OPENAI_TWOWAY_ENABLED,
     PLIVO_AUTH_ID,
     PLIVO_AUTH_TOKEN,
     PLIVO_FROM_NUMBER,
@@ -51,35 +52,34 @@ async def preflight(
     before this parameter existed) keeps working unchanged — None never
     equals 'twoway', so the guard below simply never fires for them.
     """
-    # Refuse a two-way call the backend cannot hold — unconditional, checked
-    # first, and before anything else can fail open. This is pure local logic
-    # with no I/O, unlike every check below it, so there is no outage to fail
-    # open on.
+    # Refuse a two-way call on a backend that hasn't been PROVEN on a live
+    # call yet — unconditional, checked first, and before anything else can
+    # fail open. This is pure local logic with no I/O, unlike every check
+    # below it, so there is no outage to fail open on.
     #
-    # app/telephony/openai_bridge.py is ONE-WAY ONLY (see its module
-    # docstring) — two-way conversation is Milestone B. app/admin/campaigns.py's
-    # _check_twoway_capable() already refuses this combination at CREATION
-    # time, but that cannot catch a campaign that already existed when this
-    # feature shipped. Undialled today, such a campaign would connect to
-    # OpenAI, never speak (no turn-detection cue, no response.create), never
-    # listen, and sit in dead silence for the full CALL_MAX_DURATION_S of
-    # billed Plivo airtime — then be recorded as a SUCCESSFUL zero-turn call,
-    # because max_duration counts as a clean exit. Worse than the
-    # mode-produces-calls-leads-couldn't-respond-to failure CLAUDE.md warns
-    # about by name, because at least a monologue is audible.
+    # app/telephony/openai_bridge.py fully implements two-way conversation
+    # (turn detection, RAG, barge-in truncation). OPENAI_TWOWAY_ENABLED
+    # (app/config.py) is the operator's confirmation that a human has placed
+    # a real call on it and judged it correct — the same discipline CLAUDE.md
+    # already applies to AI disclosure and to campaigns.mode never being
+    # inferred: a lead-facing behaviour this consequential doesn't go live on
+    # code review alone. app/admin/campaigns.py's _check_twoway_capable()
+    # already refuses this combination at CREATION time, but that cannot
+    # catch a campaign that already existed before the flag was flipped
+    # either way, so this dial-time copy is still load-bearing.
     #
     # 'auto' (language=None) always resolves to ELEVENLABS (see
     # languages.backend_for_iso), so a two-way 'auto' campaign — every
     # campaign created before this feature existed — can never trip this.
     twoway_backend = languages_module.backend_for_iso(language)
-    if mode == "twoway" and twoway_backend != languages_module.ELEVENLABS:
+    if (mode == "twoway" and twoway_backend != languages_module.ELEVENLABS
+            and not OPENAI_TWOWAY_ENABLED):
         return (
-            f"This campaign is 'twoway' in '{language}', but that language's "
-            "voice backend (OpenAI Realtime) only supports one-way calls "
-            "today — it cannot listen or hold a conversation, so the call "
-            "would sit in dead silence for the full call duration and still "
-            "be recorded as a success. One-way calling IS available for "
-            f"'{language}' today; two-way is not yet. Change this campaign's "
+            f"This campaign is 'twoway' in '{language}'. That backend "
+            "(OpenAI Realtime) supports two-way calling, but OPENAI_TWOWAY_ENABLED "
+            "is not set — a live call needs to confirm it works before real "
+            "campaigns use it. One-way calling IS available for "
+            f"'{language}' today. Change this campaign's "
             "mode to 'oneway', or choose a different language for a two-way "
             "campaign."
         )
