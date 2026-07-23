@@ -1,7 +1,7 @@
 """telephony/openai_prompts.py — Telugu call personas for the Realtime backend.
 
 Adapted from the sibling ../ai-voice-agent's backend/prompts.py, which earned
-these rules on real 8 kHz phone calls to real Telugu-speaking leads. Two of
+these rules on real 8 kHz phone calls to real Telugu-speaking leads. Three of
 them exist because of specific observed failures and must not be softened:
 
   1. The script is CONTENT, not words to recite. The sibling's reminder prompt
@@ -12,6 +12,13 @@ them exist because of specific observed failures and must not be softened:
   2. Telugu and English only, never Hindi. Without it the model drifted into
      Hindi mid-call, which a Telugu-speaking lead in Hyderabad experiences as
      being called by a stranger who does not know them.
+
+  3. STAY ON TOPIC (two-way only). Found on this project's own first live
+     two-way call: asked who Virat Kohli was, the model just answered.
+     ANSWERING COURSE QUESTIONS constrains COURSE FACTS to the search tool,
+     but said nothing about topics that aren't about the course at all, so
+     nothing stopped the model reaching for its own training. See
+     _STAY_ON_TOPIC_RULE.
 
 The disclosure rule is not a preference either: India's TCCCPR requires the
 caller to say it is automated, CLAUDE.md makes it the first line of every
@@ -39,6 +46,23 @@ _DISCLOSURE_RULE = (
     "that this is an automated AI call from Digital Brolly. This is a legal "
     "requirement in India and is not optional. Say it before anything else — "
     "before greeting them, before your name, before the reason for the call."
+)
+
+# Discovered on a live call: asked who Virat Kohli was, the model just
+# answered — nothing in the prompt scoped the conversation to the course at
+# all. ANSWERING COURSE QUESTIONS (below) only constrains COURSE facts to the
+# search tool; it says nothing about topics that aren't about the course in
+# the first place, so the model fell back to its own training with no rule
+# stopping it. This is the rule that closes that gap: it comes before the
+# course-facts rule because "what may this call be about" is the broader gate
+# and "how do you answer, once it's a course question" is the narrower one.
+_STAY_ON_TOPIC_RULE = (
+    "STAY ON TOPIC: This call exists to discuss Digital Brolly's courses, "
+    "nothing else. If the lead asks about anything unrelated — sports, "
+    "celebrities, news, politics, or any general-knowledge question — do NOT "
+    "answer it, even if you know the answer. Say briefly that you're only "
+    "able to help with questions about the course, then steer the "
+    "conversation back to why you called."
 )
 
 
@@ -117,6 +141,7 @@ def two_way_instructions(lead_name: str | None, script: str | None,
         "they interrupt you, stop and listen.",
         _DISCLOSURE_RULE,
         _language_rule(language_style),
+        _STAY_ON_TOPIC_RULE,
         "ANSWERING COURSE QUESTIONS: For any fact about courses, fees, dates, "
         "timings, certificates or eligibility, rely ONLY on the material the "
         "search tool returns. Never invent or guess a price, date or detail. "

@@ -489,12 +489,16 @@ def test_create_campaign_allows_twoway_telugu_once_the_flag_is_enabled(client, m
 
 
 def test_create_campaign_rejects_twoway_tinglish_too(client, monkeypatch):
-    """Tinglish shares Telugu's backend — same one-way-only limitation."""
+    """Tinglish shares Telugu's backend — same flag-gated limitation. Pins
+    OPENAI_TWOWAY_ENABLED explicitly rather than relying on its default,
+    since a real deployment's .env (loaded via load_dotenv()) can set it
+    either way independent of what this test means to check."""
     async def boom(**kwargs):
         raise AssertionError("tinglish shares te's backend and its limitation")
 
     monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", boom)
     monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID", "agent_1")
+    monkeypatch.setattr(admin_campaigns.app_config, "OPENAI_TWOWAY_ENABLED", False)
 
     r = client.post("/admin/campaigns", json={
         "name": "Tinglish Twoway", "mode": "twoway", "language": "tinglish",

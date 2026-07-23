@@ -527,6 +527,18 @@ def test_two_way_prompt_confines_course_facts_to_the_search_tool():
     assert "never invent" in instructions or "do not have that information" in instructions
 
 
+def test_two_way_prompt_refuses_off_topic_questions():
+    """REGRESSION — found on this project's own first live two-way call:
+    asked who Virat Kohli was, the model just answered. Confining COURSE
+    FACTS to the search tool (the test above) says nothing about a question
+    that isn't about the course at all, so nothing stopped the model
+    reaching into its own training. This pins the rule that closes that gap."""
+    instructions = openai_prompts.two_way_instructions(None, None).lower()
+    assert "stay on topic" in instructions
+    assert "sports" in instructions or "celebrities" in instructions
+    assert "do not" in instructions and "even if you know the answer" in instructions
+
+
 def test_two_way_prompt_survives_a_campaign_with_no_script_or_name():
     instructions = openai_prompts.two_way_instructions(None, "   ")
     assert "GOAL OF THIS CALL" not in instructions
