@@ -290,11 +290,15 @@ async def test_the_first_exit_reason_wins():
 
 
 @pytest.mark.parametrize("reason", ["plivo_stop", "plivo_disconnect",
-                                    "max_duration", "oneway_complete"])
+                                    "max_duration", "oneway_complete",
+                                    "elevenlabs_closed:1000", "openai_end_call"])
 async def test_a_clean_exit_reason_means_the_call_ran_its_course(reason):
     """oneway_complete belongs in this set: without it every successful
     one-way call would be stored 'failed', mark its lead 'failed', and burn a
-    retry attempt."""
+    retry attempt. elevenlabs_closed:1000 is the same story for a two-way call
+    the agent ends itself via its End Call tool — 1000 is a normal WebSocket
+    closure, not a failure. openai_end_call is the OpenAI backend's own
+    version of that same story, via its own end_call tool."""
     call = PlivoCall(_FakePlivoWS(), lead_id="lead-1")
     call.note_exit(reason)
     assert call.ran_its_course is True

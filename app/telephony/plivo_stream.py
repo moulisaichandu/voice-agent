@@ -59,7 +59,18 @@ _ONEWAY_POLL_S = 0.25
 # to grade its calls the same way. oneway_complete belongs in this set: it IS
 # the natural end of a one-way call, and without it every successful one-way
 # call would be stored 'failed', mark its lead 'failed', and burn a retry.
-_CLEAN_EXITS = ("plivo_stop", "plivo_disconnect", "max_duration", "oneway_complete")
+# elevenlabs_closed:1000 is the same story for a two-way call the AGENT ends
+# (its End Call tool, e.g. after a caller says goodbye): code 1000 is a normal
+# WebSocket closure, not a failure, and without it that lead would be marked
+# 'failed' and re-dialled after a conversation that completed cleanly. Other
+# close codes stay out of this set on purpose — 1002 is the billing-stop path
+# bridge.py's docstring calls out, and must still grade as failed.
+# openai_end_call is the OpenAI-backend equivalent: that platform has no
+# built-in "End Call" tool, so openai_bridge.py gives the model its own
+# end_call function and grades the resulting exit the same way — a
+# conversation the model chose to end cleanly, not a dropped call.
+_CLEAN_EXITS = ("plivo_stop", "plivo_disconnect", "max_duration", "oneway_complete",
+                "elevenlabs_closed:1000", "openai_end_call")
 
 
 def answer_xml(lead_id: str) -> str:

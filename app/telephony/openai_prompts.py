@@ -161,6 +161,10 @@ def two_way_instructions(lead_name: str | None, script: str | None,
         "If the search tool returns nothing relevant, say honestly that you do "
         "not have that information and offer to have someone follow up — do not "
         "make something up to fill the silence.",
+        "ENDING THE CALL: once the conversation has reached a natural close — "
+        "goodbyes exchanged, or the lead confirms they have no more questions — "
+        "call the end_call tool to hang up. Do not just stop talking or repeat "
+        "yourself waiting for them to hang up first.",
     ]
     if script and script.strip():
         parts.append(

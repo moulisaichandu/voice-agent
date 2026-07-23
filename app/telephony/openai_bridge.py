@@ -101,6 +101,23 @@ _SEARCH_TOOL: dict = {
     },
 }
 
+# The only way a two-way call ends itself. Without this the model has no tool
+# to hang up with, so once the conversation is naturally over it just keeps
+# the line open — the lead sits there until they hang up themselves or the
+# call runs all the way to CALL_MAX_DURATION_S. One-way needs nothing here:
+# oneway_watchdog already ends those calls.
+_END_CALL_TOOL_NAME = "end_call"
+_END_CALL_TOOL: dict = {
+    "type": "function",
+    "name": _END_CALL_TOOL_NAME,
+    "description": (
+        "Hang up the call. Call this once the conversation has reached a "
+        "natural close — goodbyes exchanged, or the lead has no more "
+        "questions and confirms they're done."
+    ),
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
 # Event types whose `item_id` names the ASSISTANT item currently being
 # spoken — the only ones allowed to update `last_item_id` (see the comment
 # at its use in `from_openai()` for why this must be a whitelist, not a
@@ -182,7 +199,7 @@ def _session_update(*, lead_name: str | None, script: str | None,
     if not one_way:
         # One-way gets no tools at all — there is nobody to answer, and a
         # tool the model can never get a reply from is worse than none.
-        session["tools"] = [_SEARCH_TOOL]
+        session["tools"] = [_SEARCH_TOOL, _END_CALL_TOOL]
         session["tool_choice"] = "auto"
 
     return {"type": "session.update", "session": session}
@@ -243,13 +260,19 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
                 language_style=variables.get("language_style"),
                 one_way=one_way,
             )))
-            # One-way: ask for the message immediately. Nothing else will —
-            # with turn detection off the model waits for an explicit cue.
-            # (The sibling sends this on Plivo's `start` event instead; here
-            # the audio is queued on the same socket Plivo just opened, which
-            # is what the ElevenLabs path already relies on.)
-            if one_way:
-                await oa.send(json.dumps({"type": "response.create"}))
+            # The AI placed this call, so it has to speak first — and the
+            # AI-disclosure compliance rule requires that first line to be the
+            # disclosure. One-way needs this because turn detection is off
+            # there and nothing else would ever cue a response; two-way needs
+            # it exactly as much, because server_vad only responds to the
+            # LEAD speaking — with no explicit cue, the model just waits for
+            # the lead to talk first, which is backwards for an outbound call
+            # and left leads sitting in silence. (The sibling ../ai-voice-agent
+            # fires this on Plivo's `start` event instead; here the audio is
+            # queued on the same socket Plivo just opened, which this
+            # project's ElevenLabs path already relies on, so firing it right
+            # after session.update works the same way for both call shapes.)
+            await oa.send(json.dumps({"type": "response.create"}))
 
             # ── Plivo → OpenAI ───────────────────────────────────────────────
             # Never called on a one-way call: PlivoCall.read_events drops the
@@ -334,7 +357,20 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
                             for item in resp.get("output") or []:
                                 if item.get("type") != "function_call":
                                     continue
-                                if item.get("name") != _SEARCH_TOOL_NAME:
+                                name = item.get("name")
+                                if name == _END_CALL_TOOL_NAME:
+                                    # PlivoCall.run() already waits for this
+                                    # response's queued audio (the goodbye
+                                    # line, sent as audio deltas earlier in
+                                    # this same response) to finish playing
+                                    # before hanging up — the same draining
+                                    # oneway_complete relies on. No
+                                    # function_call_output needed; the call
+                                    # is ending, not continuing.
+                                    call.note_exit("openai_end_call")
+                                    call.stop.set()
+                                    continue
+                                if name != _SEARCH_TOOL_NAME:
                                     continue
                                 try:
                                     args = json.loads(item.get("arguments") or "{}")

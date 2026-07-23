@@ -477,10 +477,12 @@ async def test_barge_in_truncate_names_the_current_item(bridged):
     assert isinstance(truncate["audio_end_ms"], int)
 
 
-async def test_a_two_way_call_does_not_cue_a_response_immediately(bridged):
-    """One-way sends response.create to make the model speak; two-way must not —
-    turn detection drives the model, and a manual cue would race it. The first
-    frame is the session.update, and nothing after it is a response.create."""
+async def test_a_two_way_call_also_cues_the_model_to_speak_first(bridged):
+    """REGRESSION: this used to rely on server_vad alone, so the model never
+    spoke until the LEAD did — backwards for an outbound call, where the AI
+    placed the call and the AI-disclosure rule requires the AI's first line to
+    be the disclosure. A lead who (reasonably) also waits for the other side
+    to speak first got dead air instead of a greeting."""
     oa = _FakeOpenAIWS([_audio_delta()])
     bridged(oa)
     await asyncio.wait_for(
@@ -488,8 +490,7 @@ async def test_a_two_way_call_does_not_cue_a_response_immediately(bridged):
                              language="te", one_way=False),
         timeout=5,
     )
-    types = [json.loads(s).get("type") for s in oa.sent]
-    assert "response.create" not in types
+    assert json.loads(oa.sent[1]) == {"type": "response.create"}
 
 
 # ── the two-way prompt's compliance rules ────────────────────────────────────
@@ -565,6 +566,14 @@ def test_two_way_prompt_survives_a_campaign_with_no_script_or_name():
     assert "You are speaking with" not in instructions
 
 
+def test_two_way_prompt_tells_the_model_to_end_the_call():
+    """Without this the model has a tool but no instruction to use it, and
+    just keeps the line open after the conversation is naturally over."""
+    instructions = openai_prompts.two_way_instructions(None, None).lower()
+    assert "end_call" in instructions
+    assert "natural close" in instructions
+
+
 # ── the search tool: course questions answered from RAG, not memory ─────────
 # CLAUDE.md's hard rule: search_relevant() is the ONLY function the live tool
 # may call. search_permissive() ignores the relevance floor and must never be
@@ -583,6 +592,53 @@ async def test_a_two_way_session_attaches_the_search_tool(bridged):
     )
     names = [t["name"] for t in _session(oa)["session"].get("tools", [])]
     assert _SEARCH_TOOL_NAME in names
+
+
+# ── end_call: the only way a two-way call hangs up on its own ───────────────
+# Unlike the ElevenLabs agent platform, OpenAI Realtime has no built-in
+# "End Call" tool — without one of our own, a two-way call just sits open
+# after the conversation is over, until the lead hangs up or it runs all the
+# way to CALL_MAX_DURATION_S (300s of dead air billed to the lead).
+
+_END_CALL_TOOL_NAME = "end_call"
+
+
+async def test_a_two_way_session_attaches_the_end_call_tool(bridged):
+    oa = _FakeOpenAIWS([_audio_delta()])
+    bridged(oa)
+    await asyncio.wait_for(
+        openai_bridge.bridge(_FakePlivoWS(), agent_id="x", lead_id="l",
+                             language="te", one_way=False),
+        timeout=5,
+    )
+    names = [t["name"] for t in _session(oa)["session"].get("tools", [])]
+    assert _END_CALL_TOOL_NAME in names
+
+
+async def test_calling_end_call_ends_the_call_as_done_not_failed(bridged, monkeypatch):
+    """The whole point of the tool: a conversation the model chose to end
+    cleanly must be graded 'done', not fall through to max_duration or be
+    misread as a failure."""
+    monkeypatch.setattr(openai_bridge.plivo_stream, "CALL_MAX_DURATION_S", 60)
+    oa = _FakeOpenAIWS([json.dumps({
+        "type": "response.done",
+        "response": {"output": [{
+            "type": "function_call", "name": _END_CALL_TOOL_NAME,
+            "call_id": "call_1", "arguments": "{}",
+        }]},
+    })])
+    bridged(oa)
+
+    # 60s of CALL_MAX_DURATION_S is far longer than this timeout — if
+    # end_call didn't actually end the call, this would time out instead of
+    # returning promptly.
+    outcome = await asyncio.wait_for(
+        openai_bridge.bridge(_FakePlivoWS(), agent_id="x", lead_id="l",
+                             language="te", one_way=False),
+        timeout=5,
+    )
+
+    assert outcome["status"] == "done"
 
 
 async def test_a_tool_call_is_answered_from_search_relevant(bridged, monkeypatch):
