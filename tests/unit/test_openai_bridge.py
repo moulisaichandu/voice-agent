@@ -535,8 +535,28 @@ def test_two_way_prompt_refuses_off_topic_questions():
     reaching into its own training. This pins the rule that closes that gap."""
     instructions = openai_prompts.two_way_instructions(None, None).lower()
     assert "stay on topic" in instructions
-    assert "sports" in instructions or "celebrities" in instructions
-    assert "do not" in instructions and "even if you know the answer" in instructions
+    assert "do not answer" in instructions
+    assert "certain of the answer" in instructions
+
+
+def test_two_way_prompt_bans_outside_knowledge_with_no_named_exceptions():
+    """The owner's own words after seeing the first fix: 'it shouldn't
+    answer any outside knowledge at all' — not just the categories
+    (sports/celebrities/news/politics) the first version of this rule named.
+    A category list invites a model to read it as bounding the rule (fine if
+    not on the list) or as an implicit 'unless it's simple/harmless'
+    exception. This pins that the rule is now an unqualified blanket ban —
+    no category list, no severity escape hatch — and would fail if either
+    crept back in."""
+    instructions = openai_prompts.two_way_instructions(None, None)
+    lowered = instructions.lower()
+    assert "no exceptions" in lowered
+    assert "for any reason" in lowered
+    assert "no matter" in lowered and "simple" in lowered
+    # The old wording is gone, not just superseded — its presence would mean
+    # both versions of the rule are in the prompt at once, muddying it.
+    assert "sports" not in lowered
+    assert "celebrities" not in lowered
 
 
 def test_two_way_prompt_survives_a_campaign_with_no_script_or_name():

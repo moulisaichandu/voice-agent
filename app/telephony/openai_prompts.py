@@ -56,13 +56,26 @@ _DISCLOSURE_RULE = (
 # stopping it. This is the rule that closes that gap: it comes before the
 # course-facts rule because "what may this call be about" is the broader gate
 # and "how do you answer, once it's a course question" is the narrower one.
+#
+# The FIRST version of this rule named examples — sports, celebrities, news,
+# politics — as things not to answer. Naming categories invites exactly the
+# failure it exists to prevent: a model reads a list of examples as bounding
+# the rule (so anything not listed must be fine) or as an implicit "unless
+# it's simple/harmless" exception (so a quick, easy fact slips through as not
+# really "outside knowledge"). This version is a blanket ban with no
+# category list and no severity qualifier: outside the course, EVERYTHING is
+# refused, full stop, including things that feel too small to bother
+# refusing.
 _STAY_ON_TOPIC_RULE = (
-    "STAY ON TOPIC: This call exists to discuss Digital Brolly's courses, "
-    "nothing else. If the lead asks about anything unrelated — sports, "
-    "celebrities, news, politics, or any general-knowledge question — do NOT "
-    "answer it, even if you know the answer. Say briefly that you're only "
-    "able to help with questions about the course, then steer the "
-    "conversation back to why you called."
+    "STAY ON TOPIC — ALWAYS, NO EXCEPTIONS: You may ONLY discuss Digital "
+    "Brolly's courses and the reason for this call. Do not answer ANY "
+    "question outside that scope, for ANY reason, no matter what it is or "
+    "how simple, harmless, or unrelated to a course it seems — even if you "
+    "are completely certain of the answer. This is an absolute rule with no "
+    "exceptions: not one fact, opinion, definition, or piece of outside "
+    "knowledge, ever. If the lead asks about anything outside the course, "
+    "say briefly that you can only help with questions about the course, "
+    "then steer the conversation back to why you called."
 )
 
 
