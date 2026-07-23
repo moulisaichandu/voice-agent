@@ -211,6 +211,71 @@ async def test_interrupt_clears_once_the_grace_window_has_passed():
     assert call.play_end == 0.0
 
 
+# ── played_ms: how much of the current response the lead actually heard ───────
+# Feeds the barge-in truncate. Getting it wrong misinforms the model about what
+# the lead heard, which is the whole bug this path exists to avoid.
+
+
+async def test_played_ms_is_zero_before_anything_has_played():
+    call = PlivoCall(_FakePlivoWS(), lead_id="lead-1", one_way=False)
+    assert call.played_ms() == 0
+
+
+async def test_played_ms_counts_only_what_has_actually_played_not_what_is_queued():
+    """The agent queues a whole response in an instant, but the lead has only
+    heard the part that has played out in real time. Truncating at the queued
+    length would tell the model the lead heard words still sitting in the
+    buffer."""
+    call = PlivoCall(_FakePlivoWS(), lead_id="lead-1", one_way=False)
+    await call.play(_LONG)   # 0.6s queued the moment it is handed over
+
+    # Almost no wall-clock time has passed, so almost none of it has played.
+    assert call.played_ms() < 100
+
+
+async def test_played_ms_reports_audio_heard_before_a_barge_in_and_survives_clear():
+    """The value the truncate needs, and the case the design turns on: it is
+    read AFTER clear() has wiped play_end to 0.0. Reading play_end then would
+    give 0 and tell the model the lead heard none of its reply; the snapshot
+    taken at the interruption is what keeps it honest."""
+    call = PlivoCall(_FakePlivoWS(), lead_id="lead-1", one_way=False)
+    await call.play(_LONG)   # 0.6s queued, segment starts "now"
+    # Pretend 0.3s of it has already played by backdating the segment start.
+    call.play_start -= 0.3
+
+    heard_live = call.played_ms()      # live, before the barge-in
+    await call.clear()                 # barge-in drops the queue, play_end -> 0
+    heard_after = call.played_ms()     # must still report what was heard
+
+    assert 250 <= heard_live <= 400
+    assert 250 <= heard_after <= 400
+    assert call.play_end == 0.0
+
+
+async def test_played_ms_is_zero_right_after_a_clear_with_nothing_played():
+    """A barge-in during the very first instant of a response: essentially
+    nothing reached the lead, so the truncate must say ~0 — not the queued
+    length, and not stale state from an earlier turn."""
+    call = PlivoCall(_FakePlivoWS(), lead_id="lead-1", one_way=False)
+    await call.play(_LONG)   # queued, but interrupted immediately
+
+    await call.clear()
+
+    assert call.played_ms() < 100
+
+
+async def test_played_ms_resets_for_a_fresh_response_after_a_clear():
+    """After a barge-in the next response is a NEW segment: its played time is
+    measured from its own start, not carried over from the interrupted one."""
+    call = PlivoCall(_FakePlivoWS(), lead_id="lead-1", one_way=False)
+    await call.play(_LONG)
+    call.play_start -= 0.3
+    await call.clear()       # snapshot ~300ms for the interrupted turn
+
+    await call.play(_LONG)   # a brand-new response begins playing now
+    assert call.played_ms() < 100, "the new response's clock must start at zero"
+
+
 # ── exit bookkeeping ─────────────────────────────────────────────────────────
 
 async def test_the_first_exit_reason_wins():

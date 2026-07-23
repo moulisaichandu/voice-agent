@@ -105,7 +105,21 @@ class PlivoCall:
         # Loop-time at which audio already sent to Plivo finishes playing. The
         # agent can emit audio faster than real time, so a graceful hangup must
         # wait on this rather than a fixed sleep, or the last words are cut off.
+        # 0.0 is the sentinel for "nothing queued" — set at init and reset by
+        # clear(); a call that has played audio always holds a positive
+        # loop-time here.
         self.play_end: float = 0.0
+        # Loop-time at which the CURRENT contiguous stretch of playback began.
+        # The agent streams a whole response's audio back-to-back faster than
+        # real time, so those chunks share one segment; a gap (the lead's turn)
+        # starts a new one. played_ms() measures from here to answer "how much
+        # of this response has the lead actually heard" for barge-in truncation.
+        self.play_start: float = 0.0
+        # How many ms of the current response had reached the lead at the last
+        # barge-in. clear() snapshots it BEFORE wiping play_end, because the
+        # truncate that follows needs the amount heard, and play_end is gone by
+        # then. See played_ms().
+        self._interrupted_ms: int = 0
         # The lead's first sound on an outbound call is almost always "Hello?" —
         # an acknowledgement, not an interruption. Cancelling the greeting on it
         # made the agent restart from the top. Barge-in is live after this.
@@ -144,15 +158,43 @@ class PlivoCall:
             "media": {"contentType": "audio/x-mulaw", "sampleRate": 8000,
                       "payload": payload_b64},
         }))
+        now = self._loop.time()
+        if self.play_end <= now:
+            # The queue had drained (or was cleared): this chunk begins a fresh
+            # contiguous segment, so playback of it starts now, not after some
+            # already-finished earlier audio.
+            self.play_start = now
         dur = (len(payload_b64) * 3 / 4) / _ULAW_BYTES_PER_S
-        self.play_end = max(self.play_end, self._loop.time()) + dur
+        self.play_end = max(self.play_end, now) + dur
         self.audio_seen = True
+
+    def played_ms(self) -> int:
+        """How many milliseconds of the CURRENT response actually reached the
+        lead — the value a barge-in truncate needs so the model's belief about
+        what it said matches what the lead heard.
+
+        While audio is queued (`play_end` still a live loop-time), this is the
+        real elapsed playback of the current segment, capped at the audio
+        actually queued. After clear() has wiped `play_end` to 0.0 — which is
+        exactly when the barge-in handler asks — the live figure is gone, so we
+        return the value clear() snapshotted at the instant of the interruption.
+        """
+        if self.play_end > 0.0:
+            audible_until = min(self._loop.time(), self.play_end)
+            played = audible_until - self.play_start
+            return int(played * 1000) if played > 0 else 0
+        return self._interrupted_ms
 
     async def clear(self) -> None:
         """Drop audio already buffered on the call, so barge-in is immediate
         rather than waiting for the agent's queued speech to drain.
 
         Nothing queued is left to play, so play_end resets with it."""
+        # Snapshot how much of the current response actually reached the lead
+        # BEFORE dropping the queue: the barge-in path calls played_ms() right
+        # after this, and resetting play_end below would otherwise make it read
+        # 0 — telling the model the lead heard none of its reply.
+        self._interrupted_ms = self.played_ms()
         msg: dict = {"event": "clearAudio"}
         if self.stream_id:
             msg["streamId"] = self.stream_id

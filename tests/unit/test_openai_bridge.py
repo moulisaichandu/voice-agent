@@ -81,6 +81,12 @@ def bridged(monkeypatch):
     monkeypatch.setattr(openai_bridge, "OPENAI_API_KEY", "sk-test")
     monkeypatch.setattr(openai_bridge.plivo_stream, "ONEWAY_SILENCE_TAIL_S", 0)
     monkeypatch.setattr(openai_bridge.plivo_stream, "ONEWAY_MAX_SILENT_S", 0)
+    # A two-way call has no watchdog to end it, and the fake OpenAI socket goes
+    # quiet rather than closing (matching a real one, which stays open until the
+    # lead hangs up), so nothing sets `stop` on its own. Bound the call short so
+    # the two-way tests fall through to max_duration instead of the 300s default.
+    # One-way tests still end via the watchdog well before this.
+    monkeypatch.setattr(openai_bridge.plivo_stream, "CALL_MAX_DURATION_S", 1)
 
     def _install(oa_ws):
         async def fake_connect(*a, **kw):
@@ -364,3 +370,150 @@ async def test_the_language_style_reaches_the_session_instructions(bridged):
 
     instructions = _session(oa)["session"]["instructions"]
     assert "ZZZ-MARKER-STYLE-ZZZ" in instructions
+
+
+# ── two-way: the conversation path ───────────────────────────────────────────
+# Two-way adds turn detection, a pinned STT language, lead transcripts, and
+# barge-in truncation — the last is a regression guard for a bug the sibling
+# has and must not be inherited.
+
+
+async def test_a_two_way_session_enables_turn_detection(bridged):
+    oa = _FakeOpenAIWS([_audio_delta()])
+    bridged(oa)
+    await asyncio.wait_for(
+        openai_bridge.bridge(_FakePlivoWS(), agent_id="x", lead_id="l",
+                             language="te", one_way=False),
+        timeout=5,
+    )
+    td = _session(oa)["session"]["audio"]["input"]["turn_detection"]
+    assert td["type"] == "server_vad"
+
+
+async def test_a_two_way_session_pins_the_transcription_language(bridged):
+    """On 8kHz phone audio, auto-detection was observed hearing Telugu as
+    Croatian or Urdu. The lead is then transcribed as nonsense and the model
+    answers nonsense. Pinning the language is the fix."""
+    oa = _FakeOpenAIWS([_audio_delta()])
+    bridged(oa)
+    await asyncio.wait_for(
+        openai_bridge.bridge(_FakePlivoWS(), agent_id="x", lead_id="l",
+                             language="te", one_way=False),
+        timeout=5,
+    )
+    tx = _session(oa)["session"]["audio"]["input"]["transcription"]
+    assert tx["language"] == "te"
+
+
+async def test_the_leads_words_are_recorded_as_lead_turns(bridged):
+    oa = _FakeOpenAIWS([
+        json.dumps({"type": "conversation.item.input_audio_transcription.completed",
+                    "transcript": "ఫీజు ఎంత?"}),
+        _agent_transcript("Fees are..."), _response_done(),
+    ])
+    bridged(oa)
+    outcome = await asyncio.wait_for(
+        openai_bridge.bridge(_FakePlivoWS(), agent_id="x", lead_id="l",
+                             language="te", one_way=False),
+        timeout=5,
+    )
+    roles = [(t.role, t.text) for t in outcome["transcript"]]
+    assert ("lead", "ఫీజు ఎంత?") in roles
+
+
+async def test_barge_in_truncates_the_models_belief_about_what_it_said(bridged):
+    """REGRESSION for a bug the source material has and we must not inherit.
+    Without conversation.item.truncate the model believes it said everything
+    it generated, while the lead only heard what had played — every later
+    turn then builds on something the lead never heard."""
+    oa = _FakeOpenAIWS([
+        _audio_delta(),
+        json.dumps({"type": "input_audio_buffer.speech_started"}),
+    ])
+    bridged(oa)
+    await asyncio.wait_for(
+        openai_bridge.bridge(_FakePlivoWS(), agent_id="x", lead_id="l",
+                             language="te", one_way=False),
+        timeout=5,
+    )
+    sent = [json.loads(s).get("type") for s in oa.sent]
+    assert "conversation.item.truncate" in sent
+    assert "response.cancel" in sent
+
+
+async def test_barge_in_truncate_names_the_current_item(bridged):
+    """The truncate has to identify WHICH item to trim, or the model trims the
+    wrong turn (or none). The id comes from the audio deltas of the response
+    being spoken."""
+    oa = _FakeOpenAIWS([
+        json.dumps({"type": "response.output_audio.delta",
+                    "delta": _AUDIO_B64, "item_id": "item-77"}),
+        json.dumps({"type": "input_audio_buffer.speech_started"}),
+    ])
+    bridged(oa)
+    await asyncio.wait_for(
+        openai_bridge.bridge(_FakePlivoWS(), agent_id="x", lead_id="l",
+                             language="te", one_way=False),
+        timeout=5,
+    )
+    truncate = next(json.loads(s) for s in oa.sent
+                    if json.loads(s).get("type") == "conversation.item.truncate")
+    assert truncate["item_id"] == "item-77"
+    assert truncate["content_index"] == 0
+    assert isinstance(truncate["audio_end_ms"], int)
+
+
+async def test_a_two_way_call_does_not_cue_a_response_immediately(bridged):
+    """One-way sends response.create to make the model speak; two-way must not —
+    turn detection drives the model, and a manual cue would race it. The first
+    frame is the session.update, and nothing after it is a response.create."""
+    oa = _FakeOpenAIWS([_audio_delta()])
+    bridged(oa)
+    await asyncio.wait_for(
+        openai_bridge.bridge(_FakePlivoWS(), agent_id="x", lead_id="l",
+                             language="te", one_way=False),
+        timeout=5,
+    )
+    types = [json.loads(s).get("type") for s in oa.sent]
+    assert "response.create" not in types
+
+
+# ── the two-way prompt's compliance rules ────────────────────────────────────
+
+
+def test_two_way_prompt_demands_the_ai_disclosure_first():
+    """The disclosure is legally required and is the FIRST spoken line on the
+    two-way path exactly as on one-way — nothing softens it."""
+    instructions = openai_prompts.two_way_instructions("Asha", "Ask about their goals.")
+    lowered = instructions.lower()
+    assert "first sentence" in lowered and "ai" in lowered
+    assert "not optional" in lowered
+
+
+def test_two_way_prompt_forbids_hindi_in_every_register():
+    for style in (None, languages.style("te"), languages.style("tinglish")):
+        assert "Never use Hindi" in openai_prompts.two_way_instructions(
+            None, None, language_style=style
+        )
+
+
+def test_two_way_prompt_treats_the_script_as_meaning_not_words_to_recite():
+    instructions = openai_prompts.two_way_instructions(
+        None, "Our new course starts Monday."
+    )
+    lowered = instructions.lower()
+    assert "our new course starts monday." in lowered
+    assert "never read english text aloud" in lowered
+
+
+def test_two_way_prompt_confines_course_facts_to_the_search_tool():
+    """No inventing prices or dates — course facts come only from the tool."""
+    instructions = openai_prompts.two_way_instructions(None, None).lower()
+    assert "search tool" in instructions
+    assert "never invent" in instructions or "do not have that information" in instructions
+
+
+def test_two_way_prompt_survives_a_campaign_with_no_script_or_name():
+    instructions = openai_prompts.two_way_instructions(None, "   ")
+    assert "GOAL OF THIS CALL" not in instructions
+    assert "You are speaking with" not in instructions

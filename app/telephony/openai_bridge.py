@@ -15,10 +15,13 @@ that stops a message-only call billing 300 seconds of silence) lives in
 app/telephony/plivo_stream.py and is shared with the ElevenLabs bridge. This
 module owns only OpenAI's wire protocol.
 
-ONE-WAY ONLY for now. Two-way — turn detection, input transcription, tools,
-lead transcripts, barge-in — is Milestone B and is gated on a live one-way
-call first; see bridge()'s warning for what happens if a two-way campaign is
-routed here before then.
+Both call shapes live here. One-way delivers a message and hangs up (turn
+detection off, the lead's audio never forwarded). Two-way holds a conversation:
+turn detection on, the STT language pinned, lead transcripts captured, and
+barge-in handled with conversation.item.truncate so the model's belief about
+what it said matches what the lead actually heard. The live search TOOL for
+answering course questions is still to come (Task 9); two-way campaigns remain
+gated at campaign creation and in preflight until then.
 
 Wire protocol, captured from the sibling ../ai-voice-agent's working
 implementation rather than assumed from documentation:
@@ -50,6 +53,10 @@ from app.config import (
     OPENAI_API_KEY,
     OPENAI_REALTIME_MODEL,
     OPENAI_REALTIME_NOISE_REDUCTION,
+    OPENAI_REALTIME_SILENCE_MS,
+    OPENAI_REALTIME_STT_LANGUAGE,
+    OPENAI_REALTIME_STT_MODEL,
+    OPENAI_REALTIME_VAD_THRESHOLD,
     OPENAI_REALTIME_VOICE,
 )
 from app.db.models import TranscriptTurn
@@ -78,12 +85,20 @@ async def _connect(url: str, headers: dict[str, str]) -> Any:
 
 
 def _session_update(*, lead_name: str | None, script: str | None,
-                    language_style: str | None) -> dict:
+                    language_style: str | None, one_way: bool) -> dict:
     """The session frame sent immediately after the socket opens.
 
-    No tools and no input transcription: a one-way call has nothing to look up
-    and never forwards the lead's audio, so transcribing it would be paying to
-    transcribe audio the model never receives.
+    One-way: no tools and no input transcription — a one-way call has nothing to
+    look up and never forwards the lead's audio, so transcribing it would be
+    paying to transcribe audio the model never receives, and turn detection is
+    off so the model never takes a turn against a lead it is not listening to.
+
+    Two-way: turn detection on so the model answers when the lead stops, plus a
+    transcription config with the STT language PINNED — on 8 kHz phone audio
+    auto-detection was observed hearing Telugu as Croatian/Urdu, so the lead
+    would be transcribed as nonsense and answered with nonsense (see config.py's
+    OPENAI_REALTIME_STT_LANGUAGE). This is the path where the lead actually
+    speaks, so it is where the pin has to be.
     """
     output_cfg: dict = {"format": {"type": "audio/pcmu"}}
     if OPENAI_REALTIME_VOICE:
@@ -94,17 +109,34 @@ def _session_update(*, lead_name: str | None, script: str | None,
     input_cfg: dict = {"format": {"type": "audio/pcmu"}}
     if OPENAI_REALTIME_NOISE_REDUCTION:
         input_cfg["noise_reduction"] = {"type": OPENAI_REALTIME_NOISE_REDUCTION}
-    # Unconditionally off: the model must never take a turn against a lead it
-    # is not listening to. Milestone B's two-way path overrides this.
-    input_cfg["turn_detection"] = None
+    if one_way:
+        # The model must never take a turn against a lead it is not listening to.
+        input_cfg["turn_detection"] = None
+        instructions = openai_prompts.one_way_instructions(
+            lead_name, script, language_style=language_style,
+        )
+    else:
+        transcription: dict = {"model": OPENAI_REALTIME_STT_MODEL}
+        if OPENAI_REALTIME_STT_LANGUAGE:
+            transcription["language"] = OPENAI_REALTIME_STT_LANGUAGE
+        input_cfg["transcription"] = transcription
+        input_cfg["turn_detection"] = {
+            "type": "server_vad",
+            "threshold": OPENAI_REALTIME_VAD_THRESHOLD,
+            "prefix_padding_ms": 300,
+            # The sibling floors this at 600ms: below it the model cuts leads
+            # off mid-sentence on a natural pause.
+            "silence_duration_ms": max(OPENAI_REALTIME_SILENCE_MS, 600),
+        }
+        instructions = openai_prompts.two_way_instructions(
+            lead_name, script, language_style=language_style,
+        )
 
     return {
         "type": "session.update",
         "session": {
             "type": "realtime",
-            "instructions": openai_prompts.one_way_instructions(
-                lead_name, script, language_style=language_style,
-            ),
+            "instructions": instructions,
             "output_modalities": ["audio"],
             "audio": {"input": input_cfg, "output": output_cfg},
         },
@@ -142,18 +174,14 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
         # releases the slot instead of unwinding through its finally.
         logger.error("[openai] OPENAI_API_KEY is not set — cannot bridge the call.")
         return outcome
-    if not one_way:
-        # Task 4 must not route a two-way campaign here yet. If one arrives,
-        # this says so out loud: turn detection is off and nothing cues a
-        # response, so the lead would otherwise hear silence for
-        # CALL_MAX_DURATION_S with no logged reason.
-        logger.warning(f"[openai] lead={lead_id} two-way is not implemented on this "
-                       "backend yet (Milestone B) — the agent will not speak.")
-
     variables = dynamic_variables or {}
     call = plivo_stream.PlivoCall(plivo_ws, lead_id=lead_id, one_way=one_way)
     turns: list[TranscriptTurn] = []
     agent_text: list[str] = []
+    # The id of the response item currently being spoken, tracked from the
+    # events that carry it. Barge-in truncation needs it to tell the model which
+    # item to trim to what the lead actually heard.
+    last_item_id: str | None = None
 
     url = _REALTIME_URL.format(model=OPENAI_REALTIME_MODEL)
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
@@ -168,6 +196,7 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
                 # text for te vs tinglish, so this backend's persona actually
                 # differs by register instead of one hardcoded rule for both.
                 language_style=variables.get("language_style"),
+                one_way=one_way,
             )))
             # One-way: ask for the message immediately. Nothing else will —
             # with turn detection off the model waits for an explicit cue.
@@ -188,6 +217,7 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
 
             # ── OpenAI → Plivo ───────────────────────────────────────────────
             async def from_openai() -> None:
+                nonlocal last_item_id
                 try:
                     async for raw in oa:
                         if call.stop.is_set():
@@ -197,6 +227,14 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
                         except (ValueError, TypeError):
                             continue
                         etype = event.get("type", "")
+
+                        # Track the current item id off any event that carries
+                        # one (response.created, audio/transcript deltas) — the
+                        # most recent wins, so it names the item being spoken
+                        # when a barge-in arrives.
+                        item_id = event.get("item_id")
+                        if item_id:
+                            last_item_id = item_id
 
                         if etype in ("response.output_audio.delta",
                                      "response.audio.delta"):
@@ -225,6 +263,31 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
                             agent_text.clear()
                             if said:
                                 turns.append(TranscriptTurn(role="agent", text=said))
+                        elif (etype ==
+                              "conversation.item.input_audio_transcription.completed"):
+                            # What the lead said, transcribed. Only present on a
+                            # two-way call — one-way never forwards their audio.
+                            said = (event.get("transcript") or "").strip()
+                            if said:
+                                turns.append(TranscriptTurn(role="lead", text=said))
+                        elif etype == "input_audio_buffer.speech_started":
+                            # Barge-in. Honour the greeting grace window first
+                            # (interrupt() returns False inside it), then drop
+                            # the queued audio AND tell the model how much of its
+                            # last message the lead actually heard — without the
+                            # truncate the model believes it said everything it
+                            # generated and every later turn builds on words the
+                            # lead never heard. This is the sibling's unresolved
+                            # bug (its ARCHITECTURE.md:268-276); we must not
+                            # inherit it.
+                            if await call.interrupt():
+                                await oa.send(json.dumps({"type": "response.cancel"}))
+                                await oa.send(json.dumps({
+                                    "type": "conversation.item.truncate",
+                                    "item_id": last_item_id,
+                                    "content_index": 0,
+                                    "audio_end_ms": call.played_ms(),
+                                }))
                         elif etype == "error":
                             logger.error(f"[openai] lead={lead_id} error event: "
                                          f"{event.get('error') or event}")

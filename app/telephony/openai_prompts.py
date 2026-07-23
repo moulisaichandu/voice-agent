@@ -90,3 +90,45 @@ def one_way_instructions(lead_name: str | None, script: str | None,
             f"aloud: {script.strip()}"
         )
     return "\n\n".join(parts)
+
+
+def two_way_instructions(lead_name: str | None, script: str | None,
+                         language_style: str | None = None) -> str:
+    """The persona for a call that holds a conversation with the lead.
+
+    Same non-negotiable rules as one_way_instructions() — the AI disclosure is
+    still the FIRST spoken sentence (a legal requirement enforced here because
+    the model, not a fixed string, speaks it), and Telugu-only / never-Hindi
+    still hold (see this module's docstring for the observed failures behind
+    both). What differs is the shape of the call: the script is the GOAL of a
+    two-way conversation, not a message to read out and hang up on, and the
+    model must listen, answer, and stay on topic.
+
+    language_style: exactly as one_way_instructions() — the resolved register's
+    style text (te vs tinglish); None falls back to pure Telugu.
+    """
+    who = f"You are speaking with {lead_name}. " if lead_name else ""
+    parts = [
+        f"You are a voice assistant calling on behalf of Digital Brolly, an "
+        f"education company in Hyderabad. {who}"
+        "This is a real two-way phone conversation: listen to the person, let "
+        "them finish, answer what they actually asked, and keep your turns "
+        "short and natural — one or two spoken sentences, not a monologue. If "
+        "they interrupt you, stop and listen.",
+        _DISCLOSURE_RULE,
+        _language_rule(language_style),
+        "ANSWERING COURSE QUESTIONS: For any fact about courses, fees, dates, "
+        "timings, certificates or eligibility, rely ONLY on the material the "
+        "search tool returns. Never invent or guess a price, date or detail. "
+        "If the search tool returns nothing relevant, say honestly that you do "
+        "not have that information and offer to have someone follow up — do not "
+        "make something up to fill the silence.",
+    ]
+    if script and script.strip():
+        parts.append(
+            "GOAL OF THIS CALL — this is the MEANING to steer the conversation "
+            "toward in natural spoken Telugu, not words to recite. It may be "
+            "written in English; if so, convey its meaning in Telugu and never "
+            f"read English text aloud: {script.strip()}"
+        )
+    return "\n\n".join(parts)
