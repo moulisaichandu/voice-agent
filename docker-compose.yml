@@ -20,6 +20,19 @@ services:
       # service below for the tunnel it is currently serving.
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
       TUNNEL_DISCOVERY_URL: http://cloudflared:20241
+    # Resolve DNS through Cloudflare's own resolver, NOT Docker's default.
+    #
+    # This fixes a recurring, misleading failure: preflight would report
+    # "PUBLIC_BASE_URL (…trycloudflare.com) is unreachable" even though the
+    # tunnel was up and globally resolvable. Root cause was DNS, not the
+    # tunnel — Docker's embedded resolver (127.0.0.11, forwarding to the host)
+    # negative-caches each freshly-minted quick-tunnel subdomain and keeps
+    # returning NXDOMAIN for minutes, while the parent trycloudflare.com and
+    # every other host resolve fine. Since the tunnel's DNS is Cloudflare's,
+    # asking 1.1.1.1 directly always has the fresh record the instant
+    # cloudflared mints it. Verified 2026-07-23: same URL, Docker resolver
+    # 000/NXDOMAIN vs 1.1.1.1 -> 200.
+    dns: ["1.1.1.1", "1.0.0.1"]
     # Host port 8091, not 8000: the sibling ai-voice-agent project runs its own
     # server on host:8000 — these are two independent apps and must not collide.
     # Container-internal port stays 8000 (matches the Dockerfile/uvicorn command).
