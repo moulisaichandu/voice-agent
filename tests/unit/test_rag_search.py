@@ -103,6 +103,64 @@ async def test_telugu_miss_is_retried_in_english_and_then_hits(monkeypatch):
     assert seen_queries == [TELUGU_FEE_QUERY, "What is the course fee?"]
 
 
+HINDI_FEE_QUERY = "कोर्स की फीस कितनी है?"
+HINGLISH_FEE_QUERY = "Course ki fees kitni hai?"
+
+
+async def test_hindi_miss_is_retried_in_english_and_then_hits(monkeypatch):
+    monkeypatch.setattr(search, "RAG_TRANSLATE_ON_MISS", True)
+    seen_queries = []
+
+    def fake_embed(text):
+        seen_queries.append(text)
+        return [1.0, 0.0]
+
+    async def fake_match_chunks(embedding, *, match_count, min_score):
+        if seen_queries[-1] == HINDI_FEE_QUERY:
+            return []
+        return [{"content": "Total Fee: 1,50,000 rupees.", "section": "fees", "score": 0.46}]
+
+    async def fake_translate(q):
+        assert q == HINDI_FEE_QUERY
+        return "What is the course fee?"
+
+    monkeypatch.setattr(search, "embed_text", fake_embed)
+    monkeypatch.setattr(search, "translate_to_english", fake_translate)
+    monkeypatch.setattr("app.db.rag_store.match_chunks", fake_match_chunks)
+
+    result = await search.search_relevant(HINDI_FEE_QUERY)
+
+    assert "1,50,000" in result
+    assert seen_queries == [HINDI_FEE_QUERY, "What is the course fee?"]
+
+
+async def test_hinglish_miss_is_retried_in_english_and_then_hits(monkeypatch):
+    monkeypatch.setattr(search, "RAG_TRANSLATE_ON_MISS", True)
+    seen_queries = []
+
+    def fake_embed(text):
+        seen_queries.append(text)
+        return [1.0, 0.0]
+
+    async def fake_match_chunks(embedding, *, match_count, min_score):
+        if seen_queries[-1] == HINGLISH_FEE_QUERY:
+            return []
+        return [{"content": "Total Fee: 1,50,000 rupees.", "section": "fees", "score": 0.46}]
+
+    async def fake_translate(q):
+        assert q == HINGLISH_FEE_QUERY
+        return "What is the course fee?"
+
+    monkeypatch.setattr(search, "embed_text", fake_embed)
+    monkeypatch.setattr(search, "translate_to_english", fake_translate)
+    monkeypatch.setattr("app.db.rag_store.match_chunks", fake_match_chunks)
+
+    result = await search.search_relevant(HINGLISH_FEE_QUERY)
+
+    assert "1,50,000" in result
+    assert seen_queries == [HINGLISH_FEE_QUERY, "What is the course fee?"]
+
+
 async def test_translation_retry_never_weakens_the_relevance_threshold(monkeypatch):
     """The whole point of translating instead of lowering RAG_MIN_SCORE: the
     retry moves the QUERY's language, never the bar. If the retry ever ran at
