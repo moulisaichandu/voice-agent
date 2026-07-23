@@ -531,3 +531,101 @@ def test_two_way_prompt_survives_a_campaign_with_no_script_or_name():
     instructions = openai_prompts.two_way_instructions(None, "   ")
     assert "GOAL OF THIS CALL" not in instructions
     assert "You are speaking with" not in instructions
+
+
+# ── the search tool: course questions answered from RAG, not memory ─────────
+# CLAUDE.md's hard rule: search_relevant() is the ONLY function the live tool
+# may call. search_permissive() ignores the relevance floor and must never be
+# reachable from here.
+
+_SEARCH_TOOL_NAME = "search_course_material"
+
+
+async def test_a_two_way_session_attaches_the_search_tool(bridged):
+    oa = _FakeOpenAIWS([_audio_delta()])
+    bridged(oa)
+    await asyncio.wait_for(
+        openai_bridge.bridge(_FakePlivoWS(), agent_id="x", lead_id="l",
+                             language="te", one_way=False),
+        timeout=5,
+    )
+    names = [t["name"] for t in _session(oa)["session"].get("tools", [])]
+    assert _SEARCH_TOOL_NAME in names
+
+
+async def test_a_tool_call_is_answered_from_search_relevant(bridged, monkeypatch):
+    """The hard rule: the live tool calls search_relevant and nothing else.
+    search_permissive ignores the relevance floor and would let the agent
+    recite irrelevant course text to a lead as though it were an answer."""
+    seen = {}
+
+    async def fake_relevant(query, *a, **kw):
+        seen["query"] = query
+        return "The fee is 25,000 rupees."
+
+    monkeypatch.setattr(openai_bridge, "search_relevant", fake_relevant)
+
+    def forbidden(*a, **kw):
+        raise AssertionError("search_permissive must never be reachable live")
+
+    monkeypatch.setattr(openai_bridge, "search_permissive", forbidden, raising=False)
+
+    oa = _FakeOpenAIWS([json.dumps({
+        "type": "response.done",
+        "response": {"output": [{
+            "type": "function_call", "name": _SEARCH_TOOL_NAME,
+            "call_id": "call_1", "arguments": json.dumps({"query": "fees?"}),
+        }]},
+    })])
+    bridged(oa)
+    await asyncio.wait_for(
+        openai_bridge.bridge(_FakePlivoWS(), agent_id="x", lead_id="l",
+                             language="te", one_way=False),
+        timeout=5,
+    )
+
+    assert seen["query"] == "fees?"
+    outputs = [json.loads(s) for s in oa.sent]
+    item = next(o for o in outputs
+                if o.get("type") == "conversation.item.create")
+    assert "25,000" in json.dumps(item)
+    assert any(o.get("type") == "response.create" for o in outputs), (
+        "the model must be prompted to speak the tool result"
+    )
+
+
+async def test_a_one_way_call_gets_no_tools(bridged):
+    """Nothing to search when nobody can ask."""
+    oa = _FakeOpenAIWS([_audio_delta()])
+    bridged(oa)
+    await asyncio.wait_for(
+        openai_bridge.bridge(_FakePlivoWS(), agent_id="x", lead_id="l",
+                             language="te", one_way=True),
+        timeout=5,
+    )
+    assert "tools" not in _session(oa)["session"]
+
+
+async def test_malformed_tool_arguments_do_not_crash_the_call(bridged, monkeypatch):
+    """Defensive JSON parsing: a malformed arguments string must not blow up
+    the reader task and silently kill the call."""
+    async def fake_relevant(query, *a, **kw):
+        return "fallback answer"
+
+    monkeypatch.setattr(openai_bridge, "search_relevant", fake_relevant)
+
+    oa = _FakeOpenAIWS([json.dumps({
+        "type": "response.done",
+        "response": {"output": [{
+            "type": "function_call", "name": _SEARCH_TOOL_NAME,
+            "call_id": "call_1", "arguments": "{not valid json",
+        }]},
+    })])
+    bridged(oa)
+    outcome = await asyncio.wait_for(
+        openai_bridge.bridge(_FakePlivoWS(), agent_id="x", lead_id="l",
+                             language="te", one_way=False),
+        timeout=5,
+    )
+    # Must not raise, and the call still records a normal (if empty) outcome.
+    assert outcome["status"] in ("done", "failed")

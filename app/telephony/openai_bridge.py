@@ -60,6 +60,7 @@ from app.config import (
     OPENAI_REALTIME_VOICE,
 )
 from app.db.models import TranscriptTurn
+from app.rag.search import search_relevant
 
 # The MODULE, not just PlivoCall: everything Plivo-side is deliberately in one
 # place, and importing it this way keeps that visible (and keeps its tunables
@@ -69,6 +70,32 @@ from app.telephony import openai_prompts, plivo_stream
 logger = logging.getLogger(__name__)
 
 _REALTIME_URL = "wss://api.openai.com/v1/realtime?model={model}"
+
+# The live course-question tool, two-way only (see _session_update). Calls
+# search_relevant() ONLY — CLAUDE.md's hard rule. search_relevant applies the
+# relevance floor (RAG_MIN_SCORE) and always returns something speakable, so
+# the agent never recites irrelevant course text as though it were an answer.
+# search_permissive() must never be wired to this path.
+_SEARCH_TOOL_NAME = "search_course_material"
+_SEARCH_TOOL: dict = {
+    "type": "function",
+    "name": _SEARCH_TOOL_NAME,
+    "description": (
+        "Search Digital Brolly's course documents for material relevant to the "
+        "lead's question. Call this for every question about courses, fees, "
+        "timings, batches or placement — never answer those from memory."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The lead's question, as a concise search query in English.",
+            },
+        },
+        "required": ["query"],
+    },
+}
 
 # Event types whose `item_id` names the ASSISTANT item currently being
 # spoken — the only ones allowed to update `last_item_id` (see the comment
@@ -142,15 +169,19 @@ def _session_update(*, lead_name: str | None, script: str | None,
             lead_name, script, language_style=language_style,
         )
 
-    return {
-        "type": "session.update",
-        "session": {
-            "type": "realtime",
-            "instructions": instructions,
-            "output_modalities": ["audio"],
-            "audio": {"input": input_cfg, "output": output_cfg},
-        },
+    session: dict = {
+        "type": "realtime",
+        "instructions": instructions,
+        "output_modalities": ["audio"],
+        "audio": {"input": input_cfg, "output": output_cfg},
     }
+    if not one_way:
+        # One-way gets no tools at all — there is nobody to answer, and a
+        # tool the model can never get a reply from is worse than none.
+        session["tools"] = [_SEARCH_TOOL]
+        session["tool_choice"] = "auto"
+
+    return {"type": "session.update", "session": session}
 
 
 async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
@@ -296,6 +327,32 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
                             agent_text.clear()
                             if said:
                                 turns.append(TranscriptTurn(role="agent", text=said))
+                            for item in resp.get("output") or []:
+                                if item.get("type") != "function_call":
+                                    continue
+                                if item.get("name") != _SEARCH_TOOL_NAME:
+                                    continue
+                                try:
+                                    args = json.loads(item.get("arguments") or "{}")
+                                except (ValueError, TypeError):
+                                    # Malformed tool-call JSON must not crash
+                                    # the reader task mid-call.
+                                    args = {}
+                                # search_relevant, never search_permissive —
+                                # CLAUDE.md's hard rule. It applies the
+                                # relevance floor and always returns something
+                                # speakable, so the agent is never left
+                                # tool-calling with nothing to say.
+                                answer = await search_relevant(str(args.get("query") or ""))
+                                await oa.send(json.dumps({
+                                    "type": "conversation.item.create",
+                                    "item": {
+                                        "type": "function_call_output",
+                                        "call_id": item.get("call_id"),
+                                        "output": answer,
+                                    },
+                                }))
+                                await oa.send(json.dumps({"type": "response.create"}))
                         elif (etype ==
                               "conversation.item.input_audio_transcription.completed"):
                             # What the lead said, transcribed. Only present on a
