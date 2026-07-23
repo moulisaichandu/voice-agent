@@ -425,10 +425,17 @@ async def test_barge_in_truncates_the_models_belief_about_what_it_said(bridged):
     """REGRESSION for a bug the source material has and we must not inherit.
     Without conversation.item.truncate the model believes it said everything
     it generated, while the lead only heard what had played — every later
-    turn then builds on something the lead never heard."""
+    turn then builds on something the lead never heard.
+
+    The real API's speech_started event carries an `item_id` too — it is the
+    id of the user item VAD is about to create, NOT the agent's item. Include
+    it here (distinct from the agent's), matching the real wire format,
+    because a fake event that omits it would hide the exact bug this guards."""
     oa = _FakeOpenAIWS([
-        _audio_delta(),
-        json.dumps({"type": "input_audio_buffer.speech_started"}),
+        json.dumps({"type": "response.output_audio.delta",
+                    "delta": _AUDIO_B64, "item_id": "item-agent-1"}),
+        json.dumps({"type": "input_audio_buffer.speech_started",
+                    "item_id": "item-user-1"}),
     ])
     bridged(oa)
     await asyncio.wait_for(
@@ -444,11 +451,17 @@ async def test_barge_in_truncates_the_models_belief_about_what_it_said(bridged):
 async def test_barge_in_truncate_names_the_current_item(bridged):
     """The truncate has to identify WHICH item to trim, or the model trims the
     wrong turn (or none). The id comes from the audio deltas of the response
-    being spoken."""
+    being spoken — NOT from speech_started, whose own item_id names the
+    user's upcoming item (confirmed against the OpenAI Realtime API schema:
+    "The ID of the user message item that will be created when speech
+    stops."). conversation.item.truncate only operates on assistant audio
+    items, so naming the user item here would make the API reject the
+    truncate outright, silently reintroducing the sibling's unresolved bug."""
     oa = _FakeOpenAIWS([
         json.dumps({"type": "response.output_audio.delta",
                     "delta": _AUDIO_B64, "item_id": "item-77"}),
-        json.dumps({"type": "input_audio_buffer.speech_started"}),
+        json.dumps({"type": "input_audio_buffer.speech_started",
+                    "item_id": "item-user-99"}),
     ])
     bridged(oa)
     await asyncio.wait_for(
@@ -459,6 +472,7 @@ async def test_barge_in_truncate_names_the_current_item(bridged):
     truncate = next(json.loads(s) for s in oa.sent
                     if json.loads(s).get("type") == "conversation.item.truncate")
     assert truncate["item_id"] == "item-77"
+    assert truncate["item_id"] != "item-user-99"
     assert truncate["content_index"] == 0
     assert isinstance(truncate["audio_end_ms"], int)
 

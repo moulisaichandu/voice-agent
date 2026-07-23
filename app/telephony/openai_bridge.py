@@ -70,6 +70,16 @@ logger = logging.getLogger(__name__)
 
 _REALTIME_URL = "wss://api.openai.com/v1/realtime?model={model}"
 
+# Event types whose `item_id` names the ASSISTANT item currently being
+# spoken — the only ones allowed to update `last_item_id` (see the comment
+# at its use in `from_openai()` for why this must be a whitelist, not a
+# blanket "any item_id wins").
+_ASSISTANT_ITEM_EVENTS = frozenset({
+    "response.created",
+    "response.output_audio.delta", "response.audio.delta",
+    "response.output_audio_transcript.delta", "response.audio_transcript.delta",
+})
+
 
 async def _connect(url: str, headers: dict[str, str]) -> Any:
     """Open the Realtime socket, tolerating both `websockets` header kwargs.
@@ -228,13 +238,36 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
                             continue
                         etype = event.get("type", "")
 
-                        # Track the current item id off any event that carries
-                        # one (response.created, audio/transcript deltas) — the
-                        # most recent wins, so it names the item being spoken
-                        # when a barge-in arrives.
-                        item_id = event.get("item_id")
-                        if item_id:
-                            last_item_id = item_id
+                        # Track the current item id ONLY from the AGENT's own
+                        # output events — a WHITELIST (_ASSISTANT_ITEM_EVENTS),
+                        # not the old "any event carrying item_id wins, most
+                        # recent takes it" logic.
+                        #
+                        # Why the blanket version was a real bug, not just
+                        # untidy: input_audio_buffer.speech_started ALSO
+                        # carries a top-level item_id, but per the OpenAI
+                        # Realtime API schema it is "the ID of the user
+                        # message item that will be created when speech
+                        # stops" — the LEAD's upcoming item, not the
+                        # assistant's (conversation.item.input_audio_
+                        # transcription.completed is the same: the lead's
+                        # item). conversation.item.truncate below only
+                        # operates on ASSISTANT audio items, so if a lead's
+                        # item_id ever won here the API would reject the
+                        # truncate outright and the model's belief about
+                        # what it said would never be corrected — silently
+                        # reintroducing the sibling's unresolved bug
+                        # (ARCHITECTURE.md:268-276).
+                        #
+                        # A whitelist, not a blocklist, is deliberate: a
+                        # future event type must be added here on purpose
+                        # before it can touch last_item_id, so it cannot
+                        # silently win by omission the way the old logic did.
+                        # Do NOT "simplify" this back to a blanket update.
+                        if etype in _ASSISTANT_ITEM_EVENTS:
+                            item_id = event.get("item_id")
+                            if item_id:
+                                last_item_id = item_id
 
                         if etype in ("response.output_audio.delta",
                                      "response.audio.delta"):
