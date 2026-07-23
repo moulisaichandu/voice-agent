@@ -16,12 +16,16 @@ app/telephony/plivo_stream.py and is shared with the ElevenLabs bridge. This
 module owns only OpenAI's wire protocol.
 
 Both call shapes live here. One-way delivers a message and hangs up (turn
-detection off, the lead's audio never forwarded). Two-way holds a conversation:
-turn detection on, the STT language pinned, lead transcripts captured, and
-barge-in handled with conversation.item.truncate so the model's belief about
-what it said matches what the lead actually heard. The live search TOOL for
-answering course questions is still to come (Task 9); two-way campaigns remain
-gated at campaign creation and in preflight until then.
+detection off, no tools, the lead's audio never forwarded). Two-way holds a
+conversation: turn detection on, the STT language pinned, lead transcripts
+captured, barge-in handled with conversation.item.truncate so the model's
+belief about what it said matches what the lead actually heard, and course
+questions answered via the search_course_material tool — which calls
+search_relevant() ONLY (CLAUDE.md's hard rule; see _SEARCH_TOOL's comment).
+Two-way campaigns are still refused at campaign creation and in preflight for
+languages this backend serves, pending a live call verifying the conversation
+end to end (see the plan's Milestone B gate) — not because the tool is
+missing.
 
 Wire protocol, captured from the sibling ../ai-voice-agent's working
 implementation rather than assumed from documentation:
