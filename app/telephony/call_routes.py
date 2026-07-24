@@ -129,13 +129,22 @@ async def _release_slot_once(lead_id: str, call_uuid: str | None = None) -> None
     wins matters far less than both paths choosing the SAME one, and only the
     recorded value is written on every path (including calls that ring out and
     never reach /calls/answer at all).
+
+    Never raises. It runs in /calls/hangup (whose contract is "always 200,
+    never raises — an error makes Plivo retry-storm") and in /calls/stream's
+    cleanup finally. A Redis failure here must degrade to a logged skip, not an
+    exception that escapes the handler and turns a normal teardown into a 500.
     """
-    r = redis_client.get_redis()
-    recorded = await r.get(CALL_UUID_KEY_FMT.format(lead_id=lead_id))
-    token = recorded or call_uuid or lead_id
-    first = await r.set(f"slot:released:{token}", "1", nx=True, ex=_SLOT_GUARD_TTL_S)
-    if first:
-        await telephony_worker.release_call_slot()
+    try:
+        r = redis_client.get_redis()
+        recorded = await r.get(CALL_UUID_KEY_FMT.format(lead_id=lead_id))
+        token = recorded or call_uuid or lead_id
+        first = await r.set(f"slot:released:{token}", "1", nx=True, ex=_SLOT_GUARD_TTL_S)
+        if first:
+            await telephony_worker.release_call_slot()
+    except Exception as exc:
+        logger.error(f"[calls] could not release the concurrency slot for lead "
+                     f"{lead_id}: {type(exc).__name__}: {exc}")
 
 
 @router.post("/calls/answer")
@@ -155,9 +164,16 @@ async def answer(request: Request) -> Response:
     except Exception:
         call_uuid = None
     if call_uuid and lead_id:
-        r = redis_client.get_redis()
-        await r.set(CALL_PLIVO_UUID_KEY_FMT.format(lead_id=lead_id), call_uuid,
-                    ex=_SLOT_GUARD_TTL_S)
+        try:
+            r = redis_client.get_redis()
+            await r.set(CALL_PLIVO_UUID_KEY_FMT.format(lead_id=lead_id), call_uuid,
+                        ex=_SLOT_GUARD_TTL_S)
+        except Exception as exc:
+            # Best-effort: a Redis blip must not fail the answer webhook (500).
+            # The call still proceeds via the <Stream> XML below; only the later
+            # ability to force-hang-up this leg is lost.
+            logger.warning(f"[calls] could not record the Plivo CallUUID for lead "
+                           f"{lead_id}: {type(exc).__name__}: {exc}")
 
     logger.info(f"[calls] answered lead={lead_id} CallUUID={call_uuid}")
     return Response(content=plivo_stream.answer_xml(lead_id),
@@ -199,6 +215,25 @@ def _backend_bridge(token: str):
     return bridge_module.bridge
 
 
+async def _abort_stream(ws: WebSocket, lead_id: str) -> None:
+    """Drop a call we cannot bridge, running the SAME cleanup the normal path
+    does: close our socket, hang up the Plivo leg, and release the slot.
+
+    All three are required on every early exit. keepCallAlive means closing the
+    socket alone does not end the Plivo leg, and the worker already reserved a
+    concurrency slot — skip either and the leg bills on, silent, while the slot
+    leaks. Each step is individually best-effort (_end_plivo_leg and
+    _release_slot_once swallow their own errors) so one failure can't skip the
+    next."""
+    try:
+        await ws.close()
+    except Exception as exc:
+        logger.warning(f"[calls] /calls/stream: closing the socket for lead "
+                       f"{lead_id} raised {type(exc).__name__}: {exc}")
+    await _end_plivo_leg(lead_id)
+    await _release_slot_once(lead_id)
+
+
 @router.websocket("/calls/stream")
 async def stream(ws: WebSocket) -> None:
     """The call's audio, bridged to the ElevenLabs agent."""
@@ -211,20 +246,33 @@ async def stream(ws: WebSocket) -> None:
     await ws.accept()
 
     try:
-        lead = await leads_db.get_lead(UUID(lead_id))
-    except (ValueError, AttributeError):
-        lead = None
-    if lead is None or lead.campaign_id is None:
-        logger.error(f"[calls] /calls/stream: no lead for {lead_id!r} — dropping the call")
-        await ws.close()
-        await _release_slot_once(lead_id)
-        return
+        try:
+            lead = await leads_db.get_lead(UUID(lead_id))
+        except (ValueError, AttributeError):
+            # A malformed lead id in the URL — not a DB failure.
+            lead = None
+        if lead is None or lead.campaign_id is None:
+            logger.error(f"[calls] /calls/stream: no lead for {lead_id!r} — dropping the call")
+            await _abort_stream(ws, lead_id)
+            return
 
-    campaign = await campaigns_db.get_campaign(lead.campaign_id)
-    if campaign is None:
-        logger.error(f"[calls] /calls/stream: no campaign for lead {lead_id} — dropping")
-        await ws.close()
-        await _release_slot_once(lead_id)
+        campaign = await campaigns_db.get_campaign(lead.campaign_id)
+        if campaign is None:
+            logger.error(f"[calls] /calls/stream: no campaign for lead {lead_id} — dropping")
+            await _abort_stream(ws, lead_id)
+            return
+    except Exception as exc:
+        # A transient DB error (pool exhaustion, a connection blip) while
+        # resolving the lead or campaign must NOT skip cleanup. Only UUID
+        # parsing was caught before and get_campaign was unguarded, so a real
+        # asyncpg error threw out of the handler before the finally below ever
+        # ran — stranding the lead 'calling' forever (due_leads selects only
+        # 'pending', so it is never retried), leaking the concurrency slot, and
+        # leaving a billed, silent Plivo leg up (keepCallAlive survives our
+        # socket closing).
+        logger.exception(f"[calls] /calls/stream: could not resolve the call for "
+                         f"{lead_id!r} ({type(exc).__name__}: {exc}) — dropping")
+        await _abort_stream(ws, lead_id)
         return
 
     call_language, language_vars = _call_language(lead, campaign)

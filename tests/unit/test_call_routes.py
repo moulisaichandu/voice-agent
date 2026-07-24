@@ -296,6 +296,125 @@ async def test_a_failed_hangup_lookup_never_raises(redis, monkeypatch):
     await call_routes._end_plivo_leg(str(uuid4()))  # must not raise
 
 
+async def test_releasing_the_slot_never_raises_when_redis_is_down(redis, released, monkeypatch):
+    """REGRESSION: /calls/hangup's contract is 'always 200, never raises' — an
+    error makes Plivo retry-storm — and /calls/stream's cleanup runs this in a
+    finally. A Redis failure while releasing the slot must degrade to a logged
+    skip, not an exception that escapes the handler."""
+    async def boom(*a, **k):
+        raise RuntimeError("redis unavailable")
+
+    monkeypatch.setattr(redis, "get", boom)
+
+    await call_routes._release_slot_once(str(uuid4()))  # must not raise
+
+
+# ── /calls/stream: cleanup must run on EVERY exit path ───────────────────────
+# keepCallAlive keeps the Plivo leg up when our socket closes, and the worker
+# has already reserved a concurrency slot, so every early exit must (a) end the
+# Plivo leg and (b) release the slot — or the lead is stranded 'calling', a slot
+# leaks, and a silent leg bills on.
+
+
+class _FakeWS:
+    """The minimum WebSocket surface stream() touches."""
+
+    def __init__(self, lead_id: str):
+        self.query_params = {"lead": lead_id, "token": ""}
+        self.accepted = False
+        self.close_code = "unset"
+
+    async def accept(self):
+        self.accepted = True
+
+    async def close(self, code=None):
+        self.close_code = code
+
+
+class _FakeRequest:
+    def __init__(self, lead_id: str, form_data: dict | None = None):
+        self.query_params = {"lead": lead_id, "token": ""}
+        self._form = form_data or {}
+
+    async def form(self):
+        return self._form
+
+
+async def test_a_db_error_resolving_the_call_still_cleans_up(redis, released, monkeypatch):
+    """REGRESSION (critical): a transient DB error while the call is connecting
+    must not skip cleanup. The old code caught only UUID ValueError/AttributeError
+    and left get_campaign unguarded, so a real asyncpg error threw out of the
+    handler before the finally that releases the slot and ends the Plivo leg —
+    stranding the lead 'calling' forever and leaking a slot and a billed leg."""
+    monkeypatch.setattr(call_routes, "CALL_WEBHOOK_SECRET", None)
+
+    async def boom(_lead_id):
+        raise RuntimeError("connection pool exhausted")
+
+    monkeypatch.setattr(call_routes.leads_db, "get_lead", boom)
+
+    hung_up = []
+
+    async def fake_hangup(uuid):
+        hung_up.append(uuid)
+
+    monkeypatch.setattr(call_routes.plivo_client, "hangup", fake_hangup)
+
+    lead_id = str(uuid4())
+    await redis.set(call_routes.CALL_PLIVO_UUID_KEY_FMT.format(lead_id=lead_id),
+                    "plivo-uuid")
+
+    await call_routes.stream(_FakeWS(lead_id))  # must NOT raise
+
+    assert released == [1], "the slot must be released even when the lookup errors"
+    assert hung_up == ["plivo-uuid"], "the Plivo leg must be hung up too"
+
+
+async def test_a_missing_lead_hangs_up_the_plivo_leg(redis, released, monkeypatch):
+    """REGRESSION: a lead that vanished between /calls/answer and /calls/stream
+    released its slot but never had its Plivo leg hung up — keepCallAlive keeps
+    the leg up when our socket closes, so it billed on, silent."""
+    monkeypatch.setattr(call_routes, "CALL_WEBHOOK_SECRET", None)
+
+    async def no_lead(_lead_id):
+        return None
+
+    monkeypatch.setattr(call_routes.leads_db, "get_lead", no_lead)
+
+    hung_up = []
+
+    async def fake_hangup(uuid):
+        hung_up.append(uuid)
+
+    monkeypatch.setattr(call_routes.plivo_client, "hangup", fake_hangup)
+
+    lead_id = str(uuid4())
+    await redis.set(call_routes.CALL_PLIVO_UUID_KEY_FMT.format(lead_id=lead_id),
+                    "plivo-uuid")
+
+    await call_routes.stream(_FakeWS(lead_id))
+
+    assert hung_up == ["plivo-uuid"], "the Plivo leg must be hung up on a missing lead"
+    assert released == [1]
+
+
+async def test_answer_still_serves_the_stream_xml_when_redis_is_down(redis, monkeypatch):
+    """REGRESSION: recording the Plivo CallUUID is best-effort — a Redis blip
+    must not fail the answer webhook (500). The call can still proceed via the
+    <Stream> XML; only the later force-hangup ability is lost."""
+    monkeypatch.setattr(call_routes, "CALL_WEBHOOK_SECRET", None)
+
+    async def boom(*a, **k):
+        raise RuntimeError("redis down")
+
+    monkeypatch.setattr(redis, "set", boom)
+
+    resp = await call_routes.answer(_FakeRequest(str(uuid4()),
+                                                 form_data={"CallUUID": "plivo-uuid"}))
+    assert resp.status_code == 200
+    assert b"<Stream" in resp.body
+
+
 async def test_a_sheets_failure_never_breaks_the_call_outcome(redis, monkeypatch):
     """CLAUDE.md: never block a call on a Sheets write. The transcript must
     still be recorded even if queueing the mirror fails."""
