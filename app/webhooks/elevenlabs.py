@@ -132,10 +132,16 @@ async def elevenlabs_webhook(request: Request) -> dict:
 
     try:
         event = construct_webhook_event(raw_body, sig_header, ELEVENLABS_WEBHOOK_SECRET or "")
-    except BadRequestError as exc:
+    except (BadRequestError, ValueError) as exc:
         # Deliberately generic 401 body — don't echo back WHY verification
         # failed (missing vs malformed vs stale timestamp), which would help
         # an attacker iterate toward a forged signature.
+        #
+        # ValueError is caught alongside BadRequestError because the SDK does
+        # int(timestamp) on the attacker-supplied `t=` field BEFORE any HMAC
+        # comparison: a non-numeric timestamp raises a bare ValueError, which
+        # would otherwise escape as a 500 (and a stack trace) for an unverified,
+        # unauthenticated request.
         logger.warning(f"[webhooks] signature verification failed: {exc}")
         raise HTTPException(status_code=401, detail="invalid signature") from exc
 

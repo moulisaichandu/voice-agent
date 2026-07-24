@@ -171,6 +171,25 @@ def test_tampered_or_bad_signature_is_rejected(app_client, monkeypatch):
     assert "invalid signature" in r.text.lower()
 
 
+def test_a_malformed_timestamp_is_a_401_not_a_500(app_client, monkeypatch):
+    """REGRESSION: the ElevenLabs SDK does int(timestamp) on the attacker-supplied
+    `t=` field BEFORE any HMAC check, so a non-numeric timestamp raises a plain
+    ValueError — not BadRequestError. The route caught only BadRequestError, so
+    this escaped as a 500 (and a stack trace) instead of the deliberately generic
+    401. No secret knowledge is needed to trigger it."""
+    def fake_construct(raw_body, sig_header, secret):
+        raise ValueError("invalid literal for int() with base 10: 'notanumber'")
+
+    monkeypatch.setattr(wh, "construct_webhook_event", fake_construct)
+    r = app_client.post(
+        "/webhooks/elevenlabs",
+        content=b'{"type":"post_call_transcription","data":{}}',
+        headers={"ElevenLabs-Signature": "t=notanumber,v0=deadbeef"},
+    )
+    assert r.status_code == 401
+    assert "invalid signature" in r.text.lower()
+
+
 def test_valid_signature_dispatches_and_returns_200(app_client, monkeypatch):
     monkeypatch.setattr(
         wh, "construct_webhook_event",
