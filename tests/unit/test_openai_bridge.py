@@ -430,8 +430,16 @@ async def test_barge_in_truncates_the_models_belief_about_what_it_said(bridged):
     The real API's speech_started event carries an `item_id` too — it is the
     id of the user item VAD is about to create, NOT the agent's item. Include
     it here (distinct from the agent's), matching the real wire format,
-    because a fake event that omits it would hide the exact bug this guards."""
+    because a fake event that omits it would hide the exact bug this guards.
+
+    The barge-in is into the SECOND response (an answer): the opening response
+    is delivered first (its response.done), because the opening disclosure is
+    now protected from barge-in — see
+    test_a_barge_in_during_the_opening_disclosure_is_ignored."""
     oa = _FakeOpenAIWS([
+        json.dumps({"type": "response.output_audio.delta",
+                    "delta": _AUDIO_B64, "item_id": "item-opening"}),
+        _response_done(),  # the opening (disclosure) is delivered
         json.dumps({"type": "response.output_audio.delta",
                     "delta": _AUDIO_B64, "item_id": "item-agent-1"}),
         json.dumps({"type": "input_audio_buffer.speech_started",
@@ -456,8 +464,13 @@ async def test_barge_in_truncate_names_the_current_item(bridged):
     "The ID of the user message item that will be created when speech
     stops."). conversation.item.truncate only operates on assistant audio
     items, so naming the user item here would make the API reject the
-    truncate outright, silently reintroducing the sibling's unresolved bug."""
+    truncate outright, silently reintroducing the sibling's unresolved bug.
+
+    The barge-in is into the second response, after the opening is delivered."""
     oa = _FakeOpenAIWS([
+        json.dumps({"type": "response.output_audio.delta",
+                    "delta": _AUDIO_B64, "item_id": "item-opening"}),
+        _response_done(),  # the opening (disclosure) is delivered
         json.dumps({"type": "response.output_audio.delta",
                     "delta": _AUDIO_B64, "item_id": "item-77"}),
         json.dumps({"type": "input_audio_buffer.speech_started",
@@ -477,18 +490,39 @@ async def test_barge_in_truncate_names_the_current_item(bridged):
     assert isinstance(truncate["audio_end_ms"], int)
 
 
-async def test_barge_in_before_any_assistant_audio_does_not_truncate_a_null_item(bridged):
-    """REGRESSION (Bug A): if the lead speaks before the model has produced any
-    audio item, there is no assistant item to trim. The old code sent
-    conversation.item.truncate with item_id=null anyway, which the API rejects
-    ('Invalid type for item_id: expected a string, but got null') — so the
-    truncate silently did nothing and the model's belief was never corrected.
-    The barge-in must skip the truncate rather than emit a null id.
-
-    speech_started carries a user item_id, but that is NOT in the assistant
-    whitelist, so last_item_id stays None — exactly the state that produced the
-    null truncate in the live logs."""
+async def test_a_barge_in_during_the_opening_disclosure_is_ignored(bridged):
+    """REGRESSION (compliance): the opening agent response carries the legally-
+    required AI disclosure. A lead who says "Hello?" while it is still playing
+    (before its response.done) must NOT truncate it — no cancel, no truncate —
+    or the disclosure is cut off. On a live call this fragmented the transcript
+    and fired a false [compliance] alert, because the recorded first agent turn
+    was just the pre-disclosure fragment 'ఇది Digital Brolly నుండ'."""
     oa = _FakeOpenAIWS([
+        json.dumps({"type": "response.output_audio.delta",
+                    "delta": _AUDIO_B64, "item_id": "item-opening"}),
+        # No response.done before the barge-in: the disclosure is still being
+        # delivered, so the barge-in must be ignored.
+        json.dumps({"type": "input_audio_buffer.speech_started",
+                    "item_id": "item-user-1"}),
+    ])
+    bridged(oa)
+    await asyncio.wait_for(
+        openai_bridge.bridge(_FakePlivoWS(), agent_id="x", lead_id="l",
+                             language="te", one_way=False),
+        timeout=5,
+    )
+    types = [json.loads(s).get("type") for s in oa.sent]
+    assert "conversation.item.truncate" not in types, "the disclosure must not be truncated"
+    assert "response.cancel" not in types, "the disclosure response must not be cancelled"
+
+
+async def test_barge_in_after_a_response_with_no_audio_item_does_not_truncate_null(bridged):
+    """REGRESSION (Bug A): a response can complete without producing an audio
+    item (empty or text-only), leaving last_item_id None. A barge-in after the
+    opening is delivered must then SKIP the truncate rather than send item_id=
+    null, which the API rejects ('expected a string, but got null')."""
+    oa = _FakeOpenAIWS([
+        _response_done(),  # opening delivered, but produced no audio item
         json.dumps({"type": "input_audio_buffer.speech_started",
                     "item_id": "item-user-1"}),
     ])
@@ -500,7 +534,7 @@ async def test_barge_in_before_any_assistant_audio_does_not_truncate_a_null_item
     )
     truncates = [json.loads(s) for s in oa.sent
                  if json.loads(s).get("type") == "conversation.item.truncate"]
-    assert truncates == [], "must not truncate when there is no assistant item yet"
+    assert truncates == [], "must not truncate when there is no assistant item"
 
 
 async def test_barge_in_after_the_response_finished_does_not_cancel(bridged):

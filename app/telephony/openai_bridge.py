@@ -366,6 +366,10 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
                             # draining on the Plivo side, but there is no longer
                             # an active response to cancel (Bug C).
                             response_active = False
+                            # The FIRST response.done marks the opening (the AI
+                            # disclosure) as delivered, so barge-in is honoured
+                            # from here on. Idempotent — later calls are no-ops.
+                            call.mark_opening_delivered()
                             resp = event.get("response") or {}
                             status = resp.get("status")
                             if status in ("failed", "incomplete"):

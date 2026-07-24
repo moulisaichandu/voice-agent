@@ -201,6 +201,7 @@ async def test_interrupt_is_ignored_during_the_greeting_grace_window():
 async def test_interrupt_clears_once_the_grace_window_has_passed():
     ws = _FakePlivoWS()
     call = PlivoCall(ws, lead_id="lead-1", one_way=False)
+    call.mark_opening_delivered()   # the disclosure is done; barge-in is live
     await call.play(_LONG)
     call.grace_until = asyncio.get_running_loop().time() - 1
 
@@ -208,6 +209,26 @@ async def test_interrupt_clears_once_the_grace_window_has_passed():
 
     assert cleared is True
     assert ws.sent[-1]["event"] == "clearAudio"
+    assert call.play_end == 0.0
+
+
+async def test_barge_in_is_refused_until_the_opening_disclosure_is_delivered():
+    """The first agent response carries the legally-required AI disclosure. A
+    lead's reflexive "Hello?" must NOT cut it off, so barge-in is refused until
+    the bridge marks the opening delivered (on its response.done). This is the
+    protection whose absence caused a live [compliance] false-positive: the
+    lead's "హలో" truncated the disclosure mid-word, fragmenting the transcript."""
+    ws = _FakePlivoWS()
+    call = PlivoCall(ws, lead_id="lead-1", one_way=False)
+    await call.play(_LONG)   # the opening disclosure is playing
+
+    assert await call.interrupt() is False, "the disclosure must not be interruptible"
+    assert call.play_end > 0.0, "the opening audio keeps playing through a barge-in"
+    assert not any(m["event"] == "clearAudio" for m in ws.sent)
+
+    call.mark_opening_delivered()   # the opening's response.done arrived
+
+    assert await call.interrupt() is True, "barge-in is live once the opening is delivered"
     assert call.play_end == 0.0
 
 

@@ -144,6 +144,16 @@ class PlivoCall:
         # an acknowledgement, not an interruption. Cancelling the greeting on it
         # made the agent restart from the top. Barge-in is live after this.
         self.grace_until: float = 0.0
+        # The FIRST agent response carries the legally-required AI disclosure.
+        # Barge-in is refused entirely until the bridge marks that response
+        # delivered (on its response.done), so a lead's reflexive "Hello?"
+        # cannot cut the disclosure off mid-sentence — which on a live call
+        # fragmented the transcript and fired a false [compliance] alert.
+        # OpenAI Realtime streams audio at ~speaking pace, so response.done for
+        # the opening arrives ≈ when its audio has played out, making this a
+        # sound "the disclosure has been heard" signal. Only consulted by
+        # interrupt(), which a one-way call never reaches.
+        self._opening_pending: bool = True
         # Whether ANY agent audio has arrived yet. Tracked separately from
         # play_end because that starts at 0.0, which the one-way watchdog
         # cannot tell apart from "the message already finished playing" — it
@@ -238,9 +248,21 @@ class PlivoCall:
         await self.ws.send_text(json.dumps(msg))
         self.play_end = 0.0
 
+    def mark_opening_delivered(self) -> None:
+        """The opening agent response — which carries the AI disclosure — has
+        been delivered, so barge-in may now interrupt later turns. The bridge
+        calls this on the opening's response.done. Idempotent."""
+        self._opening_pending = False
+
     async def interrupt(self) -> bool:
-        """Honour barge-in, except during the greeting window. Returns whether
-        the buffered audio was actually dropped."""
+        """Honour barge-in, except while the opening disclosure is still being
+        delivered or during the greeting window. Returns whether the buffered
+        audio was actually dropped."""
+        if self._opening_pending:
+            # Never truncate the opening line: it carries the legally-required
+            # AI disclosure. Cleared by mark_opening_delivered() on the opening
+            # response's response.done — see the field's comment.
+            return False
         if self._loop.time() < self.grace_until:
             return False
         await self.clear()
