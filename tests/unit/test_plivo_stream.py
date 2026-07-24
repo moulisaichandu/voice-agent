@@ -276,6 +276,38 @@ async def test_played_ms_resets_for_a_fresh_response_after_a_clear():
     assert call.played_ms() < 100, "the new response's clock must start at zero"
 
 
+async def test_played_ms_measures_only_the_current_item_across_a_response_boundary():
+    """REGRESSION (Bug B): the tool-call flow queues a SECOND response's audio
+    back-to-back with the first, with NO lead turn (and so no gap) between them.
+    They share one contiguous Plivo segment but are separate OpenAI items. Once
+    the bridge marks the boundary, played_ms must measure only the current item —
+    otherwise it spans both, and a barge-in truncate names the second item with
+    an audio_end_ms longer than that item's audio, which the API rejects
+    ('Audio content of Nms is already shorter than Mms')."""
+    call = PlivoCall(_FakePlivoWS(), lead_id="lead-1", one_way=False)
+    await call.play(_LONG)                 # response A: 0.6s queued
+    call.mark_response_boundary()          # response B begins back-to-back...
+    await call.play(_mulaw(0.2))           # response B: 0.2s, queued immediately
+
+    # Simulate 0.8s of real playback elapsing: all of A (0.6s) plus 0.2s of B.
+    # Backdate both endpoints so their relationship is preserved.
+    call.play_start -= 0.8
+    call.play_end -= 0.8
+
+    # The lead has heard ~0.2s of the CURRENT item (B), not ~0.8s across both.
+    assert 150 <= call.played_ms() <= 250
+
+
+async def test_mark_response_boundary_is_a_noop_for_the_very_first_response():
+    """Marking a boundary before any audio has played must behave exactly like
+    the normal first-chunk case — the segment starts 'now'. This keeps the first
+    greeting response's clock correct whether or not the bridge marks it."""
+    call = PlivoCall(_FakePlivoWS(), lead_id="lead-1", one_way=False)
+    call.mark_response_boundary()
+    await call.play(_LONG)                 # first audio, nothing queued before it
+    assert call.played_ms() < 100
+
+
 # ── exit bookkeeping ─────────────────────────────────────────────────────────
 
 async def test_the_first_exit_reason_wins():

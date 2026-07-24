@@ -131,6 +131,15 @@ class PlivoCall:
         # truncate that follows needs the amount heard, and play_end is gone by
         # then. See played_ms().
         self._interrupted_ms: int = 0
+        # Set when the next audio chunk begins a NEW response item. The tool-call
+        # flow queues a second response's audio back-to-back with the first, with
+        # no lead turn (and so no play_end gap) between them: without this flag
+        # play() would treat the two as one contiguous segment, and played_ms()
+        # would measure across BOTH. A barge-in into the second response would
+        # then report more audio than that item contains, so the truncate
+        # overshoots the item it names and the API rejects it. See
+        # mark_response_boundary() and played_ms().
+        self._segment_boundary_pending: bool = False
         # The lead's first sound on an outbound call is almost always "Hello?" —
         # an acknowledgement, not an interruption. Cancelling the greeting on it
         # made the agent restart from the top. Barge-in is live after this.
@@ -170,7 +179,14 @@ class PlivoCall:
                       "payload": payload_b64},
         }))
         now = self._loop.time()
-        if self.play_end <= now:
+        if self._segment_boundary_pending:
+            # A new response item begins: its playback clock starts where the
+            # previous item's queued audio ends (max(now, play_end)) — not
+            # carried over from the previous item, and not "now" if that item's
+            # audio is still draining ahead of it.
+            self.play_start = max(now, self.play_end)
+            self._segment_boundary_pending = False
+        elif self.play_end <= now:
             # The queue had drained (or was cleared): this chunk begins a fresh
             # contiguous segment, so playback of it starts now, not after some
             # already-finished earlier audio.
@@ -178,6 +194,16 @@ class PlivoCall:
         dur = (len(payload_b64) * 3 / 4) / _ULAW_BYTES_PER_S
         self.play_end = max(self.play_end, now) + dur
         self.audio_seen = True
+
+    def mark_response_boundary(self) -> None:
+        """Tell the call that the next audio chunk starts a NEW response item.
+
+        The tool-call flow queues a second response's audio back-to-back with
+        the first; the voice backend calls this between them so the playback
+        clock (play_start) restarts at the new item, and played_ms() measures
+        only that item rather than spanning both. See the field's comment and
+        played_ms()."""
+        self._segment_boundary_pending = True
 
     def played_ms(self) -> int:
         """How many milliseconds of the CURRENT response actually reached the

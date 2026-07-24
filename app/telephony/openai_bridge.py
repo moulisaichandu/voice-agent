@@ -244,6 +244,17 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
     # events that carry it. Barge-in truncation needs it to tell the model which
     # item to trim to what the lead actually heard.
     last_item_id: str | None = None
+    # Whether an OpenAI response is currently in progress. A barge-in may only
+    # send response.cancel while one is: cancelling after response.done has
+    # arrived (its audio still draining on the Plivo side) is rejected as
+    # response_cancel_not_active. Set on any assistant output event, cleared on
+    # response.done.
+    response_active = False
+    # The assistant item whose audio is currently playing out. When a NEW item's
+    # audio begins (the tool-call flow queues one back-to-back with the last),
+    # the playback clock must restart or played_ms() spans both items and the
+    # barge-in truncate overshoots the one it names — see PlivoCall.played_ms().
+    audio_seg_item: str | None = None
 
     url = _REALTIME_URL.format(model=OPENAI_REALTIME_MODEL)
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
@@ -285,7 +296,7 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
 
             # ── OpenAI → Plivo ───────────────────────────────────────────────
             async def from_openai() -> None:
-                nonlocal last_item_id
+                nonlocal last_item_id, response_active, audio_seg_item
                 try:
                     async for raw in oa:
                         if call.stop.is_set():
@@ -323,6 +334,9 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
                         # silently win by omission the way the old logic did.
                         # Do NOT "simplify" this back to a blanket update.
                         if etype in _ASSISTANT_ITEM_EVENTS:
+                            # Any assistant output event means a response is in
+                            # progress — see response_active's comment (Bug C).
+                            response_active = True
                             item_id = event.get("item_id")
                             if item_id:
                                 last_item_id = item_id
@@ -331,6 +345,16 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
                                      "response.audio.delta"):
                             delta = event.get("delta")
                             if delta:
+                                item_id = event.get("item_id")
+                                if (item_id and audio_seg_item is not None
+                                        and item_id != audio_seg_item):
+                                    # A new response's audio begins back-to-back
+                                    # with the last (the tool-call flow): restart
+                                    # the playback clock so a barge-in truncate
+                                    # measures only this item (Bug B).
+                                    call.mark_response_boundary()
+                                if item_id:
+                                    audio_seg_item = item_id
                                 await call.play(delta)
                         elif etype in ("response.output_audio_transcript.delta",
                                        "response.audio_transcript.delta"):
@@ -338,6 +362,10 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
                             if piece:
                                 agent_text.append(piece)
                         elif etype == "response.done":
+                            # The response is finished; its audio may still be
+                            # draining on the Plivo side, but there is no longer
+                            # an active response to cancel (Bug C).
+                            response_active = False
                             resp = event.get("response") or {}
                             status = resp.get("status")
                             if status in ("failed", "incomplete"):
@@ -411,13 +439,23 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
                             # bug (its ARCHITECTURE.md:268-276); we must not
                             # inherit it.
                             if await call.interrupt():
-                                await oa.send(json.dumps({"type": "response.cancel"}))
-                                await oa.send(json.dumps({
-                                    "type": "conversation.item.truncate",
-                                    "item_id": last_item_id,
-                                    "content_index": 0,
-                                    "audio_end_ms": call.played_ms(),
-                                }))
+                                # Only cancel a response that is actually in
+                                # progress — cancelling a finished one is
+                                # rejected as response_cancel_not_active (Bug C).
+                                if response_active:
+                                    await oa.send(json.dumps(
+                                        {"type": "response.cancel"}))
+                                    response_active = False
+                                # Only truncate a real assistant item. Before the
+                                # model has produced one, last_item_id is None,
+                                # and a null item_id is rejected outright (Bug A).
+                                if last_item_id is not None:
+                                    await oa.send(json.dumps({
+                                        "type": "conversation.item.truncate",
+                                        "item_id": last_item_id,
+                                        "content_index": 0,
+                                        "audio_end_ms": call.played_ms(),
+                                    }))
                         elif etype == "error":
                             logger.error(f"[openai] lead={lead_id} error event: "
                                          f"{event.get('error') or event}")

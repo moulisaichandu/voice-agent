@@ -477,6 +477,93 @@ async def test_barge_in_truncate_names_the_current_item(bridged):
     assert isinstance(truncate["audio_end_ms"], int)
 
 
+async def test_barge_in_before_any_assistant_audio_does_not_truncate_a_null_item(bridged):
+    """REGRESSION (Bug A): if the lead speaks before the model has produced any
+    audio item, there is no assistant item to trim. The old code sent
+    conversation.item.truncate with item_id=null anyway, which the API rejects
+    ('Invalid type for item_id: expected a string, but got null') — so the
+    truncate silently did nothing and the model's belief was never corrected.
+    The barge-in must skip the truncate rather than emit a null id.
+
+    speech_started carries a user item_id, but that is NOT in the assistant
+    whitelist, so last_item_id stays None — exactly the state that produced the
+    null truncate in the live logs."""
+    oa = _FakeOpenAIWS([
+        json.dumps({"type": "input_audio_buffer.speech_started",
+                    "item_id": "item-user-1"}),
+    ])
+    bridged(oa)
+    await asyncio.wait_for(
+        openai_bridge.bridge(_FakePlivoWS(), agent_id="x", lead_id="l",
+                             language="te", one_way=False),
+        timeout=5,
+    )
+    truncates = [json.loads(s) for s in oa.sent
+                 if json.loads(s).get("type") == "conversation.item.truncate"]
+    assert truncates == [], "must not truncate when there is no assistant item yet"
+
+
+async def test_barge_in_after_the_response_finished_does_not_cancel(bridged):
+    """REGRESSION (Bug C): when the response has already completed (response.done)
+    but its audio is still draining on the Plivo side, a barge-in has no active
+    response to cancel. The old code sent response.cancel unconditionally, which
+    the API rejects ('Cancellation failed: no active response found'). The
+    truncate must still fire to correct the model's belief; only the cancel is
+    skipped."""
+    oa = _FakeOpenAIWS([
+        json.dumps({"type": "response.output_audio.delta",
+                    "delta": _AUDIO_B64, "item_id": "item-agent-1"}),
+        _response_done(),
+        json.dumps({"type": "input_audio_buffer.speech_started",
+                    "item_id": "item-user-1"}),
+    ])
+    bridged(oa)
+    await asyncio.wait_for(
+        openai_bridge.bridge(_FakePlivoWS(), agent_id="x", lead_id="l",
+                             language="te", one_way=False),
+        timeout=5,
+    )
+    types = [json.loads(s).get("type") for s in oa.sent]
+    assert "response.cancel" not in types, "no active response to cancel after response.done"
+    assert "conversation.item.truncate" in types, "the model's belief must still be corrected"
+
+
+async def test_a_new_response_items_audio_marks_a_playback_boundary(bridged, monkeypatch):
+    """REGRESSION (Bug B): the tool-call flow queues a second response's audio
+    back-to-back with the first (no lead turn between). Both share one Plivo
+    playback segment but are separate OpenAI items, so a barge-in into the second
+    reported the elapsed time across BOTH — overshooting the item the truncate
+    names ('Audio content of Nms is already shorter than Mms'). The bridge must
+    tell PlivoCall a new item's audio has begun, so its playback clock restarts.
+
+    One boundary is marked between two DISTINCT audio items — not between deltas
+    of the same item."""
+    boundaries = []
+    real = openai_bridge.plivo_stream.PlivoCall.mark_response_boundary
+
+    def spy(self):
+        boundaries.append(True)
+        return real(self)
+
+    monkeypatch.setattr(openai_bridge.plivo_stream.PlivoCall,
+                        "mark_response_boundary", spy)
+    oa = _FakeOpenAIWS([
+        json.dumps({"type": "response.output_audio.delta",
+                    "delta": _AUDIO_B64, "item_id": "item-A"}),
+        json.dumps({"type": "response.output_audio.delta",
+                    "delta": _AUDIO_B64, "item_id": "item-A"}),   # same item
+        json.dumps({"type": "response.output_audio.delta",
+                    "delta": _AUDIO_B64, "item_id": "item-B"}),   # new item
+    ])
+    bridged(oa)
+    await asyncio.wait_for(
+        openai_bridge.bridge(_FakePlivoWS(), agent_id="x", lead_id="l",
+                             language="te", one_way=False),
+        timeout=5,
+    )
+    assert len(boundaries) == 1, "one boundary between the two distinct items"
+
+
 async def test_a_two_way_call_also_cues_the_model_to_speak_first(bridged):
     """REGRESSION: this used to rely on server_vad alone, so the model never
     spoke until the LEAD did — backwards for an outbound call, where the AI
