@@ -154,6 +154,30 @@ async def test_the_session_pins_mulaw_both_directions(bridged):
     assert audio["output"]["format"]["type"] == "audio/pcmu"
 
 
+def test_the_configured_voice_is_applied_to_the_session(monkeypatch):
+    """OPENAI_REALTIME_VOICE selects the Telugu voice (e.g. 'marin'). It reaches
+    the model only through the session's output config, so this pins that wiring
+    — a call whose config silently dropped the voice would fall back to the API
+    default with no error."""
+    monkeypatch.setattr(openai_bridge, "OPENAI_REALTIME_VOICE", "marin")
+    for one_way in (True, False):
+        output = openai_bridge._session_update(
+            lead_name=None, script=None, language_style=None, one_way=one_way,
+        )["session"]["audio"]["output"]
+        assert output["voice"] == "marin"
+
+
+def test_a_blank_voice_omits_the_key_and_uses_the_api_default(monkeypatch):
+    """Blank means "let the API pick" (config.py's documented default). The
+    session must then omit `voice` entirely rather than send an empty string,
+    which the API would reject."""
+    monkeypatch.setattr(openai_bridge, "OPENAI_REALTIME_VOICE", "")
+    output = openai_bridge._session_update(
+        lead_name=None, script=None, language_style=None, one_way=True,
+    )["session"]["audio"]["output"]
+    assert "voice" not in output
+
+
 async def test_the_script_is_given_as_content_not_words_to_recite(bridged):
     """A script written in English must be CONVEYED in Telugu, not read out in
     English. The sibling hit exactly this: leads got an English call from a
