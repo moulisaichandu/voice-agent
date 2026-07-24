@@ -49,6 +49,16 @@ _SENTENCE_END = re.compile(r"[.!?\n]")
 _GREETING_MAX_WORDS = 3
 _MAX_OPENING_CHARS = 200
 
+# Phrases that IDENTIFY the caller. A first sentence containing one names who
+# is calling — so it is NOT a bare greeting, no matter how few words it is, and
+# the disclosure has to be in it (module docstring, point 2). Without this, a
+# short caller-ID like "Digital Brolly here." was miscounted as a bare greeting
+# and rolled forward, letting the disclosure sit in the SECOND sentence — the
+# identify-first-disclose-later pattern the gate exists to reject. Brand names
+# (checked separately, below) count as identification too. Matched as whole
+# words, case-insensitively.
+_IDENTIFICATION_MARKERS = ("this is", "here", "calling", "on behalf of", "speaking")
+
 # Stripped before marker matching so the company's OWN name can't satisfy the
 # disclosure. Order matters only in that longer forms should precede shorter
 # ones. Matched case-insensitively as whole words.
@@ -106,10 +116,21 @@ def _split_first_sentence(text: str) -> tuple[str, str]:
     return text[: match.start()], text[match.end() :]
 
 
+def _names_the_caller(sentence: str) -> bool:
+    """Whether *sentence* identifies who is calling — via the company's own
+    trading name or a self-identification phrase. Such a sentence is making a
+    substantive claim about the caller, so it cannot be a bare greeting."""
+    lowered = sentence.lower()
+    markers = _BRAND_NAMES + _IDENTIFICATION_MARKERS
+    return any(re.search(rf"\b{re.escape(m)}\b", lowered) for m in markers)
+
+
 def _is_bare_greeting(sentence: str) -> bool:
     """True for an opener that asserts nothing — "Namaste!", "Hello there!".
     Once a sentence names the caller it is no longer bare, and the disclosure
-    belongs in it."""
+    belongs in it — so a caller identification is never bare, however short."""
+    if _names_the_caller(sentence):
+        return False
     return len(sentence.split()) <= _GREETING_MAX_WORDS
 
 

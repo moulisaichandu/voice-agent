@@ -65,6 +65,36 @@ def test_a_substantive_first_sentence_must_carry_the_disclosure_itself():
     ) is False
 
 
+def test_a_short_caller_identification_is_not_a_bare_greeting():
+    """REGRESSION. A first sentence that NAMES the caller is not a bare
+    greeting, no matter how few words it is — the module's contract is "once a
+    sentence names the caller the disclosure belongs in it." A 3-word company
+    identification ("Digital Brolly here.") used to be counted as bare and
+    rolled forward, letting the disclosure sit in the SECOND sentence — the
+    exact identify-first-disclose-later pattern the gate exists to reject."""
+    assert has_ai_disclosure(
+        "Digital Brolly here. This is an automated AI call about our course."
+    ) is False
+
+
+def test_a_short_self_identification_without_a_brand_name_is_not_bare():
+    """"Brolly here" names the caller without matching a full brand string, so
+    the word-count check alone would still miss it; the self-identification
+    marker ("here") is what catches it."""
+    assert has_ai_disclosure(
+        "Brolly here. This is an automated AI call about our course."
+    ) is False
+
+
+def test_a_pure_greeting_still_rolls_forward_to_the_disclosure():
+    """The tightening must not regress the legitimate roll-forward: a first
+    sentence that is ONLY a greeting (names no caller) still lets the
+    disclosure be the immediate next sentence."""
+    assert has_ai_disclosure(
+        "Good morning! This is an automated AI call from Digital Brolly."
+    ) is True
+
+
 def test_none_script_fails():
     assert has_ai_disclosure(None) is False
 
