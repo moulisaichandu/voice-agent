@@ -146,19 +146,46 @@ async def sheets_sync() -> None:
         pass  # Redis itself may be what's down; the log line above still landed
 
 
+_WRITEBACK_QUEUE = "sheets:writeback:queue"
+# Reserve-then-ack processing list, mirroring the calls worker's BLMOVE pattern
+# (app/telephony/worker.py). A lead_id is moved here BEFORE its write-back runs
+# and only removed after the write-back succeeds or is re-queued, so a crash
+# mid-drain leaves it recoverable instead of dropping the Sheet write-back.
+_WRITEBACK_PROCESSING = "sheets:writeback:processing"
+
+
 async def transcript_reconcile() -> None:
-    """Drains up to _WRITEBACK_BATCH_SIZE lead_ids from sheets:writeback:queue,
-    writing each one's latest call outcome back to their Sheet row. A failed
-    write (row/phone unresolvable, Sheets API error) re-queues the lead_id for
-    the next run rather than dropping it."""
+    """Drain up to _WRITEBACK_BATCH_SIZE lead_ids from sheets:writeback:queue,
+    writing each one's latest call outcome back to their Sheet row.
+
+    Reserve-then-ack, not rpop: the old code popped a whole batch off the queue
+    at once (at-most-once), so a crash/restart mid-drain permanently lost those
+    Sheet write-backs — the calls worker uses BLMOVE+ack+reaper to avoid exactly
+    this. Here each lead_id is reserved onto a processing list before its
+    write-back and removed only after success (or an explicit re-queue). A run
+    first reclaims anything a previous crashed run stranded in the processing
+    list. write_back_lead overwrites the Sheet row idempotently, so an
+    at-least-once re-run after a crash-between-write-and-ack is harmless."""
     r = redis_client.get_redis()
-    raw = await r.rpop("sheets:writeback:queue", _WRITEBACK_BATCH_SIZE)
-    if not raw:
-        return
-    lead_ids = raw if isinstance(raw, list) else [raw]
+
+    # Reclaim items a previous crashed run left mid-flight. Only one instance of
+    # this job runs at a time (APScheduler max_instances=1), so nothing else is
+    # holding them.
+    while await r.lmove(_WRITEBACK_PROCESSING, _WRITEBACK_QUEUE, "LEFT", "RIGHT"):
+        pass
+
+    # Reserve a fixed snapshot of up to BATCH ids into the processing list FIRST,
+    # so a failure re-queued below is retried on the NEXT run, not re-processed
+    # in a hot loop this run.
+    reserved: list[str] = []
+    for _ in range(_WRITEBACK_BATCH_SIZE):
+        lead_id_str = await r.lmove(_WRITEBACK_QUEUE, _WRITEBACK_PROCESSING, "RIGHT", "LEFT")
+        if lead_id_str is None:
+            break
+        reserved.append(lead_id_str)
 
     ok, failed = 0, 0
-    for lead_id_str in lead_ids:
+    for lead_id_str in reserved:
         try:
             success = await sheets_writeback.write_back_lead(UUID(lead_id_str))
         except Exception as exc:
@@ -169,7 +196,10 @@ async def transcript_reconcile() -> None:
             ok += 1
         else:
             failed += 1
-            await r.lpush("sheets:writeback:queue", lead_id_str)
+            await r.lpush(_WRITEBACK_QUEUE, lead_id_str)  # retry on the next run
+        # Ack: remove from the processing list now that it is either done or
+        # safely back on the queue.
+        await r.lrem(_WRITEBACK_PROCESSING, 1, lead_id_str)
 
     if ok or failed:
         logger.info(f"[scheduler] transcript_reconcile: {ok} written back, "

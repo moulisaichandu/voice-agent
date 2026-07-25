@@ -155,20 +155,45 @@ async def test_dnd_refresh_is_a_noop_with_no_flagged_leads(monkeypatch):
     assert sadd_calls == []
 
 
-class _FakeRedisQueue:
-    def __init__(self, items):
-        self._items = items
-        self.lpush_calls = []
+_WB_QUEUE = "sheets:writeback:queue"
+_WB_PROCESSING = "sheets:writeback:processing"
 
-    async def rpop(self, key, count=None):
-        if not self._items:
-            return None
-        n = len(self._items) if count is None else min(count, len(self._items))
-        popped, self._items = self._items[:n], self._items[n:]
-        return popped
+
+class _FakeRedisQueue:
+    """Models the two lists transcript_reconcile uses (the write-back queue and
+    its processing list) with real lmove/lrem/lpush semantics — index 0 is the
+    head (LEFT), index -1 the tail (RIGHT)."""
+
+    def __init__(self, items):
+        # `items` seeds the queue.
+        self._lists = {_WB_QUEUE: list(items), _WB_PROCESSING: []}
+        self.lpush_calls = []  # values pushed back onto the QUEUE (re-queues)
 
     async def lpush(self, key, value):
-        self.lpush_calls.append(value)
+        self._lists.setdefault(key, []).insert(0, value)
+        if key == _WB_QUEUE:
+            self.lpush_calls.append(value)
+
+    async def lmove(self, src, dst, src_pos, dst_pos):
+        s = self._lists.setdefault(src, [])
+        if not s:
+            return None
+        elem = s.pop(0) if src_pos.upper() == "LEFT" else s.pop()
+        d = self._lists.setdefault(dst, [])
+        d.insert(0, elem) if dst_pos.upper() == "LEFT" else d.append(elem)
+        return elem
+
+    async def lrem(self, key, count, value):
+        lst = self._lists.setdefault(key, [])
+        removed = 0
+        i = 0
+        while i < len(lst) and (count == 0 or removed < count):
+            if lst[i] == value:
+                lst.pop(i)
+                removed += 1
+            else:
+                i += 1
+        return removed
 
 
 async def test_sheets_sync_job_delegates_and_survives_failure(monkeypatch):
@@ -203,6 +228,31 @@ async def test_transcript_reconcile_writes_back_and_requeues_failures(monkeypatc
     await scheduler.transcript_reconcile()
 
     assert r.lpush_calls == [fail_id]  # only the failure is requeued
+
+
+async def test_transcript_reconcile_reclaims_items_stranded_by_a_crash(monkeypatch):
+    """REGRESSION: the drain used to rpop a whole batch at once (at-most-once),
+    so a crash mid-write-back permanently dropped those Sheet write-backs. Items
+    are now reserved onto a processing list and removed only after success, so a
+    previous crashed run's in-flight item is reclaimed and retried next run."""
+    stranded = str(uuid4())
+    r = _FakeRedisQueue([])
+    # A previous run reserved this id into 'processing', then crashed before ack.
+    await r.lpush(_WB_PROCESSING, stranded)
+    monkeypatch.setattr(scheduler.redis_client, "get_redis", lambda: r)
+
+    written = []
+
+    async def fake_write_back(lead_id):
+        written.append(str(lead_id))
+        return True
+
+    monkeypatch.setattr(scheduler.sheets_writeback, "write_back_lead", fake_write_back)
+
+    await scheduler.transcript_reconcile()
+
+    assert written == [stranded], "a stranded write-back must be reclaimed and retried"
+    assert r._lists[_WB_PROCESSING] == [], "and acked out of the processing list"
 
 
 async def test_transcript_reconcile_degrades_gracefully_on_malformed_lead_id(monkeypatch):
