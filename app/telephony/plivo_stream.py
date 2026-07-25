@@ -103,7 +103,8 @@ class PlivoCall:
     for the outbound one, and `run` to supervise the whole thing.
     """
 
-    def __init__(self, ws: WebSocket, *, lead_id: str, one_way: bool = False) -> None:
+    def __init__(self, ws: WebSocket, *, lead_id: str, one_way: bool = False,
+                 protect_opening: bool = False) -> None:
         self.ws = ws
         self.lead_id = lead_id
         self.one_way = one_way
@@ -144,16 +145,22 @@ class PlivoCall:
         # an acknowledgement, not an interruption. Cancelling the greeting on it
         # made the agent restart from the top. Barge-in is live after this.
         self.grace_until: float = 0.0
-        # The FIRST agent response carries the legally-required AI disclosure.
-        # Barge-in is refused entirely until the bridge marks that response
-        # delivered (on its response.done), so a lead's reflexive "Hello?"
-        # cannot cut the disclosure off mid-sentence — which on a live call
-        # fragmented the transcript and fired a false [compliance] alert.
-        # OpenAI Realtime streams audio at ~speaking pace, so response.done for
-        # the opening arrives ≈ when its audio has played out, making this a
-        # sound "the disclosure has been heard" signal. Only consulted by
+        # OPT-IN opening-disclosure protection (protect_opening). When enabled,
+        # barge-in is refused until the bridge marks the opening response
+        # delivered (mark_opening_delivered), so a lead's reflexive "Hello?"
+        # cannot cut the legally-required disclosure off mid-sentence — which on
+        # a live OpenAI call fragmented the transcript and fired a false
+        # [compliance] alert. OpenAI Realtime streams audio at ~speaking pace, so
+        # response.done for the opening arrives ≈ when its audio has played out,
+        # making it a sound "the disclosure has been heard" signal.
+        #
+        # It is OPT-IN, not default-on: only a backend that ALSO calls
+        # mark_opening_delivered() may enable it, or interrupt() would return
+        # False forever and barge-in would be permanently dead. The ElevenLabs
+        # bridge does not signal it and so does not opt in (its disclosure is
+        # protected only by the greeting-grace window). Only consulted by
         # interrupt(), which a one-way call never reaches.
-        self._opening_pending: bool = True
+        self._opening_pending: bool = protect_opening
         # Whether ANY agent audio has arrived yet. Tracked separately from
         # play_end because that starts at 0.0, which the one-way watchdog
         # cannot tell apart from "the message already finished playing" — it

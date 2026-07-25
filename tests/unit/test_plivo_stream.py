@@ -212,6 +212,21 @@ async def test_interrupt_clears_once_the_grace_window_has_passed():
     assert call.play_end == 0.0
 
 
+async def test_barge_in_works_immediately_without_opening_protection():
+    """REGRESSION: the opening-disclosure guard is OPT-IN (protect_opening). A
+    call that does not opt in — e.g. the ElevenLabs bridge — must honour barge-in
+    right away, with no mark_opening_delivered() signal. This guards the
+    regression where the guard defaulted ON and silently killed barge-in on the
+    ElevenLabs backend (interrupt() returned False forever)."""
+    ws = _FakePlivoWS()
+    call = PlivoCall(ws, lead_id="lead-1", one_way=False)  # NOT opted in
+    await call.play(_LONG)
+
+    assert await call.interrupt() is True, "barge-in must work without opt-in protection"
+    assert call.play_end == 0.0
+    assert any(m["event"] == "clearAudio" for m in ws.sent)
+
+
 async def test_barge_in_is_refused_until_the_opening_disclosure_is_delivered():
     """The first agent response carries the legally-required AI disclosure. A
     lead's reflexive "Hello?" must NOT cut it off, so barge-in is refused until
@@ -219,7 +234,7 @@ async def test_barge_in_is_refused_until_the_opening_disclosure_is_delivered():
     protection whose absence caused a live [compliance] false-positive: the
     lead's "హలో" truncated the disclosure mid-word, fragmenting the transcript."""
     ws = _FakePlivoWS()
-    call = PlivoCall(ws, lead_id="lead-1", one_way=False)
+    call = PlivoCall(ws, lead_id="lead-1", one_way=False, protect_opening=True)
     await call.play(_LONG)   # the opening disclosure is playing
 
     assert await call.interrupt() is False, "the disclosure must not be interruptible"

@@ -237,7 +237,12 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
         logger.error("[openai] OPENAI_API_KEY is not set — cannot bridge the call.")
         return outcome
     variables = dynamic_variables or {}
-    call = plivo_stream.PlivoCall(plivo_ws, lead_id=lead_id, one_way=one_way)
+    # Opt into opening-disclosure protection on two-way calls: this backend
+    # signals mark_opening_delivered() on the first response.done, so the guard
+    # is safe to enable here (see PlivoCall.__init__). One-way never listens, so
+    # it neither needs nor enables it.
+    call = plivo_stream.PlivoCall(plivo_ws, lead_id=lead_id, one_way=one_way,
+                                  protect_opening=not one_way)
     turns: list[TranscriptTurn] = []
     agent_text: list[str] = []
     # The id of the response item currently being spoken, tracked from the

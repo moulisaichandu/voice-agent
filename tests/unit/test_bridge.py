@@ -170,6 +170,31 @@ async def test_a_two_way_call_is_not_ended_by_the_watchdog(bridged, monkeypatch)
     assert elapsed >= 0.9, f"the call was ended early, after {elapsed:.2f}s"
 
 
+async def test_a_two_way_call_honours_barge_in_with_clearaudio(bridged, monkeypatch):
+    """REGRESSION: the ElevenLabs backend is the product's only two-way backend,
+    and the lead must be able to interrupt the agent. The opening-disclosure
+    guard added for the OpenAI path (_opening_pending, previously default-on) is
+    cleared only by mark_opening_delivered(), which this bridge never calls — so
+    interrupt() returned False on EVERY turn and clearAudio was never sent,
+    killing barge-in for the whole call. An `interruption` event after some audio
+    must drop the buffered agent speech (clearAudio)."""
+    monkeypatch.setattr(plivo_stream, "CALL_MAX_DURATION_S", 1)
+    el_ws = _FakeElevenLabsWS([
+        _metadata(), _audio(),
+        json.dumps({"type": "interruption", "interruption_event": {}}),
+    ])
+    bridged(el_ws)
+    plivo_ws = _FakePlivoWS()
+
+    await asyncio.wait_for(
+        bridge.bridge(plivo_ws, agent_id="agent_1", lead_id="lead-1", one_way=False),
+        timeout=5,
+    )
+
+    assert any(m["event"] == "clearAudio" for m in plivo_ws.sent), \
+        "barge-in must drop the buffered agent audio (clearAudio) on the ElevenLabs path"
+
+
 async def test_a_mid_call_failure_still_yields_what_was_collected(bridged):
     """REGRESSION. bridge()'s results used to be reachable only through its
     return value, and call_routes kept its own default dict — so an exception
