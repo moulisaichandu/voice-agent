@@ -48,25 +48,22 @@ async def test_ingest_document_embeds_and_stores_each_chunk(tmp_path, monkeypatc
     p = tmp_path / "course.txt"
     p.write_text("x" * 2500, encoding="utf-8")
 
-    inserted = []
-    cleared = []
+    replaced = []
 
-    async def fake_clear_doc(doc_name):
-        cleared.append(doc_name)
+    async def fake_replace(doc_name, rows):
+        replaced.append((doc_name, rows))
 
-    async def fake_insert_chunk(*, doc_name, section, content, embedding):
-        inserted.append((doc_name, content, embedding))
-
-    monkeypatch.setattr(ingest.rag_store, "clear_doc", fake_clear_doc)
-    monkeypatch.setattr(ingest.rag_store, "insert_chunk", fake_insert_chunk)
+    monkeypatch.setattr(ingest.rag_store, "replace_doc_chunks", fake_replace)
     monkeypatch.setattr(ingest, "embed_texts", lambda texts: [[0.1, 0.2]] * len(texts))
 
     n = await ingest.ingest_document(p)
 
     assert n == 3  # matches the chunking test above for the same 2500-char input
-    assert cleared == ["course.txt"]
-    assert len(inserted) == 3
-    assert all(doc_name == "course.txt" for doc_name, _, _ in inserted)
+    assert len(replaced) == 1
+    doc_name, rows = replaced[0]
+    assert doc_name == "course.txt"
+    assert len(rows) == 3
+    assert all(len(embedding) == 2 for _content, embedding in rows)
 
 
 async def test_ingest_document_clears_but_stores_nothing_for_blank_file(tmp_path, monkeypatch):
@@ -78,13 +75,42 @@ async def test_ingest_document_clears_but_stores_nothing_for_blank_file(tmp_path
     async def fake_clear_doc(doc_name):
         cleared.append(doc_name)
 
-    monkeypatch.setattr(ingest.rag_store, "clear_doc", fake_clear_doc)
-
     async def boom(*a, **kw):
-        raise AssertionError("insert_chunk must not be called for a blank document")
+        raise AssertionError("replace_doc_chunks must not be called for a blank document")
 
-    monkeypatch.setattr(ingest.rag_store, "insert_chunk", boom)
+    monkeypatch.setattr(ingest.rag_store, "clear_doc", fake_clear_doc)
+    monkeypatch.setattr(ingest.rag_store, "replace_doc_chunks", boom)
 
     n = await ingest.ingest_document(p)
     assert n == 0
     assert cleared == ["empty.txt"]
+
+
+async def test_ingest_leaves_chunks_intact_if_embedding_fails(tmp_path, monkeypatch):
+    """REGRESSION: re-ingest used to clear a doc's chunks BEFORE embedding, so an
+    embed failure (rate limit / 500 / rotated key) permanently wiped the doc's
+    corpus with no replacement — the live agent then answered 'no relevant
+    material' for that doc until a successful re-ingest. Embedding now happens
+    first, so a failure must not touch the store at all."""
+    p = tmp_path / "course.txt"
+    p.write_text("x" * 2500, encoding="utf-8")
+
+    touched = []
+
+    async def fake_clear(doc_name):
+        touched.append(("clear", doc_name))
+
+    async def fake_replace(doc_name, rows):
+        touched.append(("replace", doc_name))
+
+    def boom(texts):
+        raise RuntimeError("OpenAI rate limit")
+
+    monkeypatch.setattr(ingest.rag_store, "clear_doc", fake_clear)
+    monkeypatch.setattr(ingest.rag_store, "replace_doc_chunks", fake_replace)
+    monkeypatch.setattr(ingest, "embed_texts", boom)
+
+    with pytest.raises(RuntimeError):
+        await ingest.ingest_document(p)
+
+    assert touched == [], "an embed failure must leave the existing chunks untouched"

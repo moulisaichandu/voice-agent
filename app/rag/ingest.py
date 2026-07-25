@@ -55,20 +55,31 @@ def read_document(path: Path) -> str:
 
 
 async def ingest_document(path: Path) -> int:
-    """Chunk + embed + store one document. Clears any existing chunks for this
-    doc_name first, so re-running ingestion doesn't accumulate stale duplicate
-    chunks from a previous version of the file. Returns the chunk count."""
+    """Chunk + embed + store one document, replacing any existing chunks for this
+    doc_name so re-running ingestion doesn't accumulate stale duplicates.
+    Returns the chunk count.
+
+    Order matters: the document is EMBEDDED before the store is touched, and the
+    old chunks are then replaced ATOMICALLY (see rag_store.replace_doc_chunks).
+    An earlier version cleared first and embedded second, so an embed failure
+    (rate limit / 500 / rotated key) permanently wiped the doc's corpus with no
+    replacement, and the live agent answered 'no relevant material' for it until
+    someone noticed."""
     text = read_document(path)
     chunks = chunk_text(text)
-    await rag_store.clear_doc(path.name)
     if not chunks:
+        # An emptied document: drop its old chunks, nothing to insert.
+        await rag_store.clear_doc(path.name)
         return 0
 
+    # Embed BEFORE touching the store: a failure here leaves the prior chunks
+    # intact rather than wiping the doc.
     embeddings = embed_texts(chunks)
-    for chunk, embedding in zip(chunks, embeddings, strict=True):
-        await rag_store.insert_chunk(
-            doc_name=path.name, section=None, content=chunk, embedding=embedding,
-        )
+    rows = [
+        (chunk, embedding)
+        for chunk, embedding in zip(chunks, embeddings, strict=True)
+    ]
+    await rag_store.replace_doc_chunks(path.name, rows)
     return len(chunks)
 
 
