@@ -18,6 +18,16 @@ _client: OpenAI | None = None
 # keeps any single request well under its size limits.
 _EMBED_BATCH = 96
 
+# The live /rag/search tool calls embed_text mid-conversation, so this MUST be
+# bounded: the SDK default is a 600s read timeout with 2 retries, so a slow or
+# hung OpenAI endpoint would occupy a ThreadPoolExecutor worker for ~20 minutes
+# (a hang is not an exception, so endpoint.py's degrade path never fires), and
+# ~32 concurrent hangs saturate the pool, stalling every other asyncio.to_thread
+# in the process. translate.py bounds the same live path at 6s; embeddings gets
+# a slightly larger ceiling since it may batch, plus a single retry.
+_EMBED_TIMEOUT_S = 8.0
+_EMBED_MAX_RETRIES = 1
+
 
 def _get_client() -> OpenAI:
     global _client
@@ -28,7 +38,8 @@ def _get_client() -> OpenAI:
                 "an OpenAI credential, separate from ElevenLabs; you likely "
                 "already have it from the ai-voice-agent project's backend/.env."
             )
-        _client = OpenAI(api_key=OPENAI_API_KEY)
+        _client = OpenAI(api_key=OPENAI_API_KEY, timeout=_EMBED_TIMEOUT_S,
+                         max_retries=_EMBED_MAX_RETRIES)
     return _client
 
 
