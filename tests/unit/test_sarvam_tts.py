@@ -218,6 +218,33 @@ async def test_no_api_key_raises_before_connecting(monkeypatch):
             pass
 
 
+async def test_the_completion_event_is_requested_explicitly(monkeypatch):
+    """REGRESSION, found on the first real call against the live API.
+
+    Sarvam only sends the {"event_type": "final"} frame if the connection asked
+    for it. Without send_completion_event=true it sends the audio and then
+    NOTHING — the socket simply sits open until the server kills it as idle
+    with a 408, which took 25s+ in testing.
+
+    speak() ends its stream on that event, so without this parameter every
+    utterance blocks for the server's idle timeout. One-way survives it (the
+    audio has already been played by then); two-way would stall on every
+    single sentence."""
+    monkeypatch.setattr(sarvam_tts, "SARVAM_API_KEY", "sk-test")
+    seen: dict = {}
+
+    async def fake_connect(url, headers):
+        seen["url"] = url
+        return _FakeSarvamWS([])
+
+    monkeypatch.setattr(sarvam_tts, "_connect", fake_connect)
+
+    async with sarvam_tts.SarvamTTS(language="te-IN"):
+        pass
+
+    assert "send_completion_event=true" in seen["url"]
+
+
 async def test_the_key_is_sent_as_the_subscription_header(monkeypatch):
     """Sarvam authenticates with Api-Subscription-Key, not a Bearer token."""
     monkeypatch.setattr(sarvam_tts, "SARVAM_API_KEY", "sk-test")

@@ -50,7 +50,18 @@ from app.config import (
 
 logger = logging.getLogger(__name__)
 
-_TTS_URL = "wss://api.sarvam.ai/text-to-speech/ws?model={model}"
+# send_completion_event=true is NOT optional, despite reading like a nicety.
+# Verified against the live API on 2026-07-27: without it Sarvam streams the
+# audio and then sends nothing at all — no terminating frame — and the socket
+# sits open until the server kills it as idle with a 408, 25s+ later. With it,
+# {"event_type": "final"} arrives about 0.6s after the last audio chunk.
+#
+# speak() ends its stream on that event, so omitting this makes every utterance
+# block for the server's idle timeout: survivable on a one-way call, where the
+# audio has already reached the lead, and fatal on a two-way one, where every
+# sentence of every turn would stall.
+_TTS_URL = ("wss://api.sarvam.ai/text-to-speech/ws"
+            "?model={model}&send_completion_event=true")
 
 # Mu-law at 8 kHz is one byte per sample, so a byte is 1/8 of a millisecond.
 # Milestone B's barge-in ledger uses this to work out how much of a sentence
