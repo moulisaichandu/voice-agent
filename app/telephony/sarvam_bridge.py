@@ -225,13 +225,22 @@ class _Conversation:
 
         A reply still being generated counts as activity: the lead is waiting
         for an answer, not sitting in a dead call.
+
+        So does audio that has been SENT but not yet HEARD. Sarvam's TTS
+        delivers far faster than real time — an eight-second answer arrives in
+        about three — so the send loop finishing means nothing about whether
+        the lead has stopped listening. PlivoCall.play_end is when the queued
+        audio actually runs out, which is the same accounting the one-way
+        watchdog drains against. Measuring from the send loop instead hung up
+        mid-sentence on a call that was working perfectly.
         """
         while not self.call.stop.is_set():
             await asyncio.sleep(_SILENCE_POLL_S)
             if self.reply_task is not None and not self.reply_task.done():
                 self.note_activity()
                 continue
-            if self._loop.time() - self.last_activity >= TWOWAY_MAX_SILENT_S:
+            quiet_since = max(self.last_activity, self.call.play_end)
+            if self._loop.time() - quiet_since >= TWOWAY_MAX_SILENT_S:
                 logger.info(
                     f"[sarvam] lead={self.lead_id} ending a conversation that "
                     f"has been silent for {TWOWAY_MAX_SILENT_S:.0f}s."

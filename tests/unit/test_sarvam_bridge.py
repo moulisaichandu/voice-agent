@@ -593,3 +593,41 @@ def test_a_conversation_that_went_quiet_counts_as_a_clean_exit():
     mark its lead failed, and burn a retry on someone who said goodbye."""
     from app.telephony import plivo_stream
     assert "twoway_silence" in plivo_stream._CLEAN_EXITS
+
+
+async def test_the_watchdog_waits_for_audio_to_finish_PLAYING(two_way, monkeypatch):
+    """REGRESSION, found by driving the real vendors end to end.
+
+    TTS delivers audio far faster than real time — an eight-second answer
+    arrives from Sarvam in about three. The watchdog measured silence from the
+    last frame SENT, so it started counting while the lead still had five
+    seconds of speech to hear, and with a short enough timeout it hung up
+    mid-sentence on a call that was working perfectly.
+
+    PlivoCall already knows when queued audio finishes playing (play_end, what
+    the one-way watchdog drains against). Silence has to be measured from
+    there, not from the send loop.
+    """
+    monkeypatch.setattr(sarvam_bridge, "TWOWAY_MAX_SILENT_S", 0.3)
+    monkeypatch.setattr(sarvam_bridge.plivo_stream, "CALL_MAX_DURATION_S", 30)
+    two_way([])
+
+    call = sarvam_bridge.plivo_stream.PlivoCall(
+        _FakePlivoWS(), lead_id="l", one_way=False, protect_opening=True)
+    convo = sarvam_bridge._Conversation(
+        call, lead_id="l", system_prompt="s", turns=[])
+
+    # Everything was sent a while ago, but there is still audio queued to play.
+    loop = asyncio.get_event_loop()
+    convo.last_activity = loop.time() - 60
+    call.play_end = loop.time() + 0.6
+
+    watch = asyncio.create_task(convo.watch_for_silence())
+    await asyncio.sleep(0.35)
+    assert not call.stop.is_set(), (
+        "hung up while the lead was still listening to queued audio"
+    )
+
+    await asyncio.wait_for(watch, timeout=5)
+    assert call.stop.is_set(), "should end once the audio has drained"
+    assert call.exit_reason == "twoway_silence"
