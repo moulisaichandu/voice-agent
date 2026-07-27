@@ -180,10 +180,18 @@ def two_way_instructions(lead_name: str | None, script: str | None,
         _BREVITY_RULE,
         _COURSE_FACTS_RULE,
         _STAY_ON_TOPIC_RULE,
-        "ENDING THE CALL: When the conversation is genuinely finished — they "
-        "have said goodbye, asked not to be called again, or have nothing "
-        "further to ask — say a short goodbye and call the end_call tool. Do "
-        "not keep a lead on the line who is trying to go.",
+        # Observed on the live API: told to "say a short goodbye and call the
+        # end_call tool", the model said the goodbye and did not call the tool.
+        # Nothing then ends the call, so it runs to CALL_MAX_DURATION_S — five
+        # minutes of billed airtime and silence at a lead who has already left.
+        # Saying goodbye and ending the call have to be ONE instruction, not a
+        # sentence containing both.
+        "ENDING THE CALL: Saying goodbye and calling the end_call tool are the "
+        "SAME action — never do one without the other. The moment the "
+        "conversation is finished (they say goodbye, ask not to be called "
+        "again, or have nothing further to ask), your reply must be a short "
+        "farewell AND a call to end_call in that same turn. A goodbye without "
+        "end_call leaves the lead holding a silent line.",
     ]
     if script and script.strip():
         parts.append(
