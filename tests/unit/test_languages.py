@@ -198,11 +198,29 @@ def test_every_catalogue_iso_is_either_speakable_or_knowingly_not():
 
 # ── which backend carries which language ─────────────────────────────────────
 
-def test_telugu_and_tinglish_route_to_openai():
+def test_telugu_and_tinglish_route_to_sarvam():
     """ElevenLabs cannot speak Telugu at all — see ELEVENLABS_AGENT_LANGUAGES.
-    Routing them anywhere else is what makes these campaigns dialable."""
+    Sarvam is where they go by default: its voices are Telugu-native, which is
+    the one thing the OpenAI Realtime backend could not offer at any price."""
+    assert languages.backend_for("te") == languages.SARVAM
+    assert languages.backend_for("tinglish") == languages.SARVAM
+
+
+def test_telugu_falls_back_to_openai_when_the_rollback_is_set(monkeypatch):
+    """TELUGU_BACKEND is the rollback switch. Replacing a live voice backend is
+    only a safe decision if reverting it is one .env line and a restart, so
+    this path has to keep working — openai_bridge.py is still on disk for it."""
+    monkeypatch.setattr(languages, "TELUGU_BACKEND", languages.OPENAI_REALTIME)
     assert languages.backend_for("te") == languages.OPENAI_REALTIME
     assert languages.backend_for("tinglish") == languages.OPENAI_REALTIME
+
+
+def test_the_rollback_never_moves_a_language_off_elevenlabs(monkeypatch):
+    """The switch is scoped to Telugu. English and Hindi campaigns are dialling
+    in production and must not move backend because of a Telugu rollback."""
+    monkeypatch.setattr(languages, "TELUGU_BACKEND", languages.OPENAI_REALTIME)
+    for token in ("auto", "en", "hi", "hinglish"):
+        assert languages.backend_for(token) == languages.ELEVENLABS
 
 
 def test_english_hindi_and_auto_stay_on_elevenlabs():
@@ -217,7 +235,7 @@ def test_every_catalogue_token_has_a_backend():
     a KeyError rather than a message anyone can act on."""
     for token in languages.TOKENS:
         assert languages.backend_for(token) in (
-            languages.ELEVENLABS, languages.OPENAI_REALTIME
+            languages.ELEVENLABS, languages.OPENAI_REALTIME, languages.SARVAM
         )
 
 
@@ -256,10 +274,96 @@ def test_backend_for_iso_agrees_with_backend_for_token():
             assert languages.backend_for_iso(iso) == languages.backend_for(token)
 
 
-def test_backend_for_iso_routes_telugu_to_openai():
+def test_backend_for_iso_routes_telugu_to_sarvam():
+    assert languages.backend_for_iso("te") == languages.SARVAM
+
+
+def test_backend_for_iso_follows_the_rollback_switch(monkeypatch):
+    """preflight() only ever holds the ISO code, so if this lookup ignored the
+    switch it would check Sarvam's prerequisites for a call OpenAI was about to
+    place — refusing every rolled-back Telugu campaign for a missing key that
+    the backend actually running does not need."""
+    monkeypatch.setattr(languages, "TELUGU_BACKEND", languages.OPENAI_REALTIME)
     assert languages.backend_for_iso("te") == languages.OPENAI_REALTIME
 
 
 def test_backend_for_iso_routes_hindi_and_none_to_elevenlabs():
     assert languages.backend_for_iso("hi") == languages.ELEVENLABS
+
+
+@pytest.mark.parametrize("telugu_backend", ["sarvam", "openai_realtime"])
+def test_tokens_sharing_an_iso_code_never_disagree_about_the_backend(
+    monkeypatch, telugu_backend
+):
+    """THE invariant backend_for_iso() rests on, pinned under both settings of
+    the rollback switch.
+
+    backend_for_iso() resolves an ISO code by finding a token that maps to it,
+    and 'te' and 'tinglish' both map to 'te'. If those two tokens could ever
+    name different backends, which one won would depend on catalogue order —
+    so preflight would silently validate one backend's prerequisites for a call
+    the other was about to place. Scoping TELUGU_BACKEND to both tokens at once
+    is what keeps that impossible; this test is what stops someone splitting
+    them later without noticing."""
+    monkeypatch.setattr(languages, "TELUGU_BACKEND", telugu_backend)
+    by_iso: dict[str, set[str]] = {}
+    for token in languages.TOKENS:
+        iso = languages.iso_code(token)
+        if iso:
+            by_iso.setdefault(iso, set()).add(languages.backend_for(token))
+    for iso, backends in by_iso.items():
+        assert len(backends) == 1, (
+            f"tokens for ISO {iso!r} disagree about the backend: {backends}"
+        )
+
+
+# ── two-way capability and human-readable names, per backend ─────────────────
+#
+# app/telephony/preflight.py and app/admin/campaigns.py both refuse a two-way
+# campaign on a backend that has not been proven on a live call. They used to
+# each hardcode OPENAI_TWOWAY_ENABLED and the words "OpenAI Realtime", which
+# silently became wrong for any third backend. Both now ask here.
+
+def test_elevenlabs_two_way_needs_no_flag():
+    """Two-way English/Hindi is what production runs today. A flag it could be
+    turned off by would be a way to break the working path by accident."""
+    assert languages.twoway_enabled(languages.ELEVENLABS) is True
+
+
+def test_sarvam_two_way_is_refused_until_a_live_call_proves_it(monkeypatch):
+    """A two-way call on an unproven backend connects, never speaks, never
+    listens, bills the full CALL_MAX_DURATION_S of silence, and is then
+    recorded as a SUCCESSFUL zero-turn call because max_duration counts as a
+    clean exit. That is why the flag defaults off."""
+    monkeypatch.setattr(languages, "SARVAM_TWOWAY_ENABLED", False)
+    assert languages.twoway_enabled(languages.SARVAM) is False
+    monkeypatch.setattr(languages, "SARVAM_TWOWAY_ENABLED", True)
+    assert languages.twoway_enabled(languages.SARVAM) is True
+
+
+def test_each_backend_reads_its_own_two_way_flag(monkeypatch):
+    """Enabling two-way on one backend must not enable it on the other. They
+    are separate implementations proven by separate live calls."""
+    monkeypatch.setattr(languages, "SARVAM_TWOWAY_ENABLED", True)
+    monkeypatch.setattr(languages, "OPENAI_TWOWAY_ENABLED", False)
+    assert languages.twoway_enabled(languages.SARVAM) is True
+    assert languages.twoway_enabled(languages.OPENAI_REALTIME) is False
+
+
+def test_an_unknown_backend_is_not_two_way_capable():
+    """Degrade to refusing, not to dialling. An unrecognised backend here means
+    a bug, and a lead should not take the consequences of it."""
+    assert languages.twoway_enabled("klingon_voice") is False
+
+
+def test_every_backend_has_a_name_an_operator_can_act_on():
+    """These strings land in the refusal message an operator reads in the
+    dashboard. 'sarvam' is a code constant; 'Sarvam' is an answer."""
+    for backend in (languages.ELEVENLABS, languages.OPENAI_REALTIME,
+                    languages.SARVAM):
+        assert languages.backend_display(backend) == {
+            languages.ELEVENLABS: "ElevenLabs",
+            languages.OPENAI_REALTIME: "OpenAI Realtime",
+            languages.SARVAM: "Sarvam",
+        }[backend]
     assert languages.backend_for_iso(None) == languages.ELEVENLABS

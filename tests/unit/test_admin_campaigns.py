@@ -438,7 +438,8 @@ def test_check_language_support_skips_elevenlabs_entirely_for_a_non_elevenlabs_b
 # ── two-way requires a backend that can hold a conversation ─────────────────
 #
 # openai_bridge (the Telugu/Tinglish backend) fully implements two-way
-# conversation, but OPENAI_TWOWAY_ENABLED gates real use on a human having
+# conversation, but each backend's own *_TWOWAY_ENABLED flag gates real use
+# on a human having
 # confirmed it on a live call first — the same discipline CLAUDE.md already
 # applies to AI disclosure and to mode never being inferred. With the flag
 # off (the default), routing a two-way campaign there is refused HERE, at
@@ -453,7 +454,7 @@ def test_create_campaign_rejects_twoway_telugu_with_a_next_step(client, monkeypa
 
     monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", boom)
     monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID", "agent_1")
-    monkeypatch.setattr(admin_campaigns.app_config, "OPENAI_TWOWAY_ENABLED", False)
+    monkeypatch.setattr(admin_campaigns.languages_module, "SARVAM_TWOWAY_ENABLED", False)
 
     r = client.post("/admin/campaigns", json={
         "name": "Telugu Twoway", "mode": "twoway", "language": "te",
@@ -467,7 +468,7 @@ def test_create_campaign_rejects_twoway_telugu_with_a_next_step(client, monkeypa
 
 
 def test_create_campaign_allows_twoway_telugu_once_the_flag_is_enabled(client, monkeypatch):
-    """The flip side: OPENAI_TWOWAY_ENABLED=true is the operator's own
+    """The flip side: the backend's two-way flag is the operator's own
     confirmation that a live call has been judged and the guard should stand
     aside — proves the flag genuinely gates the check rather than the check
     being unconditional with the flag as dead code."""
@@ -479,7 +480,7 @@ def test_create_campaign_allows_twoway_telugu_once_the_flag_is_enabled(client, m
 
     monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
     monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID", "agent_1")
-    monkeypatch.setattr(admin_campaigns.app_config, "OPENAI_TWOWAY_ENABLED", True)
+    monkeypatch.setattr(admin_campaigns.languages_module, "SARVAM_TWOWAY_ENABLED", True)
 
     r = client.post("/admin/campaigns", json={
         "name": "Telugu Twoway", "mode": "twoway", "language": "te",
@@ -490,7 +491,7 @@ def test_create_campaign_allows_twoway_telugu_once_the_flag_is_enabled(client, m
 
 def test_create_campaign_rejects_twoway_tinglish_too(client, monkeypatch):
     """Tinglish shares Telugu's backend — same flag-gated limitation. Pins
-    OPENAI_TWOWAY_ENABLED explicitly rather than relying on its default,
+    the flag explicitly rather than relying on its default,
     since a real deployment's .env (loaded via load_dotenv()) can set it
     either way independent of what this test means to check."""
     async def boom(**kwargs):
@@ -498,7 +499,7 @@ def test_create_campaign_rejects_twoway_tinglish_too(client, monkeypatch):
 
     monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", boom)
     monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID", "agent_1")
-    monkeypatch.setattr(admin_campaigns.app_config, "OPENAI_TWOWAY_ENABLED", False)
+    monkeypatch.setattr(admin_campaigns.languages_module, "SARVAM_TWOWAY_ENABLED", False)
 
     r = client.post("/admin/campaigns", json={
         "name": "Tinglish Twoway", "mode": "twoway", "language": "tinglish",
@@ -548,3 +549,36 @@ def test_create_campaign_still_allows_twoway_auto(client, monkeypatch):
 
     r = client.post("/admin/campaigns", json={"name": "Auto Twoway", "mode": "twoway"})
     assert r.status_code == 201
+
+
+# ── which voice backend a campaign will actually run on ──────────────────────
+#
+# The dashboard used to compute this client-side from the language token. That
+# stopped being able to tell the truth when TELUGU_BACKEND made the mapping an
+# operator decision: a browser cannot see .env, so a rolled-back deployment
+# would have shown every Telugu campaign running on a backend it no longer
+# used. It is now computed where the answer actually lives.
+
+def test_a_campaign_reports_the_backend_that_will_carry_it(client, monkeypatch):
+    async def fake_active():
+        return [_campaign(language="te"), _campaign(language="en")]
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "list_active_campaigns", fake_active)
+
+    rows = client.get("/admin/campaigns").json()
+    assert [r["voice_backend"] for r in rows] == ["Sarvam", "ElevenLabs"]
+
+
+def test_the_reported_backend_follows_the_rollback_switch(client, monkeypatch):
+    """The whole reason this moved server-side. With TELUGU_BACKEND rolled
+    back, a Telugu campaign really is running on OpenAI Realtime, and an
+    operator diagnosing a bad call needs the dashboard to say so."""
+    async def fake_active():
+        return [_campaign(language="te")]
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "list_active_campaigns", fake_active)
+    monkeypatch.setattr(admin_campaigns.languages_module, "TELUGU_BACKEND",
+                        admin_campaigns.languages_module.OPENAI_REALTIME)
+
+    rows = client.get("/admin/campaigns").json()
+    assert rows[0]["voice_backend"] == "OpenAI Realtime"

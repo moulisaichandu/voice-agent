@@ -84,6 +84,30 @@ def _list(name: str, default: tuple[str, ...] = ()) -> list[str]:
     return [p.strip() for p in raw.split(",") if p.strip()]
 
 
+def _choice(name: str, default: str, allowed: tuple[str, ...]) -> str:
+    """One of a fixed set of values, case- and whitespace-insensitive.
+
+    The enum member of the helper family. Same contract as the rest: an
+    unrecognised override warns and falls back rather than crashing at import.
+
+    Case folding is not cosmetic here. These values are hand-edited in .env and
+    then compared with `==` deep inside dispatch tables; 'Sarvam' silently
+    meaning something different from 'sarvam' would route live calls to a
+    backend nobody chose, and the only symptom would be the wrong voice
+    answering a real lead.
+    """
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    cleaned = raw.strip().lower()
+    if cleaned in allowed:
+        return cleaned
+    logger.warning(
+        f"{name}={raw!r} is not one of {allowed} — using default {default!r}."
+    )
+    return default
+
+
 # ── DATABASE ──────────────────────────────────────────────────────────────────
 # Supabase Postgres IS Postgres — this is a plain connection string. Point it at
 # the local docker-compose pgvector container for dev/test, or the real Supabase
@@ -215,6 +239,59 @@ OPENAI_REALTIME_NOISE_REDUCTION = os.getenv("OPENAI_REALTIME_NOISE_REDUCTION", "
 # once a live two-way Telugu call has been placed and judged. One-way is
 # never affected by this flag.
 OPENAI_TWOWAY_ENABLED = _bool("OPENAI_TWOWAY_ENABLED", False)
+
+# ── SARVAM (the Telugu voice backend) ────────────────────────────────────────
+# Sarvam is an Indian-language speech vendor whose TTS voices are recorded by
+# professional Indian voice artists and whose STT is trained on Indian
+# telephony audio. It exists here to fix the one thing the OpenAI Realtime
+# backend could not: every Realtime voice is English-first, and there is no
+# Telugu-native voice at any price.
+#
+# Unlike the other two backends, Sarvam has NO speech-to-speech API. STT, LLM
+# and TTS are three separate services and the turn-taking between them is
+# ours, which is also why two-way Telugu becomes possible here at all.
+SARVAM_API_KEY: str | None = os.getenv("SARVAM_API_KEY")
+SARVAM_TTS_MODEL = os.getenv("SARVAM_TTS_MODEL", "bulbul:v3")
+# The voice. Unlike OPENAI_REALTIME_VOICE this is not optional — Sarvam's TTS
+# rejects a config frame with no speaker. 'priya' is Sarvam's documented
+# default for te-IN; judge it on a real 8 kHz call before dialling a list, and
+# change it here rather than in code.
+SARVAM_TTS_SPEAKER = os.getenv("SARVAM_TTS_SPEAKER", "priya")
+# 0.5-2.0 on bulbul:v3. Below 1.0 is slower. Telephony audio is already hard to
+# follow; err slow rather than fast.
+SARVAM_TTS_PACE = _float("SARVAM_TTS_PACE", 1.0)
+# saaras:v3 is the telephony-tuned model. saarika is NOT — it is trained on
+# clean audio and degrades on 8 kHz call quality.
+SARVAM_STT_MODEL = os.getenv("SARVAM_STT_MODEL", "saaras:v3")
+# Same reasoning as OPENAI_REALTIME_STT_LANGUAGE above, and the same observed
+# failure: on 8 kHz audio, auto-detection mis-hears Telugu as Croatian/Urdu,
+# the lead is transcribed as nonsense, and the agent answers the nonsense.
+# Sarvam wants a BCP-47 code (te-IN), not the bare ISO code.
+SARVAM_STT_LANGUAGE = os.getenv("SARVAM_STT_LANGUAGE", "te-IN")
+# The conversation brain for two-way, and the renderer that turns an English
+# script into spoken Telugu for one-way. OpenAI-compatible chat completions.
+SARVAM_LLM_MODEL = os.getenv("SARVAM_LLM_MODEL", "sarvam-105b")
+# Sarvam's own VAD decides when the lead has started/stopped speaking, which is
+# what drives barge-in. Higher sensitivity catches quieter speech at the cost of
+# treating background noise as a turn.
+SARVAM_VAD_HIGH_SENSITIVITY = _bool("SARVAM_VAD_HIGH_SENSITIVITY", False)
+# The exact twin of OPENAI_TWOWAY_ENABLED, for the same reason and with the
+# same discipline: two-way does not go live on code review alone.
+SARVAM_TWOWAY_ENABLED = _bool("SARVAM_TWOWAY_ENABLED", False)
+
+# THE ROLLBACK SWITCH. Which backend carries Telugu and Tinglish.
+#
+# This is the one knob that makes replacing a live voice backend a reversible
+# decision: if Sarvam's Telugu turns out worse than OpenAI's on a real call,
+# set this to 'openai_realtime' and restart. No deploy, no code change, no
+# migration — app/telephony/openai_bridge.py and its tests are all still here.
+#
+# It applies to BOTH Telugu tokens at once, deliberately. 'te' and 'tinglish'
+# share the ISO code 'te', and app/languages.py's backend_for_iso() resolves an
+# ISO code by finding a token that matches it — so if the two tokens could ever
+# disagree about their backend, preflight would check one backend's
+# prerequisites for a call the other was about to place.
+TELUGU_BACKEND = _choice("TELUGU_BACKEND", "sarvam", ("sarvam", "openai_realtime"))
 
 # ── EMBEDDINGS (OpenAI text-embedding-3-small) ────────────────────────────────
 # A separate credential from ElevenLabs — text-embedding-3-small is an OpenAI

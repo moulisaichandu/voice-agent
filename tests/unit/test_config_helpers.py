@@ -100,6 +100,52 @@ def test_list_strips_and_drops_empty_entries(monkeypatch):
     assert config._list("SOME_LIST") == ["a", "b"]
 
 
+# ── _choice ──────────────────────────────────────────────────────────────────
+
+def test_choice_accepts_an_allowed_value(monkeypatch):
+    monkeypatch.setenv("SOME_CHOICE", "sarvam")
+    assert config._choice("SOME_CHOICE", "openai_realtime",
+                          ("sarvam", "openai_realtime")) == "sarvam"
+
+
+def test_choice_is_case_and_whitespace_insensitive(monkeypatch):
+    """Operators edit .env by hand. ' Sarvam ' meaning something different from
+    'sarvam' would route every Telugu call to the wrong backend over a stray
+    space, and the only symptom would be the wrong voice on a live call."""
+    monkeypatch.setenv("SOME_CHOICE", "  SARVAM ")
+    assert config._choice("SOME_CHOICE", "openai_realtime",
+                          ("sarvam", "openai_realtime")) == "sarvam"
+
+
+def test_choice_warns_and_defaults_on_an_unknown_value(monkeypatch, caplog):
+    """CLAUDE.md's rule for every config helper: a malformed override warns and
+    falls back, it never crashes at import. A typo'd backend name must not be
+    able to stop the app booting, and must not pass silently either."""
+    monkeypatch.setenv("SOME_CHOICE", "elevnlabs")
+    with caplog.at_level("WARNING"):
+        assert config._choice("SOME_CHOICE", "sarvam",
+                              ("sarvam", "openai_realtime")) == "sarvam"
+    assert "SOME_CHOICE" in caplog.text
+
+
+def test_choice_unset_and_blank_use_the_default(monkeypatch):
+    monkeypatch.delenv("SOME_CHOICE", raising=False)
+    assert config._choice("SOME_CHOICE", "sarvam", ("sarvam", "x")) == "sarvam"
+    monkeypatch.setenv("SOME_CHOICE", "   ")
+    assert config._choice("SOME_CHOICE", "sarvam", ("sarvam", "x")) == "sarvam"
+
+
+# ── Sarvam / Telugu backend config ───────────────────────────────────────────
+
+def test_configured_telugu_backend_is_one_this_product_can_dial(monkeypatch):
+    """A guard on the live value rather than the parser. TELUGU_BACKEND is the
+    rollback switch: it decides which bridge carries every Telugu and Tinglish
+    call. A value outside this set would make languages.backend_for() return a
+    backend call_routes has no bridge for, and every Telugu call would fail at
+    dial time."""
+    assert config.TELUGU_BACKEND in ("sarvam", "openai_realtime")
+
+
 # ── OpenAI Realtime config tests ──────────────────────────────────────────────
 
 def test_a_malformed_realtime_threshold_warns_and_keeps_the_default(monkeypatch, caplog):

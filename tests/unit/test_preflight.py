@@ -317,6 +317,32 @@ async def test_a_telugu_campaign_does_not_ask_elevenlabs_anything(monkeypatch):
     involved would refuse every Telugu campaign for a reason that has nothing
     to do with why it can or can't dial."""
     _configured(monkeypatch)
+    monkeypatch.setattr(pf, "SARVAM_API_KEY", "sk-test")
+
+    def boom(agent_id):
+        raise AssertionError("must not consult ElevenLabs for a Sarvam-backed call")
+
+    monkeypatch.setattr(pf, "agent_language_support", boom)
+    assert await pf.preflight("agent_1", "te") is None
+
+
+async def test_a_telugu_campaign_needs_a_sarvam_key(monkeypatch):
+    _configured(monkeypatch)
+    monkeypatch.setattr(pf, "SARVAM_API_KEY", None)
+    reason = await pf.preflight("agent_1", "te")
+    assert reason is not None
+    assert "SARVAM_API_KEY" in reason
+
+
+async def test_a_rolled_back_telugu_campaign_needs_the_openai_key_instead(monkeypatch):
+    """The rollback switch has to change WHICH prerequisites are checked.
+    Checking Sarvam's key for a call openai_bridge is about to place would
+    refuse every rolled-back Telugu campaign for a key it does not need — and
+    the reverse would let one dial with no credentials at all."""
+    _configured(monkeypatch)
+    monkeypatch.setattr(pf.languages_module, "TELUGU_BACKEND",
+                        pf.languages_module.OPENAI_REALTIME)
+    monkeypatch.setattr(pf, "SARVAM_API_KEY", None)
     monkeypatch.setattr(pf, "OPENAI_API_KEY", "sk-test")
 
     def boom(agent_id):
@@ -325,9 +351,6 @@ async def test_a_telugu_campaign_does_not_ask_elevenlabs_anything(monkeypatch):
     monkeypatch.setattr(pf, "agent_language_support", boom)
     assert await pf.preflight("agent_1", "te") is None
 
-
-async def test_a_telugu_campaign_needs_an_openai_key(monkeypatch):
-    _configured(monkeypatch)
     monkeypatch.setattr(pf, "OPENAI_API_KEY", None)
     reason = await pf.preflight("agent_1", "te")
     assert reason is not None
@@ -387,14 +410,14 @@ async def test_a_voice_lookup_failure_does_not_block_an_auto_campaign(monkeypatc
     assert await pf.preflight("agent_1") is None
 
 
-async def test_a_forced_voice_never_consults_elevenlabs_for_an_openai_call(monkeypatch):
-    """A Telugu call is carried by openai_bridge.py, which sends no ElevenLabs
+async def test_a_forced_voice_never_consults_elevenlabs_for_a_telugu_call(monkeypatch):
+    """A Telugu call is carried by sarvam_bridge.py, which sends no ElevenLabs
     override at all — so a forced ElevenLabs voice is irrelevant to it and must
     not make preflight interrogate an agent that will never carry the call."""
-    _configured(monkeypatch, ELEVENLABS_VOICE_ID=_VOICE, OPENAI_API_KEY="sk-test")
+    _configured(monkeypatch, ELEVENLABS_VOICE_ID=_VOICE, SARVAM_API_KEY="sk-test")
 
     def boom(agent_id):
-        raise AssertionError("must not query ElevenLabs for an OpenAI-backed call")
+        raise AssertionError("must not query ElevenLabs for a Sarvam-backed call")
 
     monkeypatch.setattr(pf, "agent_language_support", boom)
     assert await pf.preflight("agent_1", "te") is None
@@ -427,10 +450,30 @@ async def test_the_language_checks_still_run_when_a_voice_is_forced(monkeypatch)
 # as a clean exit — worse than the silent-mismatch bug CLAUDE.md warns about
 # by name, because at least a monologue is audible.
 
-async def test_a_twoway_openai_backed_campaign_is_refused_while_the_flag_is_off(monkeypatch):
-    _configured(monkeypatch)
+def _telugu_backend(monkeypatch, backend):
+    """Point Telugu at *backend* and satisfy that backend's credential check,
+    so a test can isolate the two-way gate from everything else."""
+    monkeypatch.setattr(pf.languages_module, "TELUGU_BACKEND", backend)
+    monkeypatch.setattr(pf, "SARVAM_API_KEY", "sk-test")
     monkeypatch.setattr(pf, "OPENAI_API_KEY", "sk-test")
-    monkeypatch.setattr(pf, "OPENAI_TWOWAY_ENABLED", False)
+
+
+def _set_twoway(monkeypatch, backend, enabled):
+    flag = ("SARVAM_TWOWAY_ENABLED"
+            if backend == pf.languages_module.SARVAM else "OPENAI_TWOWAY_ENABLED")
+    monkeypatch.setattr(pf.languages_module, flag, enabled)
+
+
+_TELUGU_BACKENDS = ["sarvam", "openai_realtime"]
+
+
+@pytest.mark.parametrize("backend", _TELUGU_BACKENDS)
+async def test_a_twoway_telugu_campaign_is_refused_while_its_flag_is_off(
+    monkeypatch, backend
+):
+    _configured(monkeypatch)
+    _telugu_backend(monkeypatch, backend)
+    _set_twoway(monkeypatch, backend, False)
     reason = await pf.preflight("agent_1", "te", mode="twoway")
     assert reason is not None
     assert "twoway" in reason
@@ -438,24 +481,55 @@ async def test_a_twoway_openai_backed_campaign_is_refused_while_the_flag_is_off(
     assert "one-way" in reason.lower()
 
 
-async def test_a_twoway_openai_backed_campaign_dials_once_the_flag_is_on(monkeypatch):
-    """The flip side: the flag genuinely gates the check, not just documents
-    an intention — proves the guard actually reads OPENAI_TWOWAY_ENABLED
-    rather than always refusing regardless of it."""
+@pytest.mark.parametrize("backend", _TELUGU_BACKENDS)
+async def test_the_refusal_names_the_backend_that_would_actually_run(
+    monkeypatch, backend
+):
+    """The message used to hardcode "OpenAI Realtime". An operator told to
+    check a backend their campaign does not use has been sent to the wrong
+    place to fix a real problem."""
     _configured(monkeypatch)
-    monkeypatch.setattr(pf, "OPENAI_API_KEY", "sk-test")
-    monkeypatch.setattr(pf, "OPENAI_TWOWAY_ENABLED", True)
+    _telugu_backend(monkeypatch, backend)
+    _set_twoway(monkeypatch, backend, False)
+    reason = await pf.preflight("agent_1", "te", mode="twoway")
+    assert pf.languages_module.backend_display(backend) in reason
+
+
+@pytest.mark.parametrize("backend", _TELUGU_BACKENDS)
+async def test_a_twoway_telugu_campaign_dials_once_its_flag_is_on(
+    monkeypatch, backend
+):
+    """The flip side: the flag genuinely gates the check, not just documents
+    an intention — proves the guard reads the flag rather than always
+    refusing regardless of it."""
+    _configured(monkeypatch)
+    _telugu_backend(monkeypatch, backend)
+    _set_twoway(monkeypatch, backend, True)
     assert await pf.preflight("agent_1", "te", mode="twoway") is None
 
 
-async def test_a_oneway_openai_backed_campaign_is_never_refused_by_this_guard(monkeypatch):
+@pytest.mark.parametrize("backend", _TELUGU_BACKENDS)
+async def test_a_oneway_telugu_campaign_is_never_refused_by_this_guard(
+    monkeypatch, backend
+):
     """One-way is unaffected by the flag in either direction — it was always
     the proven, available path."""
     _configured(monkeypatch)
-    monkeypatch.setattr(pf, "OPENAI_API_KEY", "sk-test")
+    _telugu_backend(monkeypatch, backend)
     for flag in (False, True):
-        monkeypatch.setattr(pf, "OPENAI_TWOWAY_ENABLED", flag)
+        _set_twoway(monkeypatch, backend, flag)
         assert await pf.preflight("agent_1", "te", mode="oneway") is None
+
+
+async def test_enabling_two_way_on_one_backend_does_not_enable_the_other(monkeypatch):
+    """Each backend is a separate implementation proven by a separate live
+    call. Sharing one flag would let a Sarvam live-call sign-off silently
+    authorise two-way on a backend nobody tested."""
+    _configured(monkeypatch)
+    _telugu_backend(monkeypatch, pf.languages_module.OPENAI_REALTIME)
+    monkeypatch.setattr(pf.languages_module, "SARVAM_TWOWAY_ENABLED", True)
+    monkeypatch.setattr(pf.languages_module, "OPENAI_TWOWAY_ENABLED", False)
+    assert await pf.preflight("agent_1", "te", mode="twoway") is not None
 
 
 async def test_a_twoway_elevenlabs_backed_campaign_is_not_refused(monkeypatch):
@@ -477,5 +551,5 @@ async def test_the_twoway_guard_needs_no_mode_argument_to_keep_working(monkeypat
     """Existing callers that don't pass mode= must keep working exactly as
     before — mode defaults to something that never triggers the guard."""
     _configured(monkeypatch)
-    monkeypatch.setattr(pf, "OPENAI_API_KEY", "sk-test")
+    monkeypatch.setattr(pf, "SARVAM_API_KEY", "sk-test")
     assert await pf.preflight("agent_1", "te") is None

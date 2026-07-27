@@ -83,16 +83,20 @@ def _check_twoway_capable(mode: str, language: str) -> None:
     """Refuse a two-way campaign whose language routes to a backend that
     hasn't been PROVEN on a live call yet.
 
-    app/telephony/openai_bridge.py (the te/tinglish backend — see
-    app/languages.py's backend_for()) fully implements two-way conversation
-    — turn detection, RAG, barge-in truncation. What it does not yet have is
-    a human having placed a real call and confirmed it behaves correctly;
-    that is OPENAI_TWOWAY_ENABLED's job (see app/config.py). Routing a
-    two-way campaign to an unverified conversational path risks the exact
-    "campaigns.mode silently produces calls leads couldn't respond to"
-    failure CLAUDE.md documents from the sibling project, which is why mode
-    is admin-set and never inferred — the same caution applies to a backend
-    that has never been heard on a real line.
+    The te/tinglish backends (see app/languages.py's backend_for()) are at
+    different stages: openai_bridge.py implements two-way fully — turn
+    detection, RAG, barge-in truncation — and sarvam_bridge.py does not
+    implement it at all yet. Neither has what matters most, which is a human
+    having placed a real call and confirmed it behaves correctly. That is what
+    each backend's own two-way flag records; languages_module.twoway_enabled()
+    owns which flag belongs to which backend, so this function and
+    app/telephony/preflight.py cannot drift apart about it.
+
+    Routing a two-way campaign to an unverified conversational path risks the
+    exact "campaigns.mode silently produces calls leads couldn't respond to"
+    failure CLAUDE.md documents from the sibling project, which is why mode is
+    admin-set and never inferred — the same caution applies to a backend that
+    has never been heard on a real line.
 
     Checked at CREATION, where the operator can still choose 'oneway' or a
     different language — not at dial time, when the only options left are
@@ -104,17 +108,17 @@ def _check_twoway_capable(mode: str, language: str) -> None:
     """
     if mode != "twoway":
         return
-    if (languages_module.backend_for(language) != languages_module.ELEVENLABS
-            and not app_config.OPENAI_TWOWAY_ENABLED):
+    backend = languages_module.backend_for(language)
+    if not languages_module.twoway_enabled(backend):
         raise HTTPException(
             status_code=422,
             detail=(
                 f"Two-way calling for {languages_module.display(language)} "
-                "is built but not yet enabled — a live call has to confirm "
-                "it before real campaigns use it (OPENAI_TWOWAY_ENABLED in "
-                ".env). One-way calling IS available for this language today "
-                "(mode='oneway'), or choose a different language for a "
-                "two-way campaign."
+                f"is not yet enabled on its voice backend "
+                f"({languages_module.backend_display(backend)}) — a live call "
+                "has to confirm it before real campaigns use it. One-way "
+                "calling IS available for this language today (mode='oneway'), "
+                "or choose a different language for a two-way campaign."
             ),
         )
 

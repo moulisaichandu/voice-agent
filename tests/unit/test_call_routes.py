@@ -503,12 +503,34 @@ def test_build_call_language_sends_nothing_for_auto():
 # never learns which one ran. See app/languages.py's backend_for() for which
 # languages route where.
 
-def test_backend_bridge_picks_openai_for_telugu():
-    assert call_routes._backend_bridge("te") is call_routes.openai_bridge.bridge
+def test_backend_bridge_picks_sarvam_for_telugu():
+    assert call_routes._backend_bridge("te") is call_routes.sarvam_bridge.bridge
 
 
-def test_backend_bridge_picks_openai_for_tinglish():
-    assert call_routes._backend_bridge("tinglish") is call_routes.openai_bridge.bridge
+def test_backend_bridge_picks_sarvam_for_tinglish():
+    assert call_routes._backend_bridge("tinglish") is call_routes.sarvam_bridge.bridge
+
+
+@pytest.mark.parametrize("token", ["te", "tinglish"])
+def test_backend_bridge_follows_the_telugu_rollback_switch(monkeypatch, token):
+    """The rollback has to reach the dial path, not just the language table.
+    A switch that changed what preflight validated but not which bridge ran
+    would be worse than no switch at all."""
+    monkeypatch.setattr(call_routes.languages, "TELUGU_BACKEND",
+                        call_routes.languages.OPENAI_REALTIME)
+    assert call_routes._backend_bridge(token) is call_routes.openai_bridge.bridge
+
+
+def test_every_backend_a_language_can_route_to_has_a_bridge():
+    """_backend_bridge falls back to the ElevenLabs bridge for anything it does
+    not recognise, which is right for a hand-built token and WRONG for a real
+    backend somebody forgot to wire — ElevenLabs cannot speak Telugu, so that
+    fallback would dial a lead into a wall. This catches the omission here
+    instead of on a live call."""
+    for backend in (call_routes.languages.ELEVENLABS,
+                    call_routes.languages.OPENAI_REALTIME,
+                    call_routes.languages.SARVAM):
+        assert backend in call_routes._BRIDGE_BY_BACKEND
 
 
 @pytest.mark.parametrize("token", ["auto", "en", "hi", "hinglish"])

@@ -34,7 +34,7 @@ from app.db import campaigns as campaigns_db
 from app.db import leads as leads_db
 from app.db.models import Campaign, Lead
 from app.telephony import bridge as bridge_module
-from app.telephony import openai_bridge, plivo_client, plivo_stream
+from app.telephony import openai_bridge, plivo_client, plivo_stream, sarvam_bridge
 from app.telephony import worker as telephony_worker
 
 router = APIRouter(tags=["Telephony"])
@@ -194,25 +194,36 @@ def _call_language(lead: Lead, campaign: Campaign) -> tuple[str | None, dict]:
     return languages.for_call(lead.language_pref, campaign.language)
 
 
+# Every bridge takes identical arguments and populates the identical `outcome`
+# dict, by deliberate design (see openai_bridge's and sarvam_bridge's module
+# docstrings), so choosing between them is a table lookup rather than a branch.
+# Adding a backend is a row here plus a row in app/languages.py — nothing else
+# in the dial path is backend-aware, and _finalise_call, the Sheets write-back
+# queue and slot release never learn which one ran.
+_BRIDGE_BY_BACKEND = {
+    languages.ELEVENLABS: bridge_module.bridge,
+    languages.OPENAI_REALTIME: openai_bridge.bridge,
+    languages.SARVAM: sarvam_bridge.bridge,
+}
+
+
 def _backend_bridge(token: str):
     """The bridge FUNCTION for *token*'s voice backend — a reference, not a
     branch.
 
-    Both app/telephony/bridge.py's bridge() (ElevenLabs) and
-    app/telephony/openai_bridge.py's bridge() (OpenAI Realtime) take
-    identical arguments and populate the identical `outcome` dict, by
-    deliberate design (see openai_bridge's module docstring), so picking
-    between them here is the ONLY backend-aware line in the dial path.
-    Everything downstream of the call this returns — _finalise_call, the
-    Sheets write-back queue, slot release — never learns which one ran.
-
     See app/languages.py's backend_for() for which languages route where and
-    why; this must never diverge from that table, so it delegates to it
-    rather than repeating the language list here.
+    why; this must never diverge from that table, so it delegates to it rather
+    than repeating the language list here.
+
+    Falls back to the ElevenLabs bridge for a backend with no row above, which
+    is the right answer for a hand-built token and the wrong one for a real
+    backend somebody forgot to wire — ElevenLabs cannot speak Telugu, so that
+    fallback would dial a lead into a wall. tests/unit/test_call_routes.py
+    asserts every backend a language can name has a row here, so the omission
+    is caught in CI rather than on a live call.
     """
-    if languages.backend_for(token) == languages.OPENAI_REALTIME:
-        return openai_bridge.bridge
-    return bridge_module.bridge
+    return _BRIDGE_BY_BACKEND.get(languages.backend_for(token),
+                                  bridge_module.bridge)
 
 
 async def _abort_stream(ws: WebSocket, lead_id: str) -> None:

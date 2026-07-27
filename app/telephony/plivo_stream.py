@@ -69,8 +69,13 @@ _ONEWAY_POLL_S = 0.25
 # built-in "End Call" tool, so openai_bridge.py gives the model its own
 # end_call function and grades the resulting exit the same way — a
 # conversation the model chose to end cleanly, not a dropped call.
+# sarvam_end_call is the same story again on the third backend: sarvam_bridge.py
+# gives the model an end_call tool and grades the resulting exit as a
+# conversation the agent chose to end, not a dropped call. Without it every
+# Telugu conversation that finished properly would be stored 'failed', mark its
+# lead failed, and burn a retry on someone who already said goodbye.
 _CLEAN_EXITS = ("plivo_stop", "plivo_disconnect", "max_duration", "oneway_complete",
-                "elevenlabs_closed:1000", "openai_end_call")
+                "elevenlabs_closed:1000", "openai_end_call", "sarvam_end_call")
 
 
 def answer_xml(lead_id: str) -> str:

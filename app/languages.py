@@ -2,7 +2,12 @@
 
 Pure logic, no I/O — the same shape as app/compliance/disclosure.py, and for
 the same reason: what language a real person is spoken to in must be decidable
-and testable without a database or a network.
+and testable without a database or a network. The three values imported from
+app.config are the one concession: which backend carries Telugu, and whether
+each backend may run two-way, are operator decisions rather than facts about a
+language. They are plain module-level constants read once at import, so every
+function here stays synchronous, side-effect-free and testable by
+monkeypatching this module's own namespace.
 
 Two things are deliberately kept apart here:
 
@@ -28,6 +33,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Literal
+
+from app.config import (
+    OPENAI_TWOWAY_ENABLED,
+    SARVAM_TWOWAY_ENABLED,
+    TELUGU_BACKEND,
+)
 
 AUTO = "auto"
 
@@ -131,29 +142,50 @@ def elevenlabs_can_speak(iso: str | None) -> bool:
 
 
 # ── which backend carries which language ─────────────────────────────────────
-# Two voice backends exist because no single one covers this business's
+# Three voice backends exist because no single one covers this business's
 # languages. ElevenLabs Agents sounds better and is already in production, but
-# does not offer Telugu at any price (see ELEVENLABS_AGENT_LANGUAGES). OpenAI
-# Realtime does, and the sibling ../ai-voice-agent proves it on real 8 kHz
-# phone calls.
+# does not offer Telugu at any price (see ELEVENLABS_AGENT_LANGUAGES).
+#
+# Telugu therefore needs its own backend, and has had two. OpenAI Realtime came
+# first and works, but every Realtime voice is English-first — there is no
+# Telugu-native voice to choose, and no code change fixes that. Sarvam's TTS
+# voices ARE Telugu-native and its STT is trained on Indian telephony audio,
+# which is why Telugu moved there. TELUGU_BACKEND switches between the two.
 #
 # The backend is DERIVED from the language, never chosen per call and never
 # inferred by a model — campaigns.language is admin-set at creation, so the
 # backend is fully determined before a call is placed. That is the same
-# discipline campaigns.mode follows, for the same reason.
+# discipline campaigns.mode follows, for the same reason. TELUGU_BACKEND does
+# not weaken that: it is read from .env at import, identically for every call.
 ELEVENLABS = "elevenlabs"
 OPENAI_REALTIME = "openai_realtime"
+SARVAM = "sarvam"
 
-VoiceBackend = Literal["elevenlabs", "openai_realtime"]
+VoiceBackend = Literal["elevenlabs", "openai_realtime", "sarvam"]
+
+_BACKEND_DISPLAY: dict[str, str] = {
+    ELEVENLABS: "ElevenLabs",
+    OPENAI_REALTIME: "OpenAI Realtime",
+    SARVAM: "Sarvam",
+}
 
 _BACKEND_BY_TOKEN: dict[str, str] = {
     AUTO: ELEVENLABS,
     "en": ELEVENLABS,
     "hi": ELEVENLABS,
     "hinglish": ELEVENLABS,
-    "te": OPENAI_REALTIME,
-    "tinglish": OPENAI_REALTIME,
 }
+
+# Both Telugu tokens are resolved through TELUGU_BACKEND rather than listed in
+# the table above, and they are resolved through the SAME switch on purpose.
+#
+# 'te' and 'tinglish' share the ISO code 'te'. backend_for_iso() resolves an
+# ISO code by finding a token that maps to it, so if these two tokens could
+# ever name different backends, which one won would depend on catalogue order.
+# preflight would then validate one backend's prerequisites for a call the
+# other was about to place — an ElevenLabs-style silent mismatch with no
+# symptom until a live call. One switch for both tokens makes that impossible.
+_TELUGU_TOKENS = ("te", "tinglish")
 
 
 def backend_for(token: str) -> str:
@@ -163,7 +195,12 @@ def backend_for(token: str) -> str:
     routes junk to AUTO, so reaching this means a caller hand-built a token,
     and degrading to the backend that is known to work beats raising mid-dial.
     """
-    return _BACKEND_BY_TOKEN.get(normalize(token), ELEVENLABS)
+    normalised = normalize(token)
+    if normalised in _TELUGU_TOKENS:
+        # Read at call time, not baked into the table at import, so a test can
+        # exercise the rollback without reloading the module.
+        return TELUGU_BACKEND
+    return _BACKEND_BY_TOKEN.get(normalised, ELEVENLABS)
 
 
 def backend_for_iso(iso: str | None) -> str:
@@ -174,16 +211,49 @@ def backend_for_iso(iso: str | None) -> str:
     catalogue token, so it cannot call backend_for() directly.
 
     Several tokens can share an ISO code (te and tinglish are both 'te'), but
-    they never disagree about the backend — a language is carried by exactly
-    one backend — so resolving through the first token that matches is safe.
-    Falls back to ELEVENLABS for an unrecognised or absent code, for the same
-    reason backend_for() does: degrading to the backend that is known to work
-    beats raising mid-dial.
+    they never disagree about the backend — see _TELUGU_TOKENS above for what
+    guarantees that — so resolving through the first token that matches is
+    safe. Falls back to ELEVENLABS for an unrecognised or absent code, for the
+    same reason backend_for() does: degrading to the backend that is known to
+    work beats raising mid-dial.
     """
-    for token, backend in _BACKEND_BY_TOKEN.items():
+    for token in TOKENS:
         if iso_code(token) == iso:
-            return backend
+            return backend_for(token)
     return ELEVENLABS
+
+
+def twoway_enabled(backend: str) -> bool:
+    """Whether *backend* may carry a TWO-WAY (conversational) campaign.
+
+    Two-way on a backend that has not been proven on a live call is not a
+    degraded call, it is a silent one: it connects, never speaks, never
+    listens, bills the full CALL_MAX_DURATION_S of silence, and is then
+    recorded as a SUCCESSFUL zero-turn call because max_duration counts as a
+    clean exit. Hence a per-backend flag an operator flips only after taking
+    the call themselves.
+
+    ElevenLabs needs no flag — two-way English/Hindi is what production runs.
+    An unrecognised backend is refused rather than dialled: reaching here with
+    one means a bug, and a lead should not carry the cost of it.
+    """
+    if backend == ELEVENLABS:
+        return True
+    if backend == SARVAM:
+        return SARVAM_TWOWAY_ENABLED
+    if backend == OPENAI_REALTIME:
+        return OPENAI_TWOWAY_ENABLED
+    return False
+
+
+def backend_display(backend: str) -> str:
+    """*backend* as a name an operator can act on.
+
+    These strings land in the refusal an operator reads in the dashboard.
+    preflight and admin/campaigns used to hardcode "OpenAI Realtime" in that
+    message, which quietly became a lie the moment Telugu moved to Sarvam.
+    """
+    return _BACKEND_DISPLAY.get(backend, backend)
 
 
 # ISO codes ElevenLabs' Flash/Turbo v2.5 models cannot pronounce, kept as a

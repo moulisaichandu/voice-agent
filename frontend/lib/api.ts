@@ -41,12 +41,6 @@ export function languageLabel(value: string): string {
   return CAMPAIGN_LANGUAGES.find((l) => l.value === value)?.label ?? value;
 }
 
-/** Mirrors app/languages.py's _BACKEND_BY_TOKEN. Telugu and Tinglish run on
- * OpenAI Realtime because ElevenLabs Agents does not offer Telugu at all. */
-export function backendFor(language: string): "ElevenLabs" | "OpenAI Realtime" {
-  return language === "te" || language === "tinglish" ? "OpenAI Realtime" : "ElevenLabs";
-}
-
 export type Campaign = {
   campaign_id: string;
   name: string;
@@ -57,6 +51,12 @@ export type Campaign = {
   max_attempts: number;
   active: boolean;
   created_at: string;
+  /** Which voice backend actually carries this campaign, computed server-side
+   * by app/db/models.py's Campaign.voice_backend. Not derived from `language`
+   * here: the Telugu mapping is an operator decision (TELUGU_BACKEND in .env)
+   * and a browser cannot see .env, so a client-side table would show a
+   * rolled-back deployment running on a backend it no longer uses. */
+  voice_backend: string;
 };
 
 export type Lead = {

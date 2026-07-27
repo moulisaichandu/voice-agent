@@ -28,11 +28,11 @@ from app.config import (
     ELEVENLABS_API_KEY,
     ELEVENLABS_VOICE_ID,
     OPENAI_API_KEY,
-    OPENAI_TWOWAY_ENABLED,
     PLIVO_AUTH_ID,
     PLIVO_AUTH_TOKEN,
     PLIVO_FROM_NUMBER,
     PUBLIC_BASE_URL,
+    SARVAM_API_KEY,
 )
 from app.telephony.elevenlabs_client import agent_exists, agent_language_support
 
@@ -73,13 +73,19 @@ async def preflight(
     # languages.backend_for_iso), so a two-way 'auto' campaign — every
     # campaign created before this feature existed — can never trip this.
     twoway_backend = languages_module.backend_for_iso(language)
-    if (mode == "twoway" and twoway_backend != languages_module.ELEVENLABS
-            and not OPENAI_TWOWAY_ENABLED):
+    if mode == "twoway" and not languages_module.twoway_enabled(twoway_backend):
+        # The flag and the backend's NAME both come from languages_module
+        # rather than being written here. This message used to hardcode
+        # "OpenAI Realtime" and read OPENAI_TWOWAY_ENABLED directly, which
+        # silently became wrong the moment Telugu moved to Sarvam: an operator
+        # would be told to check a backend their campaign does not use.
+        display = languages_module.backend_display(twoway_backend)
+        flag = f"{twoway_backend.split('_')[0].upper()}_TWOWAY_ENABLED"
         return (
             f"This campaign is 'twoway' in '{language}'. That backend "
-            "(OpenAI Realtime) supports two-way calling, but OPENAI_TWOWAY_ENABLED "
-            "is not set — a live call needs to confirm it works before real "
-            "campaigns use it. One-way calling IS available for "
+            f"({display}) has not been confirmed for two-way calling — "
+            f"{flag} is not set, and a live call needs to confirm it works "
+            "before real campaigns use it. One-way calling IS available for "
             f"'{language}' today. Change this campaign's "
             "mode to 'oneway', or choose a different language for a two-way "
             "campaign."
@@ -164,7 +170,18 @@ async def preflight(
     # lookup. Checked OUTSIDE the `if language:` below because a forced voice
     # must not drag an OpenAI-backed call into the ElevenLabs branch;
     # backend_for_iso(None) is ELEVENLABS, so an 'auto' campaign never enters.
-    if languages_module.backend_for_iso(language) == languages_module.OPENAI_REALTIME:
+    call_backend = languages_module.backend_for_iso(language)
+    if call_backend == languages_module.SARVAM:
+        if not SARVAM_API_KEY:
+            return (
+                f"This campaign dials in '{language}', which runs on the "
+                "Sarvam backend, but SARVAM_API_KEY is not set. Get one from "
+                "https://dashboard.sarvam.ai and set it in .env. To fall back "
+                "to the previous backend instead, set "
+                "TELUGU_BACKEND=openai_realtime."
+            )
+        return None
+    if call_backend == languages_module.OPENAI_REALTIME:
         if not OPENAI_API_KEY:
             return (
                 f"This campaign dials in '{language}', which runs on the "
