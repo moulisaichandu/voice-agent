@@ -161,3 +161,33 @@ async def test_sync_normalizes_missing_language_to_auto(monkeypatch, campaign):
 
     assert n == 1
     assert upserted[0]["language_pref"] == "auto"
+
+
+# ── is the Sheet reachable at all? ───────────────────────────────────────────
+
+def test_a_missing_credential_file_is_reported_as_a_reason(monkeypatch, tmp_path):
+    """Distinguishes "you have not set this up" from "the API call failed",
+    which the scheduler needs in order to stop logging nine per-lead ERRORs
+    every ten minutes for one missing file."""
+    from app.sheets import client as sheets_client
+    monkeypatch.setattr(sheets_client, "GOOGLE_SHEET_ID", "sheet-1")
+    monkeypatch.setattr(sheets_client, "GOOGLE_SERVICE_ACCOUNT_FILE",
+                        str(tmp_path / "nope.json"))
+    reason = sheets_client.unconfigured_reason()
+    assert reason and "nope.json" in reason
+
+
+def test_a_missing_sheet_id_is_reported_as_a_reason(monkeypatch):
+    from app.sheets import client as sheets_client
+    monkeypatch.setattr(sheets_client, "GOOGLE_SHEET_ID", "")
+    reason = sheets_client.unconfigured_reason()
+    assert reason and "GOOGLE_SHEET_ID" in reason
+
+
+def test_a_fully_configured_sheet_reports_no_reason(monkeypatch, tmp_path):
+    from app.sheets import client as sheets_client
+    creds = tmp_path / "sa.json"
+    creds.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(sheets_client, "GOOGLE_SHEET_ID", "sheet-1")
+    monkeypatch.setattr(sheets_client, "GOOGLE_SERVICE_ACCOUNT_FILE", str(creds))
+    assert sheets_client.unconfigured_reason() is None

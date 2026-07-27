@@ -199,6 +199,10 @@ class _FakeRedisQueue:
 async def test_sheets_sync_job_delegates_and_survives_failure(monkeypatch):
     """A Sheets outage must not crash the scheduler loop — it also runs
     campaign_tick/retry_sweeper/dnd_refresh, which must keep ticking."""
+    # These exercise the DRAIN, which only runs when the Sheet is set up.
+    # The test env blanks GOOGLE_SHEET_ID, so say so explicitly.
+    monkeypatch.setattr(scheduler.sheets_client, "unconfigured_reason",
+                        lambda: None)
     calls = {"n": 0}
 
     async def boom():
@@ -211,6 +215,10 @@ async def test_sheets_sync_job_delegates_and_survives_failure(monkeypatch):
 
 
 async def test_transcript_reconcile_writes_back_and_requeues_failures(monkeypatch):
+    # These exercise the DRAIN, which only runs when the Sheet is set up.
+    # The test env blanks GOOGLE_SHEET_ID, so say so explicitly.
+    monkeypatch.setattr(scheduler.sheets_client, "unconfigured_reason",
+                        lambda: None)
     # Real lead_ids in production are always valid UUID strings (str(lead_id)
     # from a real Lead row) — using realistic values here so this test
     # actually exercises write_back_lead rather than failing at UUID parsing.
@@ -235,6 +243,10 @@ async def test_transcript_reconcile_reclaims_items_stranded_by_a_crash(monkeypat
     so a crash mid-write-back permanently dropped those Sheet write-backs. Items
     are now reserved onto a processing list and removed only after success, so a
     previous crashed run's in-flight item is reclaimed and retried next run."""
+    # These exercise the DRAIN, which only runs when the Sheet is set up.
+    # The test env blanks GOOGLE_SHEET_ID, so say so explicitly.
+    monkeypatch.setattr(scheduler.sheets_client, "unconfigured_reason",
+                        lambda: None)
     stranded = str(uuid4())
     r = _FakeRedisQueue([])
     # A previous run reserved this id into 'processing', then crashed before ack.
@@ -259,6 +271,10 @@ async def test_transcript_reconcile_degrades_gracefully_on_malformed_lead_id(mon
     """Anything landing in the queue that isn't a valid UUID (shouldn't
     happen in production — real entries always come from str(lead.lead_id)
     — but if it ever did) must be logged and requeued, not crash the job."""
+    # These exercise the DRAIN, which only runs when the Sheet is set up.
+    # The test env blanks GOOGLE_SHEET_ID, so say so explicitly.
+    monkeypatch.setattr(scheduler.sheets_client, "unconfigured_reason",
+                        lambda: None)
     r = _FakeRedisQueue(["not-a-real-uuid"])
     monkeypatch.setattr(scheduler.redis_client, "get_redis", lambda: r)
 
@@ -293,3 +309,96 @@ async def test_start_is_idempotent():
         assert s1 is s2
     finally:
         scheduler.shutdown()
+
+
+# ── an unconfigured Sheet is a settings problem, not a per-lead failure ──────
+#
+# From the live logs, repeating every ten minutes forever:
+#   [scheduler] sheets_sync failed: FileNotFoundError: 'sa.json'
+#   [scheduler] write-back raised for lead 9fb5d6d8-...: FileNotFoundError
+#   [scheduler] write-back raised for lead ded0c97b-...: FileNotFoundError
+#   ...one ERROR per queued lead, per sweep, indefinitely.
+#
+# The queue mechanics were fine — nothing was lost, everything requeued. But a
+# missing credential is not a transient failure of nine separate writes, and
+# reporting it as one buries the case this logging exists for: a REAL Sheets
+# error on one row. It also re-attempts nine doomed API calls every sweep.
+
+async def test_an_unconfigured_sheet_does_not_drain_the_queue(monkeypatch):
+    """The transcripts must stay queued, ready for when the credential lands."""
+    ids = [str(uuid4()) for _ in range(3)]
+    r = _FakeRedisQueue(list(ids))
+    monkeypatch.setattr(scheduler.redis_client, "get_redis", lambda: r)
+    monkeypatch.setattr(scheduler.sheets_client, "unconfigured_reason",
+                        lambda: "GOOGLE_SERVICE_ACCOUNT_FILE 'sa.json' not found")
+
+    async def must_not_run(lead_id):
+        raise AssertionError("must not attempt a write-back with no credential")
+
+    monkeypatch.setattr(scheduler.sheets_writeback, "write_back_lead", must_not_run)
+
+    await scheduler.transcript_reconcile()
+
+    assert r._lists[_WB_QUEUE] == ids, "queued transcripts must be preserved"
+    assert r._lists[_WB_PROCESSING] == []
+
+
+async def test_an_unconfigured_sheet_is_reported_once_not_once_per_lead(
+    monkeypatch, caplog
+):
+    """Nine ERROR lines per sweep drown the one case this logging is for."""
+    r = _FakeRedisQueue([str(uuid4()) for _ in range(9)])
+    monkeypatch.setattr(scheduler.redis_client, "get_redis", lambda: r)
+    monkeypatch.setattr(scheduler.sheets_client, "unconfigured_reason",
+                        lambda: "GOOGLE_SERVICE_ACCOUNT_FILE 'sa.json' not found")
+
+    with caplog.at_level("WARNING"):
+        await scheduler.transcript_reconcile()
+
+    mentions = [rec for rec in caplog.records if "sa.json" in rec.getMessage()]
+    assert len(mentions) == 1, f"expected one line, got {len(mentions)}"
+    assert "9" in caplog.text, "the operator should be told how many are waiting"
+
+
+async def test_sheets_sync_skips_cleanly_when_unconfigured(monkeypatch, caplog):
+    monkeypatch.setattr(scheduler.sheets_client, "unconfigured_reason",
+                        lambda: "GOOGLE_SHEET_ID is not set")
+
+    async def must_not_run():
+        raise AssertionError("must not call the Sheets API with no credential")
+
+    monkeypatch.setattr(scheduler.sheets_sync_module, "sheets_sync", must_not_run)
+
+    class _R:
+        async def set(self, *a, **kw):
+            return True
+
+    monkeypatch.setattr(scheduler.redis_client, "get_redis", lambda: _R())
+
+    with caplog.at_level("WARNING"):
+        await scheduler.sheets_sync()
+
+    assert "GOOGLE_SHEET_ID" in caplog.text
+    assert not any(rec.levelname == "ERROR" for rec in caplog.records), (
+        "a missing setting is not an error condition to alarm on every sweep"
+    )
+
+
+async def test_a_configured_sheet_still_drains_normally(monkeypatch):
+    """The guard must not become a way to silently stop writing back."""
+    ok_id = str(uuid4())
+    r = _FakeRedisQueue([ok_id])
+    monkeypatch.setattr(scheduler.redis_client, "get_redis", lambda: r)
+    monkeypatch.setattr(scheduler.sheets_client, "unconfigured_reason", lambda: None)
+
+    written = []
+
+    async def fake_write_back(lead_id):
+        written.append(str(lead_id))
+        return True
+
+    monkeypatch.setattr(scheduler.sheets_writeback, "write_back_lead", fake_write_back)
+
+    await scheduler.transcript_reconcile()
+
+    assert written == [ok_id]

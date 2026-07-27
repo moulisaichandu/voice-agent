@@ -47,6 +47,7 @@ from app.config import (
     TRANSCRIPT_RECONCILE_MINUTES,
 )
 from app.db import leads as leads_db
+from app.sheets import client as sheets_client
 from app.sheets import sync as sheets_sync_module
 from app.sheets import writeback as sheets_writeback
 from app.telephony import worker
@@ -130,6 +131,21 @@ async def dnd_refresh() -> None:
 async def sheets_sync() -> None:
     r = redis_client.get_redis()
     now_iso = datetime.now(timezone.utc).isoformat()
+
+    reason = sheets_client.unconfigured_reason()
+    if reason:
+        # A settings gap, not an outage. Logged at WARNING once per sweep with
+        # the fix in it, rather than as an ERROR that looks like something
+        # broke; the Sheet is a human-friendly mirror, and the app is fully
+        # functional without it.
+        logger.warning(f"[scheduler] skipping sheets_sync — {reason}")
+        record = {"at": now_iso, "synced": None, "error": reason}
+        try:
+            await r.set(SHEETS_LAST_SYNC_KEY, json.dumps(record))
+        except Exception:
+            pass
+        return
+
     try:
         synced = await sheets_sync_module.sheets_sync()
         record = {"at": now_iso, "synced": synced, "error": None}
@@ -167,6 +183,23 @@ async def transcript_reconcile() -> None:
     list. write_back_lead overwrites the Sheet row idempotently, so an
     at-least-once re-run after a crash-between-write-and-ack is harmless."""
     r = redis_client.get_redis()
+
+    reason = sheets_client.unconfigured_reason()
+    if reason:
+        # Leave the queue completely alone. Every transcript in it is still
+        # wanted; it just cannot be delivered until the Sheet is set up, and
+        # draining it into certain failure would mean nine doomed API calls and
+        # nine ERROR lines every sweep, forever.
+        try:
+            waiting = await r.llen(_WRITEBACK_QUEUE)
+        except Exception:
+            waiting = "?"
+        logger.warning(
+            f"[scheduler] {waiting} transcript(s) are queued for the Sheet and "
+            f"waiting: {reason} Nothing is lost — they will be written as soon "
+            "as it is configured."
+        )
+        return
 
     # Reclaim items a previous crashed run left mid-flight. Only one instance of
     # this job runs at a time (APScheduler max_instances=1), so nothing else is
