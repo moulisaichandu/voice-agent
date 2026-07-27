@@ -39,7 +39,7 @@ import logging
 import websockets
 from fastapi import WebSocket
 
-from app.config import ELEVENLABS_API_KEY
+from app.config import ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID
 from app.db.models import TranscriptTurn
 from app.telephony.elevenlabs_client import get_client
 from app.telephony.plivo_stream import PlivoCall
@@ -75,11 +75,17 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
     audio is never forwarded, so the agent cannot respond to it.
 
     language: an ISO code ('te', 'hi', 'en') for ElevenLabs to run the
-    conversation in, or None to send no override at all. None is not the same
+    conversation in, or None to send no LANGUAGE override. None is not the same
     as 'the default language': ElevenLabs RAISES if an override arrives for a
-    field that is not enabled in the agent's Security tab, so a campaign that
-    never asked for a language must send a frame with no override key in it.
-    See app/languages.py.
+    field that is not enabled in the agent's Security tab. See app/languages.py.
+
+    The conversation_config_override is assembled from two independent parts —
+    that language, and config's ELEVENLABS_VOICE_ID (a voice forced on EVERY
+    ElevenLabs call, including 'auto'). The frame carries no override key at all
+    only when NEITHER applies, which is what keeps a campaign on 'auto' with no
+    forced voice sending exactly the frame it always sent. app/telephony/
+    preflight.py is what guarantees the agent allows whichever fields are sent,
+    refusing to dial rather than letting ElevenLabs reject every call on answer.
 
     *outcome*: an optional dict for the caller to OWN, populated in place as
     the call progresses. It exists because this function's results used to be
@@ -106,13 +112,28 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
 
     try:
         async with websockets.connect(signed, max_size=16 * 1024 * 1024) as el_ws:
+            # Assembled from two INDEPENDENT parts: the campaign's language and
+            # the operator's forced voice. Either, both, or neither may apply —
+            # see the docstring on why an absent part must send no key at all.
+            override: dict = {}
+            if language:
+                override["agent"] = {"language": language}
+            if ELEVENLABS_VOICE_ID:
+                override["tts"] = {"voice_id": ELEVENLABS_VOICE_ID}
+
             init: dict = {
                 "type": "conversation_initiation_client_data",
                 "dynamic_variables": dynamic_variables or {},
             }
-            if language:
-                # Only when a language was actually chosen — see the docstring.
-                init["conversation_config_override"] = {"agent": {"language": language}}
+            if override:
+                # Omitted ENTIRELY when nothing is overridden — ElevenLabs
+                # raises for a field that isn't enabled in the Security tab.
+                init["conversation_config_override"] = override
+            if ELEVENLABS_VOICE_ID:
+                # The evidence that the frame actually changed, for when someone
+                # asks why a call did (or didn't) use the new voice.
+                logger.info(f"[bridge] lead {lead_id}: forcing voice "
+                            f"{ELEVENLABS_VOICE_ID}")
             await el_ws.send(json.dumps(init))
 
             # ── Plivo → ElevenLabs ───────────────────────────────────────────────

@@ -91,6 +91,11 @@ class _FakePlivoWS:
 def bridged(monkeypatch):
     """Wire bridge() to fakes and make the one-way timings test-fast."""
     monkeypatch.setattr(bridge, "ELEVENLABS_API_KEY", "sk-test")
+    # No forced voice by default. config.py calls load_dotenv(), so without this
+    # a real ELEVENLABS_VOICE_ID in .env would decide whether the "auto sends no
+    # override" guard below passes — making the suite depend on whose machine it
+    # runs on. Tests that want a forced voice set it explicitly.
+    monkeypatch.setattr(bridge, "ELEVENLABS_VOICE_ID", None)
     monkeypatch.setattr(plivo_stream, "ONEWAY_SILENCE_TAIL_S", 0)
     monkeypatch.setattr(plivo_stream, "ONEWAY_MAX_SILENT_S", 0)
 
@@ -275,3 +280,66 @@ async def test_the_override_does_not_disturb_the_dynamic_variables(bridged):
     assert frame["dynamic_variables"] == {"lead_id": "lead-1"}
     assert frame["conversation_config_override"]["agent"]["language"] == "hi"
     assert frame["type"] == "conversation_initiation_client_data"
+
+
+# ── the forced voice override (ELEVENLABS_VOICE_ID) ──────────────────────────
+# The voice is sent on EVERY ElevenLabs-backed call, independently of language,
+# because it exists to override an agent whose dashboard voice (or per-language
+# preset) is not what the operator wants. app/telephony/preflight.py is what
+# guarantees the agent actually allows the field.
+
+_VOICE = "ohvvU75FpBEB8fdaLOMh"
+
+
+async def test_the_configured_voice_is_forced_on_an_auto_campaign(bridged, monkeypatch):
+    """The whole point of forcing from code: an 'auto' campaign previously sent
+    NO override key at all, so a dashboard voice change was the only lever and a
+    per-language preset could silently win. It must now carry the voice."""
+    monkeypatch.setattr(bridge, "ELEVENLABS_VOICE_ID", _VOICE)
+    el_ws = _FakeElevenLabsWS([_metadata(), _agent_says("Hi."), _audio()])
+    bridged(el_ws)
+
+    await asyncio.wait_for(
+        bridge.bridge(_FakePlivoWS(), agent_id="agent_1", lead_id="lead-1",
+                      one_way=True),
+        timeout=5,
+    )
+
+    assert _initiation(el_ws)["conversation_config_override"] == {
+        "tts": {"voice_id": _VOICE}
+    }
+
+
+async def test_the_voice_and_the_language_travel_in_one_override(bridged, monkeypatch):
+    """Both are parts of the SAME override dict — adding the voice must not
+    displace the language (or vice versa)."""
+    monkeypatch.setattr(bridge, "ELEVENLABS_VOICE_ID", _VOICE)
+    el_ws = _FakeElevenLabsWS([_metadata(), _agent_says("Hi."), _audio()])
+    bridged(el_ws)
+
+    await asyncio.wait_for(
+        bridge.bridge(_FakePlivoWS(), agent_id="agent_1", lead_id="lead-1",
+                      language="hi", one_way=True),
+        timeout=5,
+    )
+
+    assert _initiation(el_ws)["conversation_config_override"] == {
+        "agent": {"language": "hi"},
+        "tts": {"voice_id": _VOICE},
+    }
+
+
+async def test_a_blank_voice_id_sends_no_tts_override(bridged, monkeypatch):
+    """Clearing the var in .env is the rollback, so it must restore the old
+    frame exactly — not send an empty voice_id, which would fail every call."""
+    monkeypatch.setattr(bridge, "ELEVENLABS_VOICE_ID", "")
+    el_ws = _FakeElevenLabsWS([_metadata(), _agent_says("Hi."), _audio()])
+    bridged(el_ws)
+
+    await asyncio.wait_for(
+        bridge.bridge(_FakePlivoWS(), agent_id="agent_1", lead_id="lead-1",
+                      one_way=True),
+        timeout=5,
+    )
+
+    assert "conversation_config_override" not in _initiation(el_ws)

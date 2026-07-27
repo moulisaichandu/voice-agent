@@ -171,3 +171,90 @@ def test_get_client_refuses_without_api_key(monkeypatch):
     monkeypatch.setattr(ec, "_client", None)
     with pytest.raises(RuntimeError, match="ELEVENLABS_API_KEY"):
         ec.get_client()
+
+
+# ── agent_language_support: what the agent can speak, and in which voice ──────
+# Nested shapes verified against elevenlabs==2.58.0:
+#   conversation_config.tts.{model_id,voice_id}
+#   conversation_config.language_presets[iso].overrides.tts.voice_id
+#   platform_settings.overrides.conversation_config_override.{agent.language,
+#                                                             tts.voice_id}
+# The last one is the Security-tab ALLOWLIST (booleans), not the payload.
+
+
+def _configured_agent(*, language="en", voice_id="voice_base",
+                      tts_model="eleven_flash_v2", language_presets=None,
+                      language_override=False, voice_override=False):
+    return SimpleNamespace(
+        conversation_config=SimpleNamespace(
+            agent=SimpleNamespace(language=language),
+            tts=SimpleNamespace(model_id=tts_model, voice_id=voice_id),
+            language_presets=language_presets or {},
+        ),
+        platform_settings=SimpleNamespace(
+            overrides=SimpleNamespace(
+                conversation_config_override=SimpleNamespace(
+                    agent=SimpleNamespace(language=language_override),
+                    tts=SimpleNamespace(voice_id=voice_override),
+                ),
+            ),
+        ),
+    )
+
+
+class _FakeConfiguredAgents:
+    def __init__(self, agent):
+        self._agent = agent
+
+    def get(self, agent_id):
+        return self._agent
+
+
+def test_agent_language_support_reports_the_configured_voice_and_override(monkeypatch):
+    """The voice fields are what let preflight refuse a dial before ElevenLabs
+    rejects the conversation, and what lets the operator see whether their
+    dashboard change actually landed."""
+    agent = _configured_agent(voice_id="voice_base", language_override=True,
+                              voice_override=True)
+    monkeypatch.setattr(ec, "get_client",
+                        lambda: _fake_client(agents=_FakeConfiguredAgents(agent)))
+
+    support = ec.agent_language_support("agent_1")
+
+    assert support["voice_id"] == "voice_base"
+    assert support["voice_override_allowed"] is True
+    # The pre-existing keys must be untouched — preflight and campaigns.py read them.
+    assert support["override_allowed"] is True
+    assert support["languages"] == {"en"}
+    assert support["tts_model"] == "eleven_flash_v2"
+
+
+def test_agent_language_support_degrades_to_unknown_when_the_shape_is_missing(monkeypatch):
+    """The SDK response shape is not a contract we control. A missing
+    intermediate must degrade to "I don't know" rather than raise inside
+    preflight — which never raises by design (worker.py would abort a
+    reservation). This is the property the new voice check depends on."""
+    monkeypatch.setattr(ec, "get_client", lambda: _fake_client(agents=_FakeAgents()))
+
+    support = ec.agent_language_support("agent_1")  # bare SimpleNamespace(agent_id=...)
+
+    assert support["voice_id"] is None
+    assert support["voice_override_allowed"] is False
+    assert support["preset_voice_ids"] == {}
+
+
+def test_agent_language_support_reports_a_per_language_preset_voice(monkeypatch):
+    """A per-language preset PINS a voice for that language, so changing the
+    agent's base voice in the dashboard cannot affect it — the most likely
+    reason a voice change appears not to take effect for one language."""
+    presets = {"hi": SimpleNamespace(
+        overrides=SimpleNamespace(tts=SimpleNamespace(voice_id="voice_preset")))}
+    agent = _configured_agent(voice_id="voice_base", language_presets=presets)
+    monkeypatch.setattr(ec, "get_client",
+                        lambda: _fake_client(agents=_FakeConfiguredAgents(agent)))
+
+    support = ec.agent_language_support("agent_1")
+
+    assert support["preset_voice_ids"] == {"hi": "voice_preset"}
+    assert support["voice_id"] == "voice_base"   # the base voice is unchanged
+    assert "hi" in support["languages"]          # presets still count as languages

@@ -26,6 +26,7 @@ from app import languages as languages_module
 from app.config import (
     CALL_WEBHOOK_SECRET,
     ELEVENLABS_API_KEY,
+    ELEVENLABS_VOICE_ID,
     OPENAI_API_KEY,
     OPENAI_TWOWAY_ENABLED,
     PLIVO_AUTH_ID,
@@ -149,39 +150,68 @@ async def preflight(
         return (f"Could not verify the agent with ElevenLabs ({type(exc).__name__}: "
                 f"{exc}). Not dialling while the platform's state is unknown.")
 
-    # Language, last: only reached when the chain is otherwise sound, and only
-    # when a language was actually requested. An 'auto' campaign overrides
-    # nothing and so cannot fail here — it must not gain a new way to not dial.
-    if language:
-        # Which questions are worth asking depends entirely on which backend
-        # will actually carry this call. An OpenAI-backed language has no
-        # ElevenLabs agent, no language preset and no override switch —
-        # running the ElevenLabs checks below against it would refuse the
-        # campaign for a reason unrelated to whether it can dial. See
-        # app/languages.py's backend_for_iso() for why this needs the ISO
-        # lookup rather than backend_for()'s token lookup.
-        if languages_module.backend_for_iso(language) == languages_module.OPENAI_REALTIME:
-            if not OPENAI_API_KEY:
-                return (
-                    f"This campaign dials in '{language}', which runs on the "
-                    "OpenAI Realtime backend, but OPENAI_API_KEY is not set. "
-                    "Set it in .env — it is the same key the RAG embedder uses."
-                )
-            return None
-
-        try:
-            support = await asyncio.to_thread(agent_language_support, agent_id)
-        except Exception as exc:
-            # Deliberately NOT a refusal. This check is an extra guard over a
-            # correctly-configured agent; an SDK or API change must not become
-            # a dial-stopping outage when the call would have worked fine.
-            # Every check above still applies.
-            logger.warning(
-                f"[preflight] could not read agent {agent_id}'s language support "
-                f"({type(exc).__name__}: {exc}) — dialling anyway"
+    # The agent's own configuration, last: only reached when the chain is
+    # otherwise sound. Both the language and the forced voice are answered by
+    # ONE read of the agent, so they share it.
+    #
+    # Which questions are worth asking depends entirely on which backend will
+    # actually carry this call. An OpenAI-backed language has no ElevenLabs
+    # agent, no language preset and no override switch — running the ElevenLabs
+    # checks below against it would refuse the campaign for a reason unrelated
+    # to whether it can dial, and a forced ElevenLabs voice is irrelevant to a
+    # call openai_bridge.py carries. See app/languages.py's backend_for_iso()
+    # for why this needs the ISO lookup rather than backend_for()'s token
+    # lookup. Checked OUTSIDE the `if language:` below because a forced voice
+    # must not drag an OpenAI-backed call into the ElevenLabs branch;
+    # backend_for_iso(None) is ELEVENLABS, so an 'auto' campaign never enters.
+    if languages_module.backend_for_iso(language) == languages_module.OPENAI_REALTIME:
+        if not OPENAI_API_KEY:
+            return (
+                f"This campaign dials in '{language}', which runs on the "
+                "OpenAI Realtime backend, but OPENAI_API_KEY is not set. "
+                "Set it in .env — it is the same key the RAG embedder uses."
             )
-            return None
+        return None
 
+    # Nothing overridden -> nothing to validate, and NO API call. This is what
+    # keeps an 'auto' campaign with no forced voice byte-identical to what it
+    # was before the voice override existed: bridge.py sends no
+    # conversation_config_override key at all, so ElevenLabs has nothing to
+    # reject, and such a campaign must not gain a new way to not dial.
+    if not language and not ELEVENLABS_VOICE_ID:
+        return None
+
+    try:
+        support = await asyncio.to_thread(agent_language_support, agent_id)
+    except Exception as exc:
+        # Deliberately NOT a refusal. These checks are an extra guard over a
+        # correctly-configured agent; an SDK or API change must not become
+        # a dial-stopping outage when the call would have worked fine.
+        # Every check above still applies.
+        logger.warning(
+            f"[preflight] could not read agent {agent_id}'s configuration "
+            f"({type(exc).__name__}: {exc}) — dialling anyway"
+        )
+        return None
+
+    # The voice first: once ELEVENLABS_VOICE_ID is set it is sent on EVERY
+    # ElevenLabs-backed call, including 'auto', so an agent that doesn't allow
+    # it fails 100% of its calls — a strictly larger blast radius than any
+    # language gate below. .get(), not a subscript: preflight never raising is
+    # a hard contract (worker.py would abort mid-reservation), and only the
+    # to_thread call above is inside the try.
+    if ELEVENLABS_VOICE_ID and not support.get("voice_override_allowed", False):
+        return (
+            f"ELEVENLABS_VOICE_ID is set ({ELEVENLABS_VOICE_ID}), so every call "
+            f"sends a voice override, but agent {agent_id} does not allow it. "
+            "ElevenLabs rejects an override for a field that isn't enabled, so "
+            "every call would fail on answer. Open that agent's Security tab and "
+            "enable the 'voice_id' override (Overrides -> TTS -> Voice ID), or "
+            "clear ELEVENLABS_VOICE_ID in .env to use the agent's own voice. "
+            "Run scripts/check_agent_language_support.py to see both agents."
+        )
+
+    if language:
         if not support["override_allowed"]:
             return (
                 f"This campaign dials in '{language}', but agent {agent_id} does "

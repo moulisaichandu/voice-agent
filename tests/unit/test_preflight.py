@@ -48,6 +48,10 @@ def _configured(monkeypatch, **overrides):
         "PLIVO_FROM_NUMBER": "+918035383564",
         "PUBLIC_BASE_URL": "https://example.trycloudflare.com",
         "CALL_WEBHOOK_SECRET": "s3cret",
+        # No forced voice by default: config.py calls load_dotenv(), so without
+        # pinning this a real .env value would change what preflight checks
+        # depending on whose machine runs the suite. Voice tests set it.
+        "ELEVENLABS_VOICE_ID": None,
     }
     values.update(overrides)
     for name, value in values.items():
@@ -172,7 +176,9 @@ async def test_all_checks_pass_returns_none(monkeypatch):
 
 def _support(monkeypatch, **overrides):
     support = {"override_allowed": True, "languages": {"en", "te", "hi"},
-               "tts_model": "eleven_v3_conversational"}
+               "tts_model": "eleven_v3_conversational",
+               "voice_override_allowed": True, "voice_id": "voice_base",
+               "preset_voice_ids": {}}
     support.update(overrides)
     monkeypatch.setattr(pf, "agent_language_support", lambda agent_id: support)
 
@@ -336,6 +342,73 @@ async def test_hindi_still_runs_the_elevenlabs_checks(monkeypatch):
     reason = await pf.preflight("agent_1", "hi")
     assert reason is not None
     assert "Security" in reason
+
+
+# ── the forced voice (ELEVENLABS_VOICE_ID) must be validated too ──────────────
+#
+# Once set, bridge.py sends a tts.voice_id override on EVERY ElevenLabs-backed
+# call — including 'auto', which previously sent no override at all and so was
+# never validated here. An agent that doesn't allow the field rejects 100% of
+# its calls, so this gate has to fire for auto campaigns as well.
+
+_VOICE = "ohvvU75FpBEB8fdaLOMh"
+
+
+async def test_a_forced_voice_is_validated_even_on_an_auto_campaign(monkeypatch):
+    """The gap this closes: 'auto' skipped agent validation entirely, so a
+    forced voice would have been sent unchecked and failed every call on
+    answer, with nothing in our logs explaining why."""
+    _configured(monkeypatch, ELEVENLABS_VOICE_ID=_VOICE)
+    _support(monkeypatch, voice_override_allowed=False)
+
+    reason = await pf.preflight("agent_1")  # no language: an auto campaign
+
+    assert reason is not None
+    assert "Security" in reason
+    assert _VOICE in reason
+
+
+async def test_an_auto_campaign_with_a_forced_voice_dials_when_allowed(monkeypatch):
+    _configured(monkeypatch, ELEVENLABS_VOICE_ID=_VOICE)
+    _support(monkeypatch)
+    assert await pf.preflight("agent_1") is None
+
+
+async def test_a_voice_lookup_failure_does_not_block_an_auto_campaign(monkeypatch):
+    """Fail-open is preserved on the NEW code path: this check is an extra
+    guard over a correctly-configured agent, and an SDK/API outage must not
+    become a dial-stopping outage of its own."""
+    _configured(monkeypatch, ELEVENLABS_VOICE_ID=_VOICE)
+
+    def boom(agent_id):
+        raise RuntimeError("ElevenLabs API down")
+
+    monkeypatch.setattr(pf, "agent_language_support", boom)
+    assert await pf.preflight("agent_1") is None
+
+
+async def test_a_forced_voice_never_consults_elevenlabs_for_an_openai_call(monkeypatch):
+    """A Telugu call is carried by openai_bridge.py, which sends no ElevenLabs
+    override at all — so a forced ElevenLabs voice is irrelevant to it and must
+    not make preflight interrogate an agent that will never carry the call."""
+    _configured(monkeypatch, ELEVENLABS_VOICE_ID=_VOICE, OPENAI_API_KEY="sk-test")
+
+    def boom(agent_id):
+        raise AssertionError("must not query ElevenLabs for an OpenAI-backed call")
+
+    monkeypatch.setattr(pf, "agent_language_support", boom)
+    assert await pf.preflight("agent_1", "te") is None
+
+
+async def test_the_language_checks_still_run_when_a_voice_is_forced(monkeypatch):
+    """The new voice gate must not swallow the pre-existing language gates."""
+    _configured(monkeypatch, ELEVENLABS_VOICE_ID=_VOICE)
+    _support(monkeypatch, override_allowed=False)
+
+    reason = await pf.preflight("agent_1", "hi")
+
+    assert reason is not None
+    assert "language override" in reason
 
 
 # ── refuse a two-way call on a backend not yet PROVEN on a live call ─────────

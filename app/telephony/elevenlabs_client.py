@@ -137,10 +137,19 @@ def subscription_status() -> dict:
 
 
 def agent_language_support(agent_id: str) -> dict:
-    """What languages this agent can actually be asked to speak.
+    """What languages this agent can actually be asked to speak, and in which voice.
 
     Returns {"override_allowed": bool, "languages": set[str],
-             "tts_model": str | None}.
+             "tts_model": str | None, "voice_id": str | None,
+             "voice_override_allowed": bool, "preset_voice_ids": dict[str, str]}.
+
+    The voice keys exist because app/telephony/bridge.py can force a voice on
+    every call (config's ELEVENLABS_VOICE_ID): `voice_override_allowed` is what
+    preflight checks before dialling, since ElevenLabs rejects the conversation
+    outright if the Security tab doesn't allow the field. `voice_id` and
+    `preset_voice_ids` are diagnostics — a per-language preset PINS a voice for
+    that language, so changing the agent's base voice in the dashboard cannot
+    affect it, which is the usual reason a voice change appears not to work.
 
     Read with getattr chains rather than direct attribute access on purpose:
     this reaches four levels into an SDK response whose shape is not part of
@@ -156,6 +165,16 @@ def agent_language_support(agent_id: str) -> dict:
       agent.conversation_config.tts.model_id                -> "eleven_flash_v2"
       agent.platform_settings.overrides.conversation_config_override
           .agent.language                                   -> False
+
+    Voice paths, verified the same way against elevenlabs==2.58.0's types:
+      agent.conversation_config.tts.voice_id                -> the base voice
+      agent.conversation_config.language_presets[iso]
+          .overrides.tts.voice_id                           -> a PINNED
+                                                               per-language voice
+      agent.platform_settings.overrides.conversation_config_override
+          .tts.voice_id                                     -> bool, the
+                                                               Security-tab
+                                                               allowlist flag
     """
     agent = get_client().conversational_ai.agents.get(agent_id)
 
@@ -173,14 +192,32 @@ def agent_language_support(agent_id: str) -> dict:
     except TypeError:
         pass
 
+    # A voice pinned for ONE language by a preset. Same defensive walk as
+    # above: an unexpected shape must yield "none found", never raise.
+    preset_voices: dict[str, str] = {}
+    try:
+        for iso, preset in presets.items():
+            pinned = getattr(
+                getattr(getattr(preset, "overrides", None), "tts", None),
+                "voice_id", None,
+            )
+            if pinned:
+                preset_voices[str(iso)] = str(pinned)
+    except (AttributeError, TypeError):
+        pass
+
     overrides = getattr(getattr(agent, "platform_settings", None), "overrides", None)
     ov_conv = getattr(overrides, "conversation_config_override", None)
     ov_agent = getattr(ov_conv, "agent", None)
+    ov_tts = getattr(ov_conv, "tts", None)
 
     return {
         "override_allowed": bool(getattr(ov_agent, "language", False)),
         "languages": languages_,
         "tts_model": getattr(tts_cfg, "model_id", None),
+        "voice_id": getattr(tts_cfg, "voice_id", None),
+        "voice_override_allowed": bool(getattr(ov_tts, "voice_id", False)),
+        "preset_voice_ids": preset_voices,
     }
 
 

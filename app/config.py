@@ -160,6 +160,23 @@ ELEVENLABS_WEBHOOK_SECRET: str | None = os.getenv("ELEVENLABS_WEBHOOK_SECRET")
 # Set once an agent exists in the ElevenLabs dashboard / is created via API.
 ELEVENLABS_ONEWAY_AGENT_ID: str | None = os.getenv("ELEVENLABS_ONEWAY_AGENT_ID")
 ELEVENLABS_TWOWAY_AGENT_ID: str | None = os.getenv("ELEVENLABS_TWOWAY_AGENT_ID")
+# Force ONE voice on every ElevenLabs-backed call (en/hi/hinglish AND auto),
+# overriding whatever voice each agent is configured with — including a
+# per-language preset, which pins a voice for one language and is the usual
+# reason a dashboard voice change appears not to take effect.
+#
+# Blank/unset means send no voice at all: the call frame is then byte-identical
+# to what it was before this existed (see app/telephony/bridge.py).
+#
+# SETTING THIS REQUIRES a one-time dashboard step on EVERY agent id in use
+# (both ELEVENLABS_{ONEWAY,TWOWAY}_AGENT_ID): Security -> Overrides -> enable
+# Voice ID. ElevenLabs REJECTS the whole conversation if an override arrives for
+# a field that isn't enabled, so preflight refuses to dial an agent that doesn't
+# allow it rather than letting every call fail on answer.
+#
+# Stripped and blank-normalised, unlike the plain getenv reads above: a trailing
+# space in .env would be sent as a voice id of "abc123 " and fail every call.
+ELEVENLABS_VOICE_ID: str | None = (os.getenv("ELEVENLABS_VOICE_ID") or "").strip() or None
 # Only used if ElevenLabs ever places calls itself (its own SIP-trunk number).
 # The live path does NOT use it: Plivo places the call and app/telephony/
 # bridge.py bridges the audio, so no number is registered inside ElevenLabs.
