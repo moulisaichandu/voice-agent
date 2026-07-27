@@ -1,9 +1,9 @@
 """telephony/sarvam_llm.py — Sarvam's LLM, as this backend uses it.
 
-Today it does one job: turn the operator's campaign script into the Telugu the
-lead actually hears. Milestone B adds the two-way turn loop here; the client
-and the auth live in one place so that arrives as a function, not a second
-vendor integration.
+One job: turn the operator's campaign script into the Telugu the lead actually
+hears. The two-way conversation loop deliberately does NOT live here — see
+app/telephony/conversation_llm.py, and the timeout comment below, for why the
+two jobs ended up on different models.
 
 WHY A COMPLETION AT ALL ON A ONE-WAY CALL. The operator writes campaign scripts
 in English. ElevenLabs and OpenAI Realtime both speak, so their model rendered
@@ -31,9 +31,7 @@ TWO THINGS THIS MODULE OWNS BEYOND THE HTTP CALL:
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
-from dataclasses import dataclass
 
 import httpx
 
@@ -76,82 +74,9 @@ _CACHE_TTL_S = 7 * 24 * 3600
 _DISCLOSURE_PREFIX = "ఇది కృత్రిమ మేధ ద్వారా చేసే ఆటోమేటెడ్ కాల్."
 
 
-SEARCH_TOOL_NAME = "search_course_material"
-END_CALL_TOOL_NAME = "end_call"
-
-# Chat-completions tool shape (nested under "function"), NOT the flat shape the
-# OpenAI Realtime API uses — app/telephony/openai_bridge.py's tools look
-# different for that reason and the two must not be copied between backends.
-TOOLS: list[dict] = [
-    {
-        "type": "function",
-        "function": {
-            "name": SEARCH_TOOL_NAME,
-            "description": (
-                "Search Digital Brolly's course documents for material relevant "
-                "to the lead's question. Call this for every question about "
-                "courses, fees, timings, batches or placement — never answer "
-                "those from memory."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": ("The lead's question, as a concise "
-                                        "search query in English."),
-                    },
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": END_CALL_TOOL_NAME,
-            "description": (
-                "End the call. Use this once the conversation has genuinely "
-                "finished — the lead has said goodbye, asked not to be called, "
-                "or has nothing further to ask."
-            ),
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-]
-
-
-@dataclass(frozen=True)
-class ToolCall:
-    """One tool the model asked for, with its arguments already parsed."""
-
-    call_id: str
-    name: str
-    arguments: dict
-
-
-@dataclass(frozen=True)
-class LLMReply:
-    """One assistant turn: something to say, tools to run, or both."""
-
-    text: str
-    tool_calls: list[ToolCall]
-
-
 class SarvamNotConfigured(RuntimeError):
     """No SARVAM_API_KEY. Raised before calling out, so the bridge turns it
     into a failed outcome rather than discovering it mid-call."""
-
-
-class SarvamNoAnswer(RuntimeError):
-    """The model produced a turn with nothing to say and no tool to call.
-
-    Its own doing, not a transport failure: a reasoning model that runs out of
-    token budget mid-thought returns `content: null`. On a live call that is
-    the agent going silent on a lead who just asked a question, which is
-    indistinguishable from a dropped call — so it is raised rather than
-    returned as an empty string somebody might quietly speak.
-    """
 
 
 class SarvamRenderFailed(RuntimeError):
@@ -291,78 +216,3 @@ async def render(script: str, *, language_style: str | None = None) -> str:
     # campaign, and would look compliant to anyone who trusted the cache.
     await _cache_put(key, rendered)
     return rendered
-
-
-def _parse_tool_calls(message: dict) -> list[ToolCall]:
-    """The model's tool_calls, with their JSON-string arguments decoded.
-
-    Malformed arguments become an empty dict rather than raising. A model that
-    emits broken JSON should cost one useless tool call, not the conversation —
-    and search_relevant("") returns the no-material note, which the agent can
-    say out loud instead of going silent on a lead who is waiting.
-    """
-    parsed: list[ToolCall] = []
-    for raw in message.get("tool_calls") or []:
-        function = raw.get("function") or {}
-        try:
-            arguments = json.loads(function.get("arguments") or "{}")
-        except (ValueError, TypeError):
-            logger.warning(
-                f"[sarvam-llm] tool {function.get('name')!r} was called with "
-                "arguments that are not JSON — treating them as empty."
-            )
-            arguments = {}
-        if not isinstance(arguments, dict):
-            arguments = {}
-        parsed.append(ToolCall(
-            call_id=str(raw.get("id") or ""),
-            name=str(function.get("name") or ""),
-            arguments=arguments,
-        ))
-    return parsed
-
-
-async def turn(messages: list[dict]) -> LLMReply:
-    """One conversational turn: what to say next, or which tools to run first.
-
-    Deliberately NOT cached. render()'s cache is keyed on a script's content
-    and works because one script renders identically for every lead; a
-    conversation turn depends on everything said so far, so serving a cached
-    one would replay another lead's answer to this lead.
-
-    Non-streaming, for now. Streaming would let the first sentence reach the
-    synthesiser before the model has finished thinking, which is the obvious
-    latency win — but streaming and tool calls together is a much larger piece
-    of protocol handling, and the first thing to establish is whether the
-    turn-taking is right at all. Measure before optimising: the live-call gate
-    exists to produce that number.
-    """
-    if not SARVAM_API_KEY:
-        raise SarvamNotConfigured(
-            "SARVAM_API_KEY is not set — the agent cannot hold a conversation."
-        )
-
-    message = await _post_chat({
-        "model": SARVAM_LLM_MODEL,
-        "messages": messages,
-        "tools": TOOLS,
-        "tool_choice": "auto",
-        # Higher than render()'s: this is conversation, where identical
-        # phrasing every time sounds robotic, not a translation with one right
-        # answer.
-        "temperature": 0.6,
-    })
-    reply = LLMReply(
-        text=(message.get("content") or "").strip(),
-        tool_calls=_parse_tool_calls(message),
-    )
-    if not reply.text and not reply.tool_calls:
-        # Calling a tool without speaking first is normal — the model looks
-        # something up, then answers. Neither speaking NOR calling a tool is
-        # not: see SarvamNoAnswer.
-        raise SarvamNoAnswer(
-            "Sarvam returned a turn with no content and no tool call "
-            f"(reasoning_content was {len(message.get('reasoning_content') or '')} "
-            "characters — the model may have spent its whole budget thinking)."
-        )
-    return reply

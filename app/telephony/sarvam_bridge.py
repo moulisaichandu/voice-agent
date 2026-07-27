@@ -45,6 +45,7 @@ from app.config import SARVAM_API_KEY, SARVAM_STT_LANGUAGE, SARVAM_TWOWAY_ENABLE
 from app.db.models import TranscriptTurn
 from app.rag.search import search_relevant
 from app.telephony import (
+    conversation_llm,
     plivo_stream,
     sarvam_llm,
     sarvam_prompts,
@@ -62,6 +63,26 @@ _MAX_TOOL_ROUNDS = 3
 # record what the lead heard at sentence granularity, which is the unit a
 # conversation can actually be truncated at.
 _SENTENCE_END = re.compile(r"(?<=[.!?।])\s+")
+
+# How long a two-way call may sit with NEITHER side speaking before it ends
+# itself.
+#
+# This exists because ending the call cannot be left to the model. Measured
+# against the live API on 2026-07-27: told to say goodbye and call end_call,
+# it said the goodbye and did not call the tool — 0 times out of 3, even when
+# instructed to do it in that specific turn. The best prompt variant managed
+# 2/3, and only by weakening the OUTPUT FORMAT rule that stops the synthesiser
+# reading preambles aloud to the lead, which is not a trade worth making.
+#
+# So the call ends on silence instead, the same way PlivoCall.oneway_watchdog
+# ends a message-only call. Without it a lead who says goodbye leaves the line
+# open to CALL_MAX_DURATION_S: five minutes of billed airtime and silence.
+#
+# Deliberately driven from this bridge rather than PlivoCall.run(), because the
+# ElevenLabs two-way path is in production and must not acquire a new way to
+# hang up on someone.
+TWOWAY_MAX_SILENT_S = 20.0
+_SILENCE_POLL_S = 0.25
 
 
 class SpokenLedger:
@@ -147,6 +168,11 @@ class _Conversation:
         # more sentences at the lead after they interrupted.
         self.generation = 0
         self.reply_task: asyncio.Task | None = None
+        # Wall-clock of the last thing either side did. The silence watchdog
+        # measures against this rather than against call start, so a lead who
+        # is mid-question is never hung up on.
+        self._loop = asyncio.get_event_loop()
+        self.last_activity = self._loop.time()
         # Index into self.turns / self.history of the agent turn currently
         # being spoken, so a barge-in can rewrite exactly that one.
         self._agent_turn_index: int | None = None
@@ -184,6 +210,35 @@ class _Conversation:
                 await self.call.play(payload)
                 spoken_ms += duration_ms
             self.ledger.add(sentence, spoken_ms)
+            self.note_activity()
+
+    def note_activity(self) -> None:
+        """Somebody spoke. Resets the silence watchdog."""
+        self.last_activity = self._loop.time()
+
+    async def watch_for_silence(self) -> None:
+        """End the call once neither side has spoken for TWOWAY_MAX_SILENT_S.
+
+        Not a duration cap — it measures SILENCE. A conversation that is still
+        going resets the clock on every event, so this only fires on a line
+        that has genuinely finished.
+
+        A reply still being generated counts as activity: the lead is waiting
+        for an answer, not sitting in a dead call.
+        """
+        while not self.call.stop.is_set():
+            await asyncio.sleep(_SILENCE_POLL_S)
+            if self.reply_task is not None and not self.reply_task.done():
+                self.note_activity()
+                continue
+            if self._loop.time() - self.last_activity >= TWOWAY_MAX_SILENT_S:
+                logger.info(
+                    f"[sarvam] lead={self.lead_id} ending a conversation that "
+                    f"has been silent for {TWOWAY_MAX_SILENT_S:.0f}s."
+                )
+                self.call.note_exit("twoway_silence")
+                break
+        self.call.stop.set()
 
     def truncate_to_what_was_heard(self) -> None:
         """Rewrite the agent's current turn down to the part that played.
@@ -248,7 +303,7 @@ class _Conversation:
     async def _reply(self, tts: sarvam_tts.SarvamTTS) -> None:
         try:
             for _round in range(_MAX_TOOL_ROUNDS):
-                reply = await sarvam_llm.turn(self.history)
+                reply = await conversation_llm.turn(self.history)
                 if not reply.tool_calls:
                     if reply.text:
                         await self.say(tts, reply.text)
@@ -268,7 +323,7 @@ class _Conversation:
             logger.error(f"[sarvam] lead={self.lead_id} turn failed: "
                          f"{type(exc).__name__}: {exc}")
 
-    async def _run_tools(self, reply: sarvam_llm.LLMReply) -> bool:
+    async def _run_tools(self, reply: conversation_llm.LLMReply) -> bool:
         """Run the model's tool calls. Returns True if the call should end.
 
         The assistant message carrying tool_calls has to go into the history
@@ -287,14 +342,14 @@ class _Conversation:
         })
 
         for tool_call in reply.tool_calls:
-            if tool_call.name == sarvam_llm.END_CALL_TOOL_NAME:
+            if tool_call.name == conversation_llm.END_CALL_TOOL_NAME:
                 # A conversation the agent ended cleanly, not a dropped call.
                 # 'sarvam_end_call' is in plivo_stream._CLEAN_EXITS for this.
                 self.call.note_exit("sarvam_end_call")
                 self.call.stop.set()
                 return True
 
-            if tool_call.name == sarvam_llm.SEARCH_TOOL_NAME:
+            if tool_call.name == conversation_llm.SEARCH_TOOL_NAME:
                 # search_relevant, never search_permissive — CLAUDE.md's hard
                 # rule. It applies the relevance floor and always returns
                 # something speakable, so the agent is never left with nothing
@@ -336,6 +391,7 @@ async def _run_two_way(call: plivo_stream.PlivoCall, *, lead_id: str,
                 async for event in stt.events():
                     if call.stop.is_set():
                         break
+                    conversation.note_activity()
                     if event.kind == "speech_started":
                         await conversation.on_barge_in()
                     elif event.kind == "transcript":
@@ -348,7 +404,8 @@ async def _run_two_way(call: plivo_stream.PlivoCall, *, lead_id: str,
                 await conversation._cancel_reply()
                 call.stop.set()
 
-        await call.run(call.read_events(to_sarvam), converse())
+        await call.run(call.read_events(to_sarvam), converse(),
+                       conversation.watch_for_silence())
 
 
 async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,

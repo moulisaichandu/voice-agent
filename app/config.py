@@ -268,8 +268,10 @@ SARVAM_STT_MODEL = os.getenv("SARVAM_STT_MODEL", "saaras:v3")
 # the lead is transcribed as nonsense, and the agent answers the nonsense.
 # Sarvam wants a BCP-47 code (te-IN), not the bare ISO code.
 SARVAM_STT_LANGUAGE = os.getenv("SARVAM_STT_LANGUAGE", "te-IN")
-# The conversation brain for two-way, and the renderer that turns an English
-# script into spoken Telugu for one-way. OpenAI-compatible chat completions.
+# Renders an English campaign script into spoken Telugu. Sarvam's own model,
+# because it is Indic-tuned and the output quality showed on the first live
+# test — and because this runs ONCE per campaign, off the call path (see
+# CONVERSATION_LLM_PROVIDER for why that distinction matters).
 SARVAM_LLM_MODEL = os.getenv("SARVAM_LLM_MODEL", "sarvam-105b")
 # Sarvam's own VAD decides when the lead has started/stopped speaking, which is
 # what drives barge-in. Higher sensitivity catches quieter speech at the cost of
@@ -292,6 +294,36 @@ SARVAM_TWOWAY_ENABLED = _bool("SARVAM_TWOWAY_ENABLED", False)
 # disagree about their backend, preflight would check one backend's
 # prerequisites for a call the other was about to place.
 TELUGU_BACKEND = _choice("TELUGU_BACKEND", "sarvam", ("sarvam", "openai_realtime"))
+
+# ── the two-way conversation brain ───────────────────────────────────────────
+# Separate from SARVAM_LLM_MODEL above because the two jobs have opposite
+# constraints. Rendering a script happens once per campaign and is cached, so
+# it can afford to be slow and should be the best Indic model available.
+# Answering a lead mid-call happens every turn, with a real person waiting in
+# silence, so it has to be FAST.
+#
+# Sarvam's chat models cannot do the second job. Measured against the live API
+# 2026-07-27: both sarvam-105b and sarvam-30b are REASONING models that spend
+# 400-2000 completion tokens thinking before answering, and it cannot be turned
+# off (reasoning_effort takes only low/medium/high; thinking.type=disabled and
+# chat_template_kwargs.enable_thinking=False are accepted and ignored; capping
+# max_tokens truncates inside the reasoning and returns no answer at all). A
+# realistic conversational turn measured 21.8 seconds. A lead asking "how much
+# are the fees?" would sit in silence for twenty-two seconds.
+#
+# So the conversation runs on an ordinary, fast chat model. Both providers speak
+# the same OpenAI-compatible protocol, so this is a URL and a key, not a second
+# integration. Set to 'sarvam' to keep everything in one vendor if their latency
+# ever changes.
+CONVERSATION_LLM_PROVIDER = _choice(
+    "CONVERSATION_LLM_PROVIDER", "openai", ("openai", "sarvam"))
+# Blank picks the provider's default (gpt-4o-mini / sarvam-105b) rather than
+# forcing an operator switching providers to remember to change two variables.
+CONVERSATION_LLM_MODEL = os.getenv("CONVERSATION_LLM_MODEL", "")
+# A turn the lead is waiting through. Far shorter than the render timeout on
+# purpose: past this the answer is no longer worth having, because the lead has
+# already decided the line is dead.
+CONVERSATION_LLM_TIMEOUT_S = _float("CONVERSATION_LLM_TIMEOUT_S", 12.0)
 
 # ── EMBEDDINGS (OpenAI text-embedding-3-small) ────────────────────────────────
 # A separate credential from ElevenLabs — text-embedding-3-small is an OpenAI

@@ -30,10 +30,19 @@ Async everywhere.
   Hinglish, and `auto`. `app/telephony/bridge.py`.
 - **Sarvam** (`SARVAM_API_KEY`) — **Telugu and Tinglish**, one-way live and
   two-way built-but-gated. `app/telephony/sarvam_bridge.py`. NOT a
-  speech-to-speech API: STT (`saaras:v3`), LLM (`sarvam-105b`) and TTS
-  (`bulbul:v3`) are three separate services and **the turn-taking between them
-  is ours**. That is why two-way is possible here at all, and why the barge-in
-  handling is this backend's most delicate code — see `SpokenLedger`.
+  speech-to-speech API: STT (`saaras:v3`), TTS (`bulbul:v3`) and an LLM are
+  three separate services and **the turn-taking between them is ours**. That is
+  why two-way is possible here at all, and why the barge-in handling is this
+  backend's most delicate code — see `SpokenLedger`.
+  - **Two jobs, two models, deliberately.** `sarvam_llm.render()` turns the
+    English script into Telugu on `sarvam-105b` — once per campaign, warmed at
+    campaign creation, so it can be slow and Indic-tuned. `conversation_llm`
+    answers the lead mid-call and defaults to **OpenAI**, because Sarvam's chat
+    models are reasoning models: a real conversational turn measured **21.8s**
+    and the reasoning cannot be disabled (`reasoning_effort` takes only
+    low/medium/high; `thinking.type=disabled` is accepted and ignored; capping
+    `max_tokens` truncates inside the reasoning and returns no answer).
+    The same turn on OpenAI measures ~1.5s.
 - **OpenAI Realtime** (`gpt-realtime-2.1`, uses the existing `OPENAI_API_KEY`) —
   the PREVIOUS Telugu backend, kept working and kept tested as a rollback.
   `app/telephony/openai_bridge.py`. Reached only when
@@ -132,6 +141,15 @@ the only transcoding anywhere in the project. It is pure-Python on purpose —
   nobody heard, and the agent starts referring back to things it never said.
   A partly-played sentence is DROPPED, not kept — under-claiming makes the
   agent repeat itself, over-claiming makes it incoherent.
+- **Nothing relies on the model calling `end_call`.** Measured against the live
+  API: instructed to say goodbye and end the call, it says the goodbye and does
+  not call the tool — 0/3, even when told to do it in that exact turn; the best
+  prompt variant reached 2/3 and only by weakening the rule that stops the
+  synthesiser reading preambles aloud. `sarvam_bridge`'s `watch_for_silence`
+  ends the call when neither side has spoken for `TWOWAY_MAX_SILENT_S`, the
+  same shape as `PlivoCall.oneway_watchdog`. It is scoped to this bridge on
+  purpose — the ElevenLabs two-way path is in production and must not acquire a
+  new way to hang up on someone.
 - On both Telugu backends a script may be written in English and rendered into
   Telugu by a model, so `has_ai_disclosure()`'s creation-time check on
   `campaigns.script` does NOT guarantee what the lead actually hears.

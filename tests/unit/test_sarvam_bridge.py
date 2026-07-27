@@ -375,7 +375,7 @@ def two_way(monkeypatch):
             seen["histories"].append([dict(m) for m in history])
             if queued:
                 return queued.pop(0)
-            return sarvam_bridge.sarvam_llm.LLMReply(text="Ok.", tool_calls=[])
+            return sarvam_bridge.conversation_llm.LLMReply(text="Ok.", tool_calls=[])
 
         async def fake_render(script, *, language_style=None):
             return _TELUGU
@@ -386,7 +386,7 @@ def two_way(monkeypatch):
 
         monkeypatch.setattr(sarvam_bridge.sarvam_tts, "_connect", fake_tts_connect)
         monkeypatch.setattr(sarvam_bridge.sarvam_stt, "_connect", fake_stt_connect)
-        monkeypatch.setattr(sarvam_bridge.sarvam_llm, "turn", fake_turn)
+        monkeypatch.setattr(sarvam_bridge.conversation_llm, "turn", fake_turn)
         monkeypatch.setattr(sarvam_bridge.sarvam_llm, "render", fake_render)
         monkeypatch.setattr(sarvam_bridge, "search_relevant", fake_search)
         return seen, tts_ws, stt_ws
@@ -395,11 +395,11 @@ def two_way(monkeypatch):
 
 
 def _reply(text="", tools=()):
-    return sarvam_bridge.sarvam_llm.LLMReply(text=text, tool_calls=list(tools))
+    return sarvam_bridge.conversation_llm.LLMReply(text=text, tool_calls=list(tools))
 
 
 def _tool(name, **arguments):
-    return sarvam_bridge.sarvam_llm.ToolCall(
+    return sarvam_bridge.conversation_llm.ToolCall(
         call_id="c1", name=name, arguments=arguments)
 
 
@@ -530,3 +530,66 @@ async def test_two_way_is_refused_while_its_flag_is_off(two_way, monkeypatch):
     assert outcome["status"] == "failed"
     assert outcome["turns"] == 0
     assert not any(m.get("event") == "playAudio" for m in plivo.sent)
+
+
+# ── the two-way silence watchdog ─────────────────────────────────────────────
+#
+# Measured against the live API: told to say goodbye AND call end_call, the
+# model says the goodbye and does not call the tool — 0/3, even when instructed
+# to do it explicitly in that turn. The best prompt variant reached 2/3, and
+# only by weakening the OUTPUT FORMAT rule that stops the synthesiser reading
+# preambles aloud to the lead. That is not a trade worth making.
+#
+# So ending the call does not depend on the model. If nobody has spoken for
+# TWOWAY_MAX_SILENT_S, the call ends by itself — the same shape as
+# PlivoCall.oneway_watchdog, and for the same reason: without it the line sits
+# open to CALL_MAX_DURATION_S, five minutes of billed airtime at a lead who
+# already said goodbye.
+#
+# Scoped to this bridge on purpose. The ElevenLabs two-way path is in
+# production and must not acquire a new way to hang up on someone.
+
+async def test_a_two_way_call_ends_itself_when_both_sides_go_quiet(two_way,
+                                                                   monkeypatch):
+    monkeypatch.setattr(sarvam_bridge, "TWOWAY_MAX_SILENT_S", 0.2)
+    monkeypatch.setattr(sarvam_bridge.plivo_stream, "CALL_MAX_DURATION_S", 30)
+    two_way([_said("థాంక్స్, బై.")], replies=[_reply(text="ధన్యవాదాలు.")])
+
+    outcome = await asyncio.wait_for(
+        sarvam_bridge.bridge(_FakePlivoWS(), agent_id="x", lead_id="lead-1",
+                             language="te", one_way=False,
+                             dynamic_variables={"script": "Course starts Monday."}),
+        timeout=10,
+    )
+
+    assert outcome["status"] == "done", (
+        "a conversation that ran its course is not a failed call — grading it "
+        "failed would mark the lead failed and burn a retry"
+    )
+
+
+async def test_the_call_is_not_cut_off_while_someone_is_still_talking(two_way,
+                                                                     monkeypatch):
+    """The watchdog must measure SILENCE, not elapsed time. A lead who is
+    mid-question when it fires is hung up on."""
+    monkeypatch.setattr(sarvam_bridge, "TWOWAY_MAX_SILENT_S", 60)
+    monkeypatch.setattr(sarvam_bridge.plivo_stream, "CALL_MAX_DURATION_S", 1)
+    two_way([_said("ఫీజు ఎంత?")], replies=[_reply(text="ఇరవై అయిదు వేలు.")])
+
+    outcome = await asyncio.wait_for(
+        sarvam_bridge.bridge(_FakePlivoWS(), agent_id="x", lead_id="lead-1",
+                             language="te", one_way=False,
+                             dynamic_variables={"script": "Course starts Monday."}),
+        timeout=10,
+    )
+
+    # Ended by max_duration, not by the watchdog — the conversation was active.
+    assert any(t.role == "lead" for t in outcome["transcript"])
+
+
+def test_a_conversation_that_went_quiet_counts_as_a_clean_exit():
+    """'twoway_silence' must be in plivo_stream._CLEAN_EXITS. Without it every
+    conversation that ended by both sides finishing would be stored 'failed',
+    mark its lead failed, and burn a retry on someone who said goodbye."""
+    from app.telephony import plivo_stream
+    assert "twoway_silence" in plivo_stream._CLEAN_EXITS

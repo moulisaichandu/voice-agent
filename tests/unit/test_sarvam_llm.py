@@ -202,91 +202,6 @@ async def test_the_repaired_text_is_what_gets_cached(llm):
     assert has_ai_disclosure(next(iter(redis.store.values())))
 
 
-# ── turn(): the two-way conversation call ────────────────────────────────────
-
-_HISTORY = [
-    {"role": "system", "content": "You are a voice assistant."},
-    {"role": "user", "content": "ఫీజు ఎంత?"},
-]
-
-
-def _reply(content=None, tool_calls=None):
-    message: dict = {"role": "assistant", "content": content}
-    if tool_calls:
-        message["tool_calls"] = tool_calls
-    return {"choices": [{"message": message}]}
-
-
-async def test_a_turn_returns_the_assistant_text(llm):
-    llm(payload=_reply(content="ఫీజు ఇరవై అయిదు వేలు."))
-    reply = await sarvam_llm.turn(_HISTORY)
-    assert reply.text == "ఫీజు ఇరవై అయిదు వేలు."
-    assert reply.tool_calls == []
-
-
-async def test_a_turn_sends_the_tools_and_the_history(llm):
-    llm(payload=_reply(content="సరే."))
-    await sarvam_llm.turn(_HISTORY)
-
-    sent = _FakeAsyncClient.calls[0]["json"]
-    assert sent["messages"] == _HISTORY
-    names = [t["function"]["name"] for t in sent["tools"]]
-    assert "search_course_material" in names
-    assert "end_call" in names
-    assert sent["tool_choice"] == "auto"
-
-
-async def test_a_tool_call_comes_back_parsed(llm):
-    """Arguments arrive as a JSON STRING in the OpenAI-compatible shape. A
-    caller that had to re-parse them would duplicate the error handling."""
-    llm(payload=_reply(tool_calls=[{
-        "id": "call_1", "type": "function",
-        "function": {"name": "search_course_material",
-                     "arguments": '{"query": "fees"}'},
-    }]))
-
-    reply = await sarvam_llm.turn(_HISTORY)
-
-    assert reply.text == ""
-    assert len(reply.tool_calls) == 1
-    assert reply.tool_calls[0].name == "search_course_material"
-    assert reply.tool_calls[0].arguments == {"query": "fees"}
-    assert reply.tool_calls[0].call_id == "call_1"
-
-
-async def test_unparseable_tool_arguments_become_empty_rather_than_raising(llm):
-    """A model that emits malformed JSON should cost one useless tool call, not
-    the whole conversation. search_relevant('') returns the no-material note,
-    which the agent can say out loud."""
-    llm(payload=_reply(tool_calls=[{
-        "id": "call_1", "type": "function",
-        "function": {"name": "search_course_material", "arguments": "{oh no"},
-    }]))
-
-    reply = await sarvam_llm.turn(_HISTORY)
-    assert reply.tool_calls[0].arguments == {}
-
-
-async def test_a_turn_that_returns_nothing_usable_raises(llm):
-    """Distinct from an empty reply the agent could just stay silent on: a
-    500 means the turn did not happen and the caller has to decide what to do
-    about a lead waiting on the line."""
-    llm(status_code=500, payload={})
-    with pytest.raises(sarvam_llm.SarvamRenderFailed):
-        await sarvam_llm.turn(_HISTORY)
-
-
-async def test_a_turn_is_never_served_from_the_render_cache(llm):
-    """The cache is keyed on a script's content and exists because one script
-    renders identically for every lead. A CONVERSATION turn depends on
-    everything said so far — serving a cached one would replay another lead's
-    answer."""
-    llm(payload=_reply(content="మొదటి."))
-    await sarvam_llm.turn(_HISTORY)
-    await sarvam_llm.turn(_HISTORY)
-    assert len(_FakeAsyncClient.calls) == 2
-
-
 # ── reasoning-model latency and empty content ────────────────────────────────
 #
 # Measured against the live API on 2026-07-27. sarvam-105b and sarvam-30b are
@@ -309,35 +224,6 @@ def test_the_client_allows_for_a_reasoning_model_s_latency():
     assert sarvam_llm._TIMEOUT_S >= 45, (
         "a reasoning model needs headroom; 20s failed on the first real render"
     )
-
-
-async def test_a_reply_that_is_all_reasoning_and_no_answer_is_not_silence(llm):
-    """A max_tokens cap truncates inside reasoning_content and returns
-    content=null. On a two-way call that would be the agent going silent on a
-    lead who just asked a question — indistinguishable from a dropped call."""
-    llm(payload={"choices": [{"message": {
-        "content": None,
-        "reasoning_content": "The user has asked me to say",
-    }}]})
-
-    with pytest.raises(sarvam_llm.SarvamNoAnswer):
-        await sarvam_llm.turn([{"role": "user", "content": "ఫీజు ఎంత?"}])
-
-
-async def test_a_reply_with_no_answer_but_a_tool_call_is_fine(llm):
-    """Calling a tool without saying anything first is normal and correct —
-    the model looks something up, then speaks. That is not the empty-reply
-    failure above and must not be treated as one."""
-    llm(payload={"choices": [{"message": {
-        "content": None,
-        "tool_calls": [{"id": "c1", "type": "function",
-                        "function": {"name": "search_course_material",
-                                     "arguments": '{"query": "fees"}'}}],
-    }}]})
-
-    reply = await sarvam_llm.turn([{"role": "user", "content": "ఫీజు ఎంత?"}])
-    assert reply.text == ""
-    assert reply.tool_calls[0].name == "search_course_material"
 
 
 async def test_a_render_that_returns_only_reasoning_fails_loudly(llm):
