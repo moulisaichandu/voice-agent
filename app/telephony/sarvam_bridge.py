@@ -317,8 +317,15 @@ class _Conversation:
                     if reply.text:
                         await self.say(tts, reply.text)
                     return
+                # Text that arrives WITH a tool call is filler — "let me look
+                # that up for you". On a real call the agent announced its own
+                # lookup twice and then reported failure, which is three
+                # synthesised turns to deliver nothing. A search takes about a
+                # second; silence is shorter than saying so. The answer that
+                # follows is what the lead wants.
                 if reply.text:
-                    await self.say(tts, reply.text)
+                    logger.debug(f"[sarvam] lead={self.lead_id} not speaking "
+                                 f"tool-call filler: {reply.text[:60]!r}")
                 if await self._run_tools(reply):
                     return  # end_call: nothing further to say
             logger.warning(

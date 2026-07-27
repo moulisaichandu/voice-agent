@@ -708,3 +708,50 @@ async def test_a_one_way_call_with_no_script_refuses_rather_than_greeting(bridge
 
     assert outcome["status"] == "failed"
     assert outcome["turns"] == 0
+
+
+# ── answering from the documents, not narrating the lookup ───────────────────
+#
+# From a real call. Asked about the course, the agent said, out loud, twice:
+#   "I will look in our documents for the right information."
+#   "I am searching our course documents. It will take a moment."
+# ...and then that it had found nothing.
+#
+# Two separate faults. The narration is this one: the model returns filler text
+# ALONGSIDE its tool call, and the bridge spoke it. A lookup takes about a
+# second — far less than the two extra synthesised turns needed to announce it.
+
+async def test_filler_said_alongside_a_tool_call_is_not_spoken(two_way):
+    """The lead should hear the ANSWER, not a commentary on the search."""
+    seen, _tts, _stt = two_way(
+        [_said("Fee enta?")],
+        replies=[
+            _reply(text="I will look in our documents. It will take a moment.",
+                   tools=[_tool("search_course_material", query="course fees")]),
+            _reply(text="Fee is 25,000 rupees."),
+        ],
+    )
+
+    outcome = await _run(_FakePlivoWS(), one_way=False)
+
+    spoken = [t.text for t in outcome["transcript"] if t.role == "agent"]
+    assert not any("look in our documents" in t for t in spoken), (
+        f"the agent narrated its own lookup instead of answering: {spoken}"
+    )
+    assert any("25,000" in t for t in spoken), "the answer must still be spoken"
+
+
+async def test_the_tool_still_runs_when_its_filler_is_suppressed(two_way):
+    """Dropping the words must not drop the lookup."""
+    seen, _tts, _stt = two_way(
+        [_said("Fee enta?")],
+        replies=[
+            _reply(text="Let me check.",
+                   tools=[_tool("search_course_material", query="course fees")]),
+            _reply(text="Twenty five thousand."),
+        ],
+    )
+
+    await _run(_FakePlivoWS(), one_way=False)
+
+    assert seen["queries"] == ["course fees"]

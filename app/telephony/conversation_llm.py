@@ -70,18 +70,26 @@ TOOLS: list[dict] = [
         "function": {
             "name": SEARCH_TOOL_NAME,
             "description": (
-                "Search Digital Brolly's course documents for material relevant "
-                "to the lead's question. Call this for every question about "
-                "courses, fees, timings, batches or placement — never answer "
-                "those from memory."
+                "Search Digital Brolly's course documents for material "
+                "relevant to the lead's question. Call this for every question "
+                "about courses, fees, timings, batches, duration, syllabus or "
+                "placement — never answer those from memory. The `query` MUST "
+                "be in English, whatever language the lead is speaking."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": ("The lead's question, as a concise "
-                                        "search query in English."),
+                        "description": (
+                            "ALWAYS in English, never Telugu script — the "
+                            "documents are English and a Telugu query "
+                            "retrieves nothing. Translate what the lead asked "
+                            "into a few English keywords, using what you "
+                            "already know this call is about. Example: for "
+                            "'లక్షణాలు గురించి చెప్పు' send 'digital marketing "
+                            "course features', NOT a literal translation."
+                        ),
                     },
                 },
                 "required": ["query"],

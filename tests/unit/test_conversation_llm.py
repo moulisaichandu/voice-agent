@@ -203,3 +203,32 @@ async def test_the_turn_timeout_is_shorter_than_a_lead_s_patience(llm):
     cannot: past a few seconds the lead has decided the line is dead, and the
     answer is no longer worth having."""
     assert conversation_llm.CONVERSATION_LLM_TIMEOUT_S <= 15
+
+
+async def test_the_search_tool_demands_an_english_query(llm):
+    """Your course documents are English, so the embeddings are English.
+    Measured against the real corpus: a Telugu query scores 0.10-0.17 against
+    its own answer chunk, below the 0.30 relevance floor, while the English
+    equivalent scores 0.35-0.65.
+
+    search_relevant() does rescue a miss by translating, but that costs a round
+    trip mid-call AND loses context: "లక్షణాలు గురించి చెప్పు" (tell me about
+    the features) was translated in isolation as "Tell about the symptoms" and
+    retrieved nothing. The MODEL is the right place to do this — unlike the
+    standalone translator, it knows the call is about digital marketing
+    courses. app/rag/translate.py explains why that translator must NOT be
+    given the same hint."""
+    llm()
+    await conversation_llm.turn(_HISTORY)
+
+    tools = _FakeAsyncClient.calls[0]["json"]["tools"]
+    search = next(t["function"] for t in tools
+                  if t["function"]["name"] == "search_course_material")
+    described = (search["description"] + " "
+                 + search["parameters"]["properties"]["query"]["description"])
+    assert "English" in described
+    lowered = described.lower()
+    assert "always" in lowered or "must" in lowered, (
+        "the model treated 'as a concise search query in English' as advice "
+        "and sent Telugu anyway"
+    )
