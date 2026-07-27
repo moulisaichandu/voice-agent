@@ -166,7 +166,7 @@ async def _complete(system_prompt: str, user_prompt: str) -> str:
     return text
 
 
-def _ensure_disclosure(text: str) -> str:
+def ensure_disclosure(text: str) -> str:
     """*text*, guaranteed to open with an AI disclosure.
 
     Logged at WARNING with the [compliance] prefix the operator already greps
@@ -205,7 +205,7 @@ async def render(script: str, *, language_style: str | None = None) -> str:
     if cached:
         return cached
 
-    rendered = _ensure_disclosure(
+    rendered = ensure_disclosure(
         await _complete(
             sarvam_prompts.render_instructions(cleaned, language_style=language_style),
             cleaned,

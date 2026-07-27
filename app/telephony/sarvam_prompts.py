@@ -62,6 +62,21 @@ _OUTPUT_ONLY_RULE = (
 # and every Telugu campaign starts failing its own compliance check.
 _GREETING_TEMPLATE = "నమస్తే {name} గారు."
 
+# What a two-way call opens with when its campaign has no script.
+#
+# REQUIRED, not a nicety. app/telephony/call_routes.py only passes `script`
+# into a call's dynamic_variables when mode == "oneway", so EVERY two-way call
+# arrives with none. Without this the rendered body is empty and the opening
+# collapses to the bare name greeting — which is what a real lead heard on
+# 2026-07-27: a call with no AI disclosure at all.
+#
+# Written in English like any operator script, so it renders into whichever
+# register the campaign uses and picks up the same disclosure repair.
+DEFAULT_TWOWAY_SCRIPT = (
+    "This is an automated AI call from Digital Brolly. I am calling about our "
+    "digital marketing courses. Ask me anything you would like to know."
+)
+
 
 def _language_rule(language_style: str | None) -> str:
     """The LANGUAGE instruction for this call's register.

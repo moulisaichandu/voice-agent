@@ -471,20 +471,36 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
         # Rendered before the socket opens: this is the one step that can take
         # a noticeable moment on a cache miss, and holding a TTS connection
         # open through it buys nothing.
+        script = (variables.get("script") or "").strip()
+        if not one_way and not script:
+            # A two-way campaign needs no script, and call_routes only forwards
+            # one for oneway — so this is the NORMAL two-way path, not an edge
+            # case. Without a fallback the render is empty and the opening
+            # collapses to the bare name greeting, which is exactly what a real
+            # lead heard on 2026-07-27: a call with no AI disclosure at all.
+            script = sarvam_prompts.DEFAULT_TWOWAY_SCRIPT
+
         body = await sarvam_llm.render(
-            variables.get("script") or "",
-            language_style=variables.get("language_style"),
+            script, language_style=variables.get("language_style"),
         )
-        spoken = sarvam_prompts.compose_spoken(
-            body, lead_name=variables.get("lead_name"),
-        )
-        if not spoken.strip():
+        if not body.strip():
+            # Checked on the BODY, not on the composed line. compose_spoken()
+            # prepends a name greeting, so a lead called "Mouli" turned an empty
+            # render into a non-empty "నమస్తే Mouli గారు." and sailed past this
+            # guard into a non-compliant call.
             logger.error(
                 f"[sarvam] lead={lead_id} nothing to say — the campaign script "
                 "rendered empty. A one-way campaign cannot be created without "
                 "a script, so check how this one was made."
             )
             return outcome
+
+        # Last line of defence before a real person hears this. render() already
+        # repairs a dropped disclosure, but the greeting is spliced in AFTER
+        # that, and only the composed text is what the lead actually hears.
+        spoken = sarvam_llm.ensure_disclosure(sarvam_prompts.compose_spoken(
+            body, lead_name=variables.get("lead_name"),
+        ))
 
         if not one_way:
             await _run_two_way(

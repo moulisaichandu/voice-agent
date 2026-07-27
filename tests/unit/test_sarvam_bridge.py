@@ -631,3 +631,80 @@ async def test_the_watchdog_waits_for_audio_to_finish_PLAYING(two_way, monkeypat
     await asyncio.wait_for(watch, timeout=5)
     assert call.stop.is_set(), "should end once the audio has drained"
     assert call.exit_reason == "twoway_silence"
+
+
+# ── the opening must disclose, script or no script ───────────────────────────
+#
+# REGRESSION from a real call. app/telephony/call_routes.py only puts `script`
+# into dynamic_variables when mode == "oneway", so every TWO-WAY call arrives
+# here with no script at all. render("") correctly returns "", compose_spoken()
+# then produced nothing but the greeting — "నమస్తే Mouli గారు." — and that is
+# what a real lead heard: a call with NO AI disclosure, which India telecom
+# rules require in the first line.
+#
+# The [compliance] check in call_routes caught it after the fact, exactly as
+# designed. This is the preventive half.
+
+async def test_a_two_way_call_with_no_script_still_discloses(two_way):
+    """The failing case from the live call, pinned."""
+    two_way([])
+
+    outcome = await asyncio.wait_for(
+        sarvam_bridge.bridge(_FakePlivoWS(), agent_id="x", lead_id="l",
+                             language="te", one_way=False,
+                             dynamic_variables={"lead_name": "Mouli"}),
+        timeout=10,
+    )
+
+    from app.compliance.disclosure import has_ai_disclosure
+    first_agent = next(t for t in outcome["transcript"] if t.role == "agent")
+    assert has_ai_disclosure(first_agent.text), (
+        f"a lead would hear {first_agent.text!r} with no AI disclosure"
+    )
+
+
+async def test_a_greeting_alone_is_never_spoken_as_the_opening(two_way,
+                                                               monkeypatch):
+    """The exact shape that went out on a real call: the render produces
+    nothing, so the only thing left is the name greeting.
+
+    The contract is NOT "always open the call" — it is "never open it
+    non-compliantly". With the renderer returning nothing even for the default
+    script, something is badly wrong, and a failed call is strictly better than
+    a real person hearing an undisclosed AI. So: either a compliant opening, or
+    silence. Never "నమస్తే Mouli గారు." on its own."""
+    two_way([])
+
+    async def empty_render(script, *, language_style=None):
+        return ""
+
+    monkeypatch.setattr(sarvam_bridge.sarvam_llm, "render", empty_render)
+
+    outcome = await asyncio.wait_for(
+        sarvam_bridge.bridge(_FakePlivoWS(), agent_id="x", lead_id="l",
+                             language="te", one_way=False,
+                             dynamic_variables={"lead_name": "Mouli"}),
+        timeout=10,
+    )
+
+    from app.compliance.disclosure import has_ai_disclosure
+    spoken = [t.text for t in outcome["transcript"] if t.role == "agent"]
+    assert all(has_ai_disclosure(t) for t in spoken), (
+        f"a lead would hear {spoken!r} with no AI disclosure"
+    )
+    if not spoken:
+        assert outcome["status"] == "failed", (
+            "a call that said nothing must be recorded as failed, not done"
+        )
+
+
+async def test_a_one_way_call_with_no_script_refuses_rather_than_greeting(bridged):
+    """One-way has nothing to say without a script — a campaign cannot even be
+    created without one. Speaking a bare greeting and hanging up would be a
+    non-compliant call for no purpose."""
+    bridged(_FakeSarvamWS(_audio_then_final()), rendered="")
+
+    outcome = await _run(_FakePlivoWS(), dynamic_variables={"lead_name": "Mouli"})
+
+    assert outcome["status"] == "failed"
+    assert outcome["turns"] == 0
