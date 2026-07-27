@@ -142,7 +142,19 @@ class SarvamSTT:
         await self._ws.send(json.dumps({
             "audio": {
                 "data": base64.b64encode(pcm).decode(),
-                "encoding": "audio/pcm_s16le",
+                # 'audio/wav', NOT 'audio/pcm_s16le'. These are two different
+                # fields with two different enums: the CONNECTION's
+                # input_audio_codec query param (above) takes pcm_s16le and
+                # declares what the bytes are; this per-message field takes
+                # only audio/wav. Sending pcm_s16le here is rejected outright —
+                # "audio.encoding: Input should be 'audio/wav'" — and a
+                # rejected stream means the agent hears nothing at all for the
+                # whole call.
+                #
+                # The bytes stay raw PCM16; no WAV container is added or
+                # wanted. Verified live by transcribing real Telugu through
+                # exactly this frame.
+                "encoding": "audio/wav",
                 "sample_rate": "8000",
             },
         }))

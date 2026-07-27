@@ -129,7 +129,18 @@ async def test_plivo_mulaw_is_decoded_to_pcm_before_being_sent(connected):
         await stt.send_audio(_MULAW_B64)
 
     frame = json.loads(ws.sent[0])["audio"]
-    assert frame["encoding"] == "audio/pcm_s16le"
+    # 'audio/wav', NOT 'audio/pcm_s16le'. Those are two different fields with
+    # two different enums, and conflating them is how this was originally
+    # written: the CONNECTION's input_audio_codec query param accepts
+    # pcm_s16le, while the per-message encoding field accepts only audio/wav.
+    # Sending pcm_s16le here made Sarvam reject the stream outright — verified
+    # live: "audio.encoding: Input should be 'audio/wav'" — which on a real
+    # call means the agent is completely deaf.
+    #
+    # No WAV container is needed; the bytes stay raw PCM16, as the codec param
+    # already declared. Confirmed by transcribing real Telugu speech through
+    # this exact frame shape.
+    assert frame["encoding"] == "audio/wav"
     assert frame["sample_rate"] == "8000"
     assert base64.b64decode(frame["data"]) == ulaw.decode(_MULAW_FRAME)
     assert len(base64.b64decode(frame["data"])) == 2 * len(_MULAW_FRAME)
