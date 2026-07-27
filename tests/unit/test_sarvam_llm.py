@@ -234,3 +234,25 @@ async def test_a_render_that_returns_only_reasoning_fails_loudly(llm):
 
     with pytest.raises(sarvam_llm.SarvamRenderFailed):
         await sarvam_llm.render(_SCRIPT, language_style=None)
+
+
+async def test_the_render_asks_for_enough_tokens_to_finish_thinking(llm):
+    """REGRESSION from a live failure: "Sarvam chat completions returned no
+    text", intermittently, on a script that had rendered fine minutes earlier.
+
+    Sarvam's default completion budget is 2048 tokens and the reasoning
+    routinely eats all of it. Measured over four runs with no max_tokens: two
+    returned finish_reason=length at exactly 2048 with content=0 characters.
+    The same prompt with max_tokens=4000 succeeded three times out of three,
+    using 1493-2234 tokens — so the ceiling has to sit well above the reasoning,
+    not near it.
+
+    A render that fails means the call does not dial at all, so this was a
+    campaign that worked or did not depending on how long the model thought."""
+    llm()
+    await sarvam_llm.render(_SCRIPT, language_style=None)
+
+    sent = _FakeAsyncClient.calls[0]["json"]
+    assert sent.get("max_tokens", 0) >= 4000, (
+        "Sarvam's 2048 default is below what its own reasoning consumes"
+    )

@@ -60,6 +60,17 @@ _CHAT_URL = "https://api.sarvam.ai/v1/chat/completions"
 # very first live render failed with ReadTimeout.
 _TIMEOUT_S = 60.0
 
+# Sarvam's own default completion budget is 2048 tokens, and its reasoning
+# routinely spends all of it before writing a word of the answer. Measured over
+# four identical requests with no max_tokens: two came back
+# finish_reason=length at exactly 2048 with content=0 characters — a render
+# that "returned no text", intermittently, on a script that had worked minutes
+# earlier. A failed render means the campaign does not dial at all.
+#
+# The same prompt with max_tokens=4000 succeeded 3/3, spending 1493-2234
+# tokens. The ceiling has to sit well clear of the reasoning, not near it.
+_MAX_TOKENS = 4096
+
 # A rendered script changes only when the script does, and the key is a content
 # hash, so a stale entry is unreachable rather than wrong. The TTL exists to
 # stop abandoned campaigns' renders living in Redis forever.
@@ -159,6 +170,9 @@ async def _complete(system_prompt: str, user_prompt: str) -> str:
         # Low but not zero: this is a rendering task with one right meaning and
         # some freedom in phrasing, not a creative one.
         "temperature": 0.3,
+        # See _MAX_TOKENS: below this the model runs out of budget mid-thought
+        # and returns no answer at all.
+        "max_tokens": _MAX_TOKENS,
     })
     text = (message.get("content") or "").strip()
     if not text:

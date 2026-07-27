@@ -17,9 +17,10 @@ Sarvam's chat models cannot do the second job. Measured against the live API on
 completion tokens of `reasoning_content` before roughly a hundred characters of
 answer. A realistic conversational turn took 21.8 seconds. It cannot be turned
 off — `reasoning_effort` accepts only low/medium/high (and 'low' still reasoned
-for 17s), `thinking.type=disabled` and `chat_template_kwargs.enable_thinking`
-are accepted and silently ignored, and capping `max_tokens` truncates INSIDE
-the reasoning so no answer comes back at all.
+for 17s), and `thinking.type=disabled` and `chat_template_kwargs.enable_thinking`
+are accepted and silently ignored. A SMALL max_tokens makes it worse, not
+better: it truncates inside the reasoning and returns no answer at all, so the
+budget has to be raised well clear of it rather than lowered.
 
 Both vendors implement the same OpenAI-compatible chat-completions protocol, so
 supporting either is a URL and a key rather than a second integration. Sarvam
@@ -224,6 +225,11 @@ async def turn(messages: list[dict]) -> LLMReply:
         # phrasing every time sounds robotic, not a translation with one right
         # answer.
         "temperature": 0.6,
+        # Harmless on OpenAI, where a conversational reply is a few dozen
+        # tokens. Load-bearing if CONVERSATION_LLM_PROVIDER is flipped back to
+        # sarvam: its default budget is 2048 and its reasoning eats all of it,
+        # returning content=null — see sarvam_llm._MAX_TOKENS.
+        "max_tokens": 4096,
     }
 
     try:
