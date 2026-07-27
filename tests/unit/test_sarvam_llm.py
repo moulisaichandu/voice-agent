@@ -285,3 +285,66 @@ async def test_a_turn_is_never_served_from_the_render_cache(llm):
     await sarvam_llm.turn(_HISTORY)
     await sarvam_llm.turn(_HISTORY)
     assert len(_FakeAsyncClient.calls) == 2
+
+
+# ── reasoning-model latency and empty content ────────────────────────────────
+#
+# Measured against the live API on 2026-07-27. sarvam-105b and sarvam-30b are
+# REASONING models: every response spends 400-2000 completion tokens on
+# `reasoning_content` before emitting ~100 characters of actual `content`.
+# Reasoning cannot be switched off (reasoning_effort only accepts
+# low/medium/high, and 'low' still reasoned for 17s; thinking.type=disabled and
+# chat_template_kwargs.enable_thinking=False were accepted and ignored).
+#
+# Consequences this module has to survive:
+#   * a render takes 14-22s, so a 20s timeout fails on a normal script;
+#   * capping max_tokens truncates INSIDE the reasoning, so `content` comes
+#     back null rather than short.
+
+def test_the_client_allows_for_a_reasoning_model_s_latency():
+    """REGRESSION. _TIMEOUT_S was 20s, chosen before anyone had run this
+    against the real API. A render of an ordinary three-sentence script
+    measured 14-22s, so the very first live call failed with ReadTimeout and
+    the campaign would not have dialled at all."""
+    assert sarvam_llm._TIMEOUT_S >= 45, (
+        "a reasoning model needs headroom; 20s failed on the first real render"
+    )
+
+
+async def test_a_reply_that_is_all_reasoning_and_no_answer_is_not_silence(llm):
+    """A max_tokens cap truncates inside reasoning_content and returns
+    content=null. On a two-way call that would be the agent going silent on a
+    lead who just asked a question — indistinguishable from a dropped call."""
+    llm(payload={"choices": [{"message": {
+        "content": None,
+        "reasoning_content": "The user has asked me to say",
+    }}]})
+
+    with pytest.raises(sarvam_llm.SarvamNoAnswer):
+        await sarvam_llm.turn([{"role": "user", "content": "ఫీజు ఎంత?"}])
+
+
+async def test_a_reply_with_no_answer_but_a_tool_call_is_fine(llm):
+    """Calling a tool without saying anything first is normal and correct —
+    the model looks something up, then speaks. That is not the empty-reply
+    failure above and must not be treated as one."""
+    llm(payload={"choices": [{"message": {
+        "content": None,
+        "tool_calls": [{"id": "c1", "type": "function",
+                        "function": {"name": "search_course_material",
+                                     "arguments": '{"query": "fees"}'}}],
+    }}]})
+
+    reply = await sarvam_llm.turn([{"role": "user", "content": "ఫీజు ఎంత?"}])
+    assert reply.text == ""
+    assert reply.tool_calls[0].name == "search_course_material"
+
+
+async def test_a_render_that_returns_only_reasoning_fails_loudly(llm):
+    """Same shape on the render path, where it already had to fail — pinned so
+    the null-content case stays distinguishable from a working empty script."""
+    llm(payload={"choices": [{"message": {
+        "content": None, "reasoning_content": "Let me think about"}}]})
+
+    with pytest.raises(sarvam_llm.SarvamRenderFailed):
+        await sarvam_llm.render(_SCRIPT, language_style=None)

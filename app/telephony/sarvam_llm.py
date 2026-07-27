@@ -45,7 +45,22 @@ from app.telephony import sarvam_prompts
 logger = logging.getLogger(__name__)
 
 _CHAT_URL = "https://api.sarvam.ai/v1/chat/completions"
-_TIMEOUT_S = 20.0
+
+# Generous, and measured rather than guessed. Both Sarvam chat models are
+# REASONING models: every response spends 400-2000 completion tokens on
+# `reasoning_content` before emitting ~100 characters of actual `content`.
+# Against the live API on 2026-07-27, rendering an ordinary three-sentence
+# script took 14-22s on sarvam-105b and 6.7s on sarvam-30b.
+#
+# The reasoning cannot be turned off. `reasoning_effort` accepts only
+# low/medium/high (not "none"), and "low" still reasoned for 17s;
+# `thinking.type=disabled` and `chat_template_kwargs.enable_thinking=False`
+# were both accepted and ignored. Capping max_tokens does not help either — it
+# truncates INSIDE the reasoning, so `content` comes back null.
+#
+# This was 20s, chosen before anyone had run it against the real API, and the
+# very first live render failed with ReadTimeout.
+_TIMEOUT_S = 60.0
 
 # A rendered script changes only when the script does, and the key is a content
 # hash, so a stale entry is unreachable rather than wrong. The TTL exists to
@@ -126,6 +141,17 @@ class LLMReply:
 class SarvamNotConfigured(RuntimeError):
     """No SARVAM_API_KEY. Raised before calling out, so the bridge turns it
     into a failed outcome rather than discovering it mid-call."""
+
+
+class SarvamNoAnswer(RuntimeError):
+    """The model produced a turn with nothing to say and no tool to call.
+
+    Its own doing, not a transport failure: a reasoning model that runs out of
+    token budget mid-thought returns `content: null`. On a live call that is
+    the agent going silent on a lead who just asked a question, which is
+    indistinguishable from a dropped call — so it is raised rather than
+    returned as an empty string somebody might quietly speak.
+    """
 
 
 class SarvamRenderFailed(RuntimeError):
@@ -326,7 +352,17 @@ async def turn(messages: list[dict]) -> LLMReply:
         # answer.
         "temperature": 0.6,
     })
-    return LLMReply(
+    reply = LLMReply(
         text=(message.get("content") or "").strip(),
         tool_calls=_parse_tool_calls(message),
     )
+    if not reply.text and not reply.tool_calls:
+        # Calling a tool without speaking first is normal — the model looks
+        # something up, then answers. Neither speaking NOR calling a tool is
+        # not: see SarvamNoAnswer.
+        raise SarvamNoAnswer(
+            "Sarvam returned a turn with no content and no tool call "
+            f"(reasoning_content was {len(message.get('reasoning_content') or '')} "
+            "characters — the model may have spent its whole budget thinking)."
+        )
+    return reply
