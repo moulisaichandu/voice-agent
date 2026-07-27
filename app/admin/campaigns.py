@@ -20,6 +20,7 @@ from app import config as app_config
 from app import languages as languages_module
 from app.db import campaigns as campaigns_db
 from app.db.models import Campaign, CampaignLanguage
+from app.telephony import sarvam_llm
 from app.telephony.elevenlabs_client import agent_language_support
 
 router = APIRouter()
@@ -230,16 +231,53 @@ async def create_campaign(body: CampaignCreate) -> Campaign:
     agent_id = _resolve_agent_id(body.mode, body.agent_id)
     await _check_language_support(agent_id, body.language)
     try:
-        return await campaigns_db.create_campaign(
+        campaign = await campaigns_db.create_campaign(
             name=body.name, mode=body.mode, agent_id=agent_id,
             script=body.script, max_attempts=body.max_attempts,
             language=body.language,
         )
+        await _warm_rendered_script(campaign)
+        return campaign
     except ValueError as exc:
         # The oneway-needs-a-script and AI-disclosure checks in
         # create_campaign() raise ValueError — surfaced as a 422 the frontend
         # can show inline, not a 500.
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+async def _warm_rendered_script(campaign: Campaign) -> None:
+    """Render this campaign's script into Telugu now, so no lead waits for it.
+
+    Rendering measured 14-22s against the live API — Sarvam's chat models are
+    reasoning models and cannot be told to hurry. The result is cached per
+    campaign, so only the FIRST call of a campaign would pay it, but that lead
+    answers the phone and hears up to twenty-two seconds of silence. They hang
+    up, and because ONEWAY_MAX_SILENT_S is 30s the watchdog never even notices:
+    it is recorded as a delivered call.
+
+    Deliberately best-effort. The campaign is what the operator asked for; the
+    warm cache is a nicety. A Sarvam outage at creation time must not cost them
+    the campaign, because the dial path still renders on demand — just slowly.
+    """
+    if not campaign.script or not campaign.script.strip():
+        return
+    if languages_module.backend_for(campaign.language) != languages_module.SARVAM:
+        # ElevenLabs renders nothing and OpenAI Realtime renders as it speaks.
+        # Warming either would pay Sarvam to translate a script no Sarvam call
+        # will ever read.
+        return
+    try:
+        await sarvam_llm.render(
+            campaign.script,
+            language_style=languages_module.style(campaign.language),
+        )
+    except Exception as exc:  # noqa: BLE001 - never lose a campaign over a cache
+        logger.warning(
+            f"[sarvam-llm] could not pre-render campaign {campaign.campaign_id}'s "
+            f"script ({type(exc).__name__}: {exc}). The campaign is created; the "
+            "first call will render on demand and its lead may hear a long "
+            "pause before the agent speaks."
+        )
 
 
 @router.patch("/campaigns/{campaign_id}", response_model=Campaign)

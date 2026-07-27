@@ -582,3 +582,103 @@ def test_the_reported_backend_follows_the_rollback_switch(client, monkeypatch):
 
     rows = client.get("/admin/campaigns").json()
     assert rows[0]["voice_backend"] == "OpenAI Realtime"
+
+
+# ── pre-rendering the Telugu, so no lead waits for it ────────────────────────
+#
+# Measured against the live API on 2026-07-27: rendering a script on
+# sarvam-105b takes 14-22s. The result is cached per campaign, so only the
+# FIRST call of a campaign pays it — but that lead answers the phone and hears
+# up to twenty-two seconds of silence, which is a hang-up. ONEWAY_MAX_SILENT_S
+# is 30s so the watchdog would not even kill it; it would be recorded as a
+# delivered call.
+#
+# So the render is warmed when the campaign is created, off the request path.
+
+def test_creating_a_telugu_campaign_warms_the_render(client, monkeypatch):
+    warmed = {}
+
+    async def fake_create(**kwargs):
+        return _campaign(mode="oneway", language="te", script=kwargs["script"])
+
+    async def fake_render(script, *, language_style=None):
+        warmed["script"] = script
+        warmed["style"] = language_style
+        return "ఇది కృత్రిమ మేధ ద్వారా చేసే ఆటోమేటెడ్ కాల్."
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
+    monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_ONEWAY_AGENT_ID",
+                        "agent_1")
+    monkeypatch.setattr(admin_campaigns.sarvam_llm, "render", fake_render)
+
+    script = "This is an automated AI call. Our course starts Monday."
+    r = client.post("/admin/campaigns", json={
+        "name": "Telugu", "mode": "oneway", "language": "te", "script": script,
+    })
+
+    assert r.status_code == 201
+    assert warmed["script"] == script
+
+
+def test_warming_never_blocks_or_breaks_campaign_creation(client, monkeypatch):
+    """The render is a nicety; the campaign is the thing the operator asked
+    for. A Sarvam outage at creation time must not lose them their campaign —
+    the dial path renders on demand anyway, it is only slower."""
+    async def fake_create(**kwargs):
+        return _campaign(mode="oneway", language="te", script=kwargs["script"])
+
+    async def boom(script, *, language_style=None):
+        raise RuntimeError("sarvam is down")
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
+    monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_ONEWAY_AGENT_ID",
+                        "agent_1")
+    monkeypatch.setattr(admin_campaigns.sarvam_llm, "render", boom)
+
+    r = client.post("/admin/campaigns", json={
+        "name": "Telugu", "mode": "oneway", "language": "te",
+        "script": "This is an automated AI call. Our course starts Monday.",
+    })
+    assert r.status_code == 201
+
+
+def test_an_english_campaign_does_not_call_sarvam_at_all(client, monkeypatch):
+    """English runs on ElevenLabs, which renders nothing. Warming it would pay
+    Sarvam to translate a script no Sarvam call will ever speak."""
+    async def fake_create(**kwargs):
+        return _campaign(mode="oneway", language="en", script=kwargs["script"])
+
+    async def boom(script, *, language_style=None):
+        raise AssertionError("must not render for an ElevenLabs-backed campaign")
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
+    monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_ONEWAY_AGENT_ID",
+                        "agent_1")
+    monkeypatch.setattr(admin_campaigns.sarvam_llm, "render", boom)
+
+    r = client.post("/admin/campaigns", json={
+        "name": "English", "mode": "oneway", "language": "en",
+        "script": "This is an automated AI call. Our course starts Monday.",
+    })
+    assert r.status_code == 201
+
+
+def test_a_campaign_with_no_script_warms_nothing(client, monkeypatch):
+    """Two-way campaigns need no script, and there is nothing to render."""
+    async def fake_create(**kwargs):
+        return _campaign(mode="twoway", language="te", script=None)
+
+    async def boom(script, *, language_style=None):
+        raise AssertionError("nothing to render")
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
+    monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID",
+                        "agent_1")
+    monkeypatch.setattr(admin_campaigns.languages_module, "SARVAM_TWOWAY_ENABLED",
+                        True)
+    monkeypatch.setattr(admin_campaigns.sarvam_llm, "render", boom)
+
+    r = client.post("/admin/campaigns", json={
+        "name": "Telugu twoway", "mode": "twoway", "language": "te",
+    })
+    assert r.status_code == 201
