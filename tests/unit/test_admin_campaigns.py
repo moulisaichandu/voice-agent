@@ -682,3 +682,32 @@ def test_a_campaign_with_no_script_warms_nothing(client, monkeypatch):
         "name": "Telugu twoway", "mode": "twoway", "language": "te",
     })
     assert r.status_code == 201
+
+
+def test_a_scriptless_two_way_campaign_warms_its_default_opening(client, monkeypatch):
+    """A two-way campaign needs no script, and the bridge falls back to
+    DEFAULT_TWOWAY_SCRIPT. Warming only campaign.script therefore warmed
+    nothing at all for the commonest two-way case, and the first lead after a
+    Redis flush would answer to ~20s of silence while it rendered."""
+    warmed = {}
+
+    async def fake_create(**kwargs):
+        return _campaign(mode="twoway", language="te", script=None)
+
+    async def fake_render(script, *, language_style=None):
+        warmed["script"] = script
+        return "ఇది కృత్రిమ మేధ ద్వారా చేసే ఆటోమేటెడ్ కాల్."
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
+    monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID",
+                        "agent_1")
+    monkeypatch.setattr(admin_campaigns.languages_module, "SARVAM_TWOWAY_ENABLED",
+                        True)
+    monkeypatch.setattr(admin_campaigns.sarvam_llm, "render", fake_render)
+
+    r = client.post("/admin/campaigns", json={
+        "name": "Telugu twoway", "mode": "twoway", "language": "te",
+    })
+
+    assert r.status_code == 201
+    assert warmed.get("script") == admin_campaigns.sarvam_prompts.DEFAULT_TWOWAY_SCRIPT

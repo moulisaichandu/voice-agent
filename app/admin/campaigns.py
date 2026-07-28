@@ -20,7 +20,7 @@ from app import config as app_config
 from app import languages as languages_module
 from app.db import campaigns as campaigns_db
 from app.db.models import Campaign, CampaignLanguage
-from app.telephony import sarvam_llm
+from app.telephony import sarvam_llm, sarvam_prompts
 from app.telephony.elevenlabs_client import agent_language_support
 
 router = APIRouter()
@@ -259,8 +259,14 @@ async def _warm_rendered_script(campaign: Campaign) -> None:
     warm cache is a nicety. A Sarvam outage at creation time must not cost them
     the campaign, because the dial path still renders on demand — just slowly.
     """
-    if not campaign.script or not campaign.script.strip():
-        return
+    script = (campaign.script or "").strip()
+    if not script:
+        if campaign.mode != "twoway":
+            return
+        # A two-way campaign needs no script and the bridge falls back to
+        # DEFAULT_TWOWAY_SCRIPT, so warming only campaign.script warmed nothing
+        # at all for the commonest two-way case.
+        script = sarvam_prompts.DEFAULT_TWOWAY_SCRIPT
     if languages_module.backend_for(campaign.language) != languages_module.SARVAM:
         # ElevenLabs renders nothing and OpenAI Realtime renders as it speaks.
         # Warming either would pay Sarvam to translate a script no Sarvam call
@@ -268,8 +274,7 @@ async def _warm_rendered_script(campaign: Campaign) -> None:
         return
     try:
         await sarvam_llm.render(
-            campaign.script,
-            language_style=languages_module.style(campaign.language),
+            script, language_style=languages_module.style(campaign.language),
         )
     except Exception as exc:  # noqa: BLE001 - never lose a campaign over a cache
         logger.warning(
