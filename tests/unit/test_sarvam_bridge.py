@@ -755,3 +755,66 @@ async def test_the_tool_still_runs_when_its_filler_is_suppressed(two_way):
     await _run(_FakePlivoWS(), one_way=False)
 
     assert seen["queries"] == ["course fees"]
+
+
+# ── a burst of short utterances must not starve the agent ────────────────────
+#
+# REGRESSION from a real call. The lead said "హలో", "ఓకే ఓకే", "హలో", "ఓకే" in
+# quick succession. The logs show SIX OpenAI completions, all 200 — and the
+# transcript shows ONE agent turn. Every new transcript cancelled the answer
+# still being generated for the previous one, so the agent was answering every
+# time and we were throwing the answers away and paying for them. The lead
+# heard silence and hung up after 28 seconds.
+#
+# Cancelling is right for a genuine barge-in — the lead talking OVER the agent.
+# It is wrong for a lead who simply said two things in a row, which on a phone
+# is most of them, and which Sarvam's STT also produces naturally by emitting
+# an utterance per pause.
+
+async def test_a_burst_of_utterances_produces_one_answer_not_none(two_way):
+    """The whole failure in one test: four transcripts, one reply."""
+    seen, _tts, _stt = two_way(
+        [_said("హలో."), _said("ఓకే ఓకే."), _said("హలో."), _said("ఓకే.")],
+        replies=[_reply(text="Chెప్పండి.")],
+    )
+
+    outcome = await _run(_FakePlivoWS(), one_way=False)
+
+    agent_turns = [t for t in outcome["transcript"]
+                   if t.role == "agent" and "Chెప్పండి" in t.text]
+    assert agent_turns, (
+        "the agent answered and every answer was cancelled — the lead heard "
+        "nothing at all"
+    )
+
+
+async def test_a_burst_costs_one_completion_not_one_each(two_way):
+    """Six completions were paid for and one was used. Each cancelled reply is
+    a wasted API call as well as a silent lead."""
+    seen, _tts, _stt = two_way(
+        [_said("హలో."), _said("ఓకే ఓకే."), _said("హలో."), _said("ఓకే.")],
+        replies=[_reply(text="సరే.")],
+    )
+
+    await _run(_FakePlivoWS(), one_way=False)
+
+    assert len(seen["histories"]) <= 2, (
+        f"a burst of 4 utterances triggered {len(seen['histories'])} model "
+        "calls; they should collapse into one"
+    )
+
+
+async def test_everything_the_lead_said_reaches_the_model(two_way):
+    """Collapsing the burst must not lose what was said in it — the one reply
+    has to answer all of it, not just the last fragment."""
+    seen, _tts, _stt = two_way(
+        [_said("ఫీజు ఎంత?"), _said("మరియు ఎన్ని నెలలు?")],
+        replies=[_reply(text="సరే.")],
+    )
+
+    await _run(_FakePlivoWS(), one_way=False)
+
+    assert seen["histories"], "the model should have been called"
+    last = seen["histories"][-1]
+    said = " ".join(m.get("content") or "" for m in last if m.get("role") == "user")
+    assert "ఫీజు ఎంత?" in said and "మరియు ఎన్ని నెలలు?" in said

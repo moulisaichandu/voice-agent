@@ -82,6 +82,21 @@ _SENTENCE_END = re.compile(r"(?<=[.!?।])\s+")
 # ElevenLabs two-way path is in production and must not acquire a new way to
 # hang up on someone.
 TWOWAY_MAX_SILENT_S = 20.0
+
+# How long to wait for the lead to finish before answering.
+#
+# Not politeness — this is what stops a burst of utterances starving the agent
+# completely. Every new transcript cancels the answer still being generated for
+# the previous one, which is correct for a genuine barge-in and wrong for a
+# lead who simply said two things in a row. On a real call the lead said
+# "హలో", "ఓకే ఓకే", "హలో", "ఓకే"; the logs show SIX completions, all 200, and
+# the transcript shows ONE agent turn. The agent answered every time and every
+# answer was thrown away. The lead heard silence and hung up at 28 seconds.
+#
+# Sarvam's STT emits an utterance per pause, so this is the normal shape of
+# speech, not an edge case. Waiting briefly collapses a burst into one answer
+# that has heard all of it — and costs one completion instead of six.
+_REPLY_DEBOUNCE_S = 0.7
 _SILENCE_POLL_S = 0.25
 
 
@@ -302,12 +317,27 @@ class _Conversation:
         """A completed lead utterance: record it and answer it."""
         self.turns.append(TranscriptTurn(role="lead", text=text))
         self.history.append({"role": "user", "content": text})
-        # One reply at a time. A lead who says two things quickly should get
-        # one answer to both, not two answers talking over each other.
+        # One reply at a time, and not until the lead has actually stopped.
+        # Cancelling here is what starved the agent on a live call (see
+        # _REPLY_DEBOUNCE_S): the cancel is cheap only because the replacement
+        # waits before calling the model, so a burst collapses into one answer
+        # rather than N answers of which N-1 are discarded.
         await self._cancel_reply()
-        self.reply_task = asyncio.create_task(self._reply(tts))
+        self.reply_task = asyncio.create_task(self._reply_when_they_stop(tts))
 
     # ── answering ────────────────────────────────────────────────────────────
+
+    async def _reply_when_they_stop(self, tts: sarvam_tts.SarvamTTS) -> None:
+        """Wait out _REPLY_DEBOUNCE_S, then answer everything said so far.
+
+        Cancelled by the next transcript if one arrives inside the window, and
+        cancelled here is free: no completion has been requested yet. That is
+        the whole point — the model is called once, after the lead has
+        finished, instead of once per fragment with every answer but the last
+        thrown away.
+        """
+        await asyncio.sleep(_REPLY_DEBOUNCE_S)
+        await self._reply(tts)
 
     async def _reply(self, tts: sarvam_tts.SarvamTTS) -> None:
         try:
