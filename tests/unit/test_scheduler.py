@@ -169,6 +169,9 @@ class _FakeRedisQueue:
         self._lists = {_WB_QUEUE: list(items), _WB_PROCESSING: []}
         self.lpush_calls = []  # values pushed back onto the QUEUE (re-queues)
 
+    async def llen(self, key):
+        return len(self._lists.setdefault(key, []))
+
     async def lpush(self, key, value):
         self._lists.setdefault(key, []).insert(0, value)
         if key == _WB_QUEUE:

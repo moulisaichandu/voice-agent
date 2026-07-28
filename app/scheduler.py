@@ -38,6 +38,7 @@ from apscheduler.triggers.cron import CronTrigger
 from app import redis_client
 from app.compliance.calling_hours import within_calling_hours
 from app.config import (
+    CALL_MAX_DURATION_S,
     CALLING_HOURS_TZ,
     CAMPAIGN_TICK_SECONDS,
     MAX_CONCURRENT_CALLS,
@@ -112,6 +113,11 @@ async def retry_sweeper() -> None:
          on the next campaign_tick once they're back to 'pending'.
     """
     await worker.reaper_sweep(PROCESSING_REAPER_TIMEOUT_S)
+    # 3. Slot recovery — a call whose process died mid-flight never ran either
+    #    teardown path, so its concurrency slot was never returned and its lead
+    #    is still 'calling'. Bounded by CALL_MAX_DURATION_S plus slack, so a
+    #    genuinely live call is never touched.
+    await worker.reap_stranded_calls(CALL_MAX_DURATION_S + _STRANDED_SLACK_S)
 
 
 async def dnd_refresh() -> None:
@@ -161,6 +167,10 @@ async def sheets_sync() -> None:
     except Exception:
         pass  # Redis itself may be what's down; the log line above still landed
 
+
+# How long past a call's maximum duration before it is certainly over. Slack
+# absorbs clock skew and the drain PlivoCall.run() allows for trailing audio.
+_STRANDED_SLACK_S = 120
 
 _WRITEBACK_QUEUE = "sheets:writeback:queue"
 # Reserve-then-ack processing list, mirroring the calls worker's BLMOVE pattern

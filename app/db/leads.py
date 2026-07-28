@@ -280,3 +280,30 @@ async def dnd_phones() -> list[str]:
     pool = await get_pool()
     rows = await pool.fetch("select distinct phone_e164 from leads where dnd = true")
     return [r["phone_e164"] for r in rows]
+
+
+async def stale_calling_leads(older_than_s: int) -> list[UUID]:
+    """Leads still marked 'calling' whose call cannot still be in progress.
+
+    A call is bounded by CALL_MAX_DURATION_S, so a lead left in 'calling' for
+    longer than that plus slack is not a live call — it is a call whose process
+    died before it could record an outcome (a deploy, a crash, an OOM). Neither
+    /calls/stream's finally nor /calls/hangup runs in that case, so nothing
+    releases the concurrency slot or resolves the lead, and both stay stuck
+    forever. See worker.reap_stranded_calls.
+
+    last_called_at is set by record_dial_attempt when the attempt is placed, so
+    it is the right clock: it exists for every attempt, answered or not.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT lead_id FROM leads
+             WHERE status = 'calling'
+               AND last_called_at IS NOT NULL
+               AND last_called_at < now() - ($1 || ' seconds')::interval
+            """,
+            str(int(older_than_s)),
+        )
+    return [r["lead_id"] for r in rows]

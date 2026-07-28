@@ -169,6 +169,46 @@ async def reaper_sweep(timeout_s: int) -> int:
     return n
 
 
+async def reap_stranded_calls(older_than_s: int) -> int:
+    """Return the concurrency slots of calls whose process died mid-call.
+
+    _release_slot_once keys its dedupe guard per ATTEMPT, which fixed slots
+    leaking across RETRIES. It cannot fix this: if the process itself dies
+    mid-call, neither /calls/stream's finally nor /calls/hangup ever runs, so
+    the slot is never returned at all. calls:live:count has no TTL and nothing
+    else resets it, so every crashed call costs a permanent slot — the failure
+    _release_slot_once's docstring records being found in production with 4 of
+    10 already gone, recoverable only by a manual DEL.
+
+    Idempotent by construction, with no extra bookkeeping: the slot is released
+    only when mark_result_if_calling actually transitions the lead, and that is
+    guarded on the lead still being 'calling'. A second sweep over the same
+    lead transitions nothing and therefore releases nothing, so repeated runs
+    can never decrement the counter into over-admission.
+
+    'failed' is the honest outcome — the call really did fail — and it lets the
+    ordinary retry path pick the lead up again, which is what should happen to
+    someone whose call was cut short by a deploy.
+    """
+    stranded = await leads_db.stale_calling_leads(older_than_s)
+    reaped = 0
+    for lead_id in stranded:
+        try:
+            if await leads_db.mark_result_if_calling(lead_id, "failed"):
+                await release_call_slot()
+                reaped += 1
+        except Exception as exc:  # noqa: BLE001 - one bad row must not stop the sweep
+            logger.error(f"[worker] could not reap stranded call for lead "
+                         f"{lead_id}: {type(exc).__name__}: {exc}")
+    if reaped:
+        logger.warning(
+            f"[worker] reaped {reaped} call(s) stranded by a process that died "
+            "mid-call: their concurrency slots are back and their leads are "
+            "eligible for retry."
+        )
+    return reaped
+
+
 async def _reserve_next(timeout_s: int = 2) -> str | None:
     r = redis_client.get_redis()
     return await r.blmove(QUEUE_KEY, PROCESSING_KEY, timeout=timeout_s, src="RIGHT", dest="LEFT")
