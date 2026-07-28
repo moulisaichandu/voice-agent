@@ -118,6 +118,9 @@ async def retry_sweeper() -> None:
     #    is still 'calling'. Bounded by CALL_MAX_DURATION_S plus slack, so a
     #    genuinely live call is never touched.
     await worker.reap_stranded_calls(CALL_MAX_DURATION_S + _STRANDED_SLACK_S)
+    # 4. ...and any slot left behind with no lead to attribute it to, which
+    #    step 3 structurally cannot see.
+    await worker.reconcile_live_slots()
 
 
 async def dnd_refresh() -> None:

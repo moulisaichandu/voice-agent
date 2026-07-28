@@ -124,6 +124,25 @@ async def test_reaper_is_a_noop_when_nothing_is_stuck():
 # A call cannot outlive CALL_MAX_DURATION_S, so anything older than that plus
 # slack is definitionally over.
 
+class _FakeRedis:
+    """Enough Redis for the slot counter: a string GET and an eval that runs
+    the same compare-and-lower the real Lua does."""
+
+    def __init__(self, store):
+        self.store = dict(store)
+
+    async def get(self, key):
+        return self.store.get(key)
+
+    async def eval(self, script, numkeys, key, target):
+        cur = int(self.store.get(key) or 0)
+        target = int(target)
+        if cur > target:
+            self.store[key] = str(target)
+            return cur - target
+        return 0
+
+
 async def test_a_call_that_cannot_still_be_running_returns_its_slot(monkeypatch):
     released = {"n": 0}
     stranded = [uuid4(), uuid4()]
@@ -226,6 +245,79 @@ async def test_the_sweeper_runs_it(monkeypatch):
         return 0
 
     monkeypatch.setattr(scheduler.worker, "reap_stranded_calls", fake_reap)
+    monkeypatch.setattr(scheduler.worker, "reaper_sweep", noop)
+
+    await scheduler.retry_sweeper()
+
+    assert called["n"] == 1
+
+
+# ── a slot counter orphaned from any lead ────────────────────────────────────
+#
+# reap_stranded_calls recovers a slot by resolving the lead that still holds
+# it. It structurally cannot recover one whose lead was already resolved by
+# another path — the counter is then orphaned, above the number of calls that
+# actually exist, with nothing left to attribute it to.
+#
+# Found live immediately after shipping the reaper: 0 leads in 'calling',
+# 0 stale, calls:live:count = 1. Permanently.
+#
+# The invariant is simple: a slot is only legitimately held while a lead is
+# 'calling', so the counter can never exceed that many. Anything above is leak.
+
+async def test_a_counter_above_the_calls_that_exist_is_brought_back_down(monkeypatch):
+    async def fake_count():
+        return 1
+
+    monkeypatch.setattr(worker.leads_db, "count_calling_leads", fake_count)
+    r = _FakeRedis({worker.LIVE_COUNT_KEY: "4"})
+    monkeypatch.setattr(worker.redis_client, "get_redis", lambda: r)
+
+    recovered = await worker.reconcile_live_slots()
+
+    assert recovered == 3
+    assert r.store[worker.LIVE_COUNT_KEY] == "1"
+
+
+async def test_a_counter_matching_reality_is_left_alone(monkeypatch):
+    async def fake_count():
+        return 2
+
+    monkeypatch.setattr(worker.leads_db, "count_calling_leads", fake_count)
+    r = _FakeRedis({worker.LIVE_COUNT_KEY: "2"})
+    monkeypatch.setattr(worker.redis_client, "get_redis", lambda: r)
+
+    assert await worker.reconcile_live_slots() == 0
+    assert r.store[worker.LIVE_COUNT_KEY] == "2"
+
+
+async def test_the_counter_is_never_raised(monkeypatch):
+    """Only ever lowers. Raising it would invent occupancy and throttle
+    dialling for a reason that does not exist — the opposite failure, reached
+    by a sweep that is meant to be a safety net."""
+    async def fake_count():
+        return 5
+
+    monkeypatch.setattr(worker.leads_db, "count_calling_leads", fake_count)
+    r = _FakeRedis({worker.LIVE_COUNT_KEY: "1"})
+    monkeypatch.setattr(worker.redis_client, "get_redis", lambda: r)
+
+    assert await worker.reconcile_live_slots() == 0
+    assert r.store[worker.LIVE_COUNT_KEY] == "1"
+
+
+async def test_the_sweeper_reconciles_too(monkeypatch):
+    called = {"n": 0}
+
+    async def fake_reconcile():
+        called["n"] += 1
+        return 0
+
+    async def noop(*a, **kw):
+        return 0
+
+    monkeypatch.setattr(scheduler.worker, "reconcile_live_slots", fake_reconcile)
+    monkeypatch.setattr(scheduler.worker, "reap_stranded_calls", noop)
     monkeypatch.setattr(scheduler.worker, "reaper_sweep", noop)
 
     await scheduler.retry_sweeper()

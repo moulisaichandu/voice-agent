@@ -307,3 +307,16 @@ async def stale_calling_leads(older_than_s: int) -> list[UUID]:
             str(int(older_than_s)),
         )
     return [r["lead_id"] for r in rows]
+
+
+async def count_calling_leads() -> int:
+    """How many calls are genuinely in flight right now.
+
+    A concurrency slot is only legitimately held while its lead is 'calling',
+    so this is the ceiling calls:live:count can honestly have. See
+    worker.reconcile_live_slots.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT count(*) FROM leads WHERE status = 'calling'") or 0

@@ -169,6 +169,53 @@ async def reaper_sweep(timeout_s: int) -> int:
     return n
 
 
+# Lower calls:live:count to a target, atomically, and never raise it. Done in
+# Lua so the read and the write cannot interleave with a worker acquiring a
+# slot between them — which would otherwise clobber a legitimate acquisition.
+_RECONCILE_SLOTS_LUA = """
+local cur = tonumber(redis.call('GET', KEYS[1]) or '0')
+local target = tonumber(ARGV[1])
+if cur > target then
+  redis.call('SET', KEYS[1], target)
+  return cur - target
+end
+return 0
+"""
+
+
+async def reconcile_live_slots() -> int:
+    """Bring calls:live:count back down to the number of calls that exist.
+
+    The companion to reap_stranded_calls, which recovers a slot by resolving
+    the lead still holding it. That cannot help when the lead was already
+    resolved by another path and only the counter was left behind: the slot is
+    then orphaned, attributable to nothing, and permanent. Observed live
+    immediately after shipping the reaper — 0 leads calling, 0 stale,
+    calls:live:count = 1.
+
+    Only ever LOWERS. Raising it would invent occupancy and throttle dialling
+    for a reason that does not exist, which is a worse failure than the one
+    this is fixing and reached by a job meant to be a safety net.
+
+    The DB count is read before the Lua runs, so a call starting in that window
+    could see the counter lowered by one more than it should be. That is
+    bounded, self-correcting on the next release, and vastly preferable to
+    capacity that is lost forever — the failure _release_slot_once's docstring
+    records reaching 4 of 10 slots in production.
+    """
+    live = await leads_db.count_calling_leads()
+    r = redis_client.get_redis()
+    recovered = int(await r.eval(_RECONCILE_SLOTS_LUA, 1, LIVE_COUNT_KEY, live) or 0)
+    if recovered:
+        logger.warning(
+            f"[worker] recovered {recovered} orphaned concurrency slot(s): "
+            f"calls:live:count claimed more calls than the {live} actually in "
+            "flight. Left alone, each one permanently reduces how many leads "
+            "can be dialled at once."
+        )
+    return recovered
+
+
 async def reap_stranded_calls(older_than_s: int) -> int:
     """Return the concurrency slots of calls whose process died mid-call.
 
