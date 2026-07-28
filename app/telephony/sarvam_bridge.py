@@ -227,6 +227,31 @@ class _Conversation:
             self.ledger.add(sentence, spoken_ms)
             self.note_activity()
 
+    async def deliver_opening(self, tts: sarvam_tts.SarvamTTS,
+                              opening: str) -> None:
+        """Speak the opening, and keep it barge-in protected until it has been
+        HEARD rather than merely sent.
+
+        PlivoCall's protect_opening exists so a lead cannot talk over the AI
+        disclosure. Lifting it when say() returns defeated that: say() returns
+        once the audio is handed to Plivo, and Sarvam's TTS delivers far faster
+        than real time, so the lead was typically still seconds into the
+        disclosure. A "hello" then counted as a valid barge-in, the ledger
+        truthfully rewrote the turn to the only sentence that had played — the
+        bare name greeting — and the disclosure vanished from the call and from
+        the record. Observed live as a [compliance] ERROR.
+
+        play_end is when the queued audio actually runs out, the same clock the
+        one-way watchdog drains against.
+        """
+        await self.say(tts, opening)
+        while not self.call.stop.is_set():
+            remaining = self.call.play_end - self._loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(remaining, _SILENCE_POLL_S))
+        self.call.mark_opening_delivered()
+
     def note_activity(self) -> None:
         """Somebody spoke. Resets the silence watchdog."""
         self.last_activity = self._loop.time()
@@ -430,9 +455,9 @@ async def _run_two_way(call: plivo_stream.PlivoCall, *, lead_id: str,
         async def converse() -> None:
             try:
                 # The AI placed this call, so it speaks first — the disclosure
-                # cannot wait for the lead to say something.
-                await conversation.say(tts, opening)
-                call.mark_opening_delivered()
+                # cannot wait for the lead to say something, and cannot be
+                # talked over until it has actually been heard.
+                await conversation.deliver_opening(tts, opening)
 
                 async for event in stt.events():
                     if call.stop.is_set():

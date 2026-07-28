@@ -490,31 +490,40 @@ async def test_the_agent_can_end_the_call_cleanly(two_way):
 
 # ── barge-in ─────────────────────────────────────────────────────────────────
 
-async def test_barge_in_forgets_what_the_lead_never_heard(two_way):
+async def test_barge_in_forgets_what_the_lead_never_heard():
     """THE bug the previous plan warned about inheriting.
 
-    OpenAI Realtime is told what the lead actually heard via
-    conversation.item.truncate and repairs its own history. Here the history is
-    ours: if we keep the whole answer after an interruption, every later turn
-    is built on words nobody heard, and the agent starts referring back to
-    things it never said.
+    OpenAI Realtime is told what the lead heard via conversation.item.truncate
+    and repairs its own history. Here the history is ours: if we keep the whole
+    answer after an interruption, every later turn is built on words nobody
+    heard, and the agent starts referring back to things it never said.
 
-    Asserted on the history handed to the NEXT turn, which is where the damage
-    would actually show up."""
-    seen, _tts, _stt = two_way(
-        [_barge_in(), _said("Aagandi.")],
-        replies=[_reply(text="Ok.")],
+    Tested on an ordinary answer rather than the opening, because the opening
+    is barge-in PROTECTED until it has played — see
+    test_the_opening_stays_protected_until_it_has_actually_played."""
+    from app.db.models import TranscriptTurn
+
+    call = sarvam_bridge.plivo_stream.PlivoCall(
+        _FakePlivoWS(), lead_id="l", one_way=False, protect_opening=False)
+    turns = []
+    convo = sarvam_bridge._Conversation(
+        call, lead_id="l", system_prompt="s", turns=turns)
+
+    # An answer of two sentences, of which only the first ever played.
+    convo._agent_turn_index = 0
+    turns.append(TranscriptTurn(role="agent", text="One. Two."))
+    convo.history.append({"role": "assistant", "content": "One. Two."})
+    convo.ledger.add("One.", 1000)
+    convo.ledger.add("Two.", 1000)
+
+    await convo.on_barge_in()
+
+    claimed = " ".join(m.get("content") or "" for m in convo.history
+                       if m.get("role") == "assistant")
+    assert "Two." not in claimed, (
+        "the history still claims a sentence the lead never heard"
     )
-
-    await _run(_FakePlivoWS(), one_way=False)
-
-    assert seen["histories"], "the lead's turn should have reached the model"
-    last = seen["histories"][-1]
-    assistant_text = " ".join(m.get("content") or "" for m in last
-                              if m.get("role") == "assistant")
-    assert _TELUGU not in assistant_text, (
-        "the history still claims the agent said an opening the lead cut off"
-    )
+    assert all("Two." not in t.text for t in turns)
 
 
 # ── the gate ─────────────────────────────────────────────────────────────────
@@ -818,3 +827,45 @@ async def test_everything_the_lead_said_reaches_the_model(two_way):
     last = seen["histories"][-1]
     said = " ".join(m.get("content") or "" for m in last if m.get("role") == "user")
     assert "ఫీజు ఎంత?" in said and "మరియు ఎన్ని నెలలు?" in said
+
+
+# ── the disclosure must be HEARD before the shield comes down ────────────────
+
+async def test_the_opening_stays_protected_until_it_has_actually_played(two_way):
+    """REGRESSION from a live call that logged a [compliance] ERROR.
+
+    protect_opening=True stops a lead talking over the AI disclosure. But the
+    shield was dropped the moment say() returned — and say() returns when the
+    audio has been SENT, not heard. Sarvam's TTS delivers far faster than real
+    time, so the lead was still two seconds into an eleven-second opening.
+    Saying "హలో" then counted as a valid barge-in, the SpokenLedger truthfully
+    rewrote the turn to the only sentence that had played — the bare name
+    greeting — and the disclosure was gone from both the call and the record.
+
+    Same send-versus-play distinction as the silence watchdog, with a
+    compliance consequence instead of a billing one."""
+    two_way([])
+    call = sarvam_bridge.plivo_stream.PlivoCall(
+        _FakePlivoWS(), lead_id="l", one_way=False, protect_opening=True)
+    convo = sarvam_bridge._Conversation(
+        call, lead_id="l", system_prompt="s", turns=[])
+
+    one_second = base64.b64encode(b"" * 8000).decode()  # 8000 B = 1s
+
+    class _InstantTTS:
+        async def speak(self, text):
+            # A whole second of audio, handed over instantly — exactly what the
+            # real client does when Sarvam answers faster than playback.
+            # PlivoCall.play() derives play_end from the PAYLOAD, so this has
+            # to be a genuine second of bytes, not a short frame labelled 1000.
+            yield one_second, 1000
+
+    task = asyncio.create_task(convo.deliver_opening(_InstantTTS(), "ఒకటి. రెండు."))
+    await asyncio.sleep(0.05)
+
+    assert not await call.interrupt(), (
+        "the lead was able to talk over the AI disclosure while it was still "
+        "playing"
+    )
+    await asyncio.wait_for(task, timeout=10)
+    assert await call.interrupt(), "the shield must come down once it has played"
