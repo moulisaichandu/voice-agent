@@ -314,9 +314,23 @@ async def _cached_check(key: str, compute: Callable[[], Awaitable[dict]]) -> dic
     except Exception:
         raw = None
     if raw:
-        result = json.loads(raw)
-        result["cached"] = True
-        return result
+        try:
+            result = json.loads(raw)
+        except (TypeError, ValueError):
+            # A partial write or stale schema must not turn the dashboard
+            # into a 500. Treat corrupted cache data as a cache miss.
+            logger.warning("Ignoring malformed readiness cache for %s", key)
+        else:
+            if isinstance(result, dict):
+                try:
+                    ReadinessCheck(**{**result, "cached": True})
+                except Exception:
+                    logger.warning("Ignoring invalid readiness cache for %s", key)
+                else:
+                    result["cached"] = True
+                    return result
+            else:
+                logger.warning("Ignoring non-object readiness cache for %s", key)
     return await _refresh_check(key, compute)
 
 
@@ -516,7 +530,20 @@ async def sheets_status() -> SheetsStatusResponse:
         raw = None
     if not raw:
         return SheetsStatusResponse(configured=configured)
-    data = json.loads(raw)
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring malformed Sheets sync status cache")
+        return SheetsStatusResponse(
+            configured=configured,
+            last_error="Cached Sheets status is malformed; waiting for the next sync",
+        )
+    if not isinstance(data, dict):
+        logger.warning("Ignoring non-object Sheets sync status cache")
+        return SheetsStatusResponse(
+            configured=configured,
+            last_error="Cached Sheets status is malformed; waiting for the next sync",
+        )
     return SheetsStatusResponse(
         configured=configured,
         last_sync_at=data.get("at"),

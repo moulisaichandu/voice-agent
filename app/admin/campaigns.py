@@ -13,7 +13,7 @@ import logging
 from typing import Literal
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel, Field
 
 from app import config as app_config
@@ -226,7 +226,9 @@ async def list_campaigns(include_inactive: bool = False) -> list[Campaign]:
 
 
 @router.post("/campaigns", response_model=Campaign, status_code=201)
-async def create_campaign(body: CampaignCreate) -> Campaign:
+async def create_campaign(
+    body: CampaignCreate, background_tasks: BackgroundTasks,
+) -> Campaign:
     _check_twoway_capable(body.mode, body.language)
     agent_id = _resolve_agent_id(body.mode, body.agent_id)
     await _check_language_support(agent_id, body.language)
@@ -236,7 +238,10 @@ async def create_campaign(body: CampaignCreate) -> Campaign:
             script=body.script, max_attempts=body.max_attempts,
             language=body.language,
         )
-        await _warm_rendered_script(campaign)
+        # Sarvam rendering is an optional cache warm-up and can take long
+        # enough for the console proxy to time out. Respond as soon as the
+        # campaign is durable; Starlette runs this task after sending the 201.
+        background_tasks.add_task(_warm_rendered_script, campaign)
         return campaign
     except ValueError as exc:
         # The oneway-needs-a-script and AI-disclosure checks in

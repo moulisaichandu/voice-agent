@@ -590,6 +590,18 @@ def test_readiness_cache_survives_a_redis_hiccup_on_write(client, monkeypatch):
     assert preflight_check["status"] == "good"
 
 
+def test_readiness_recomputes_malformed_cached_check(client, monkeypatch):
+    redis = _FakeRedis({"readiness:preflight": "not-json"})
+    _mock_all_healthy(monkeypatch, redis=redis)
+
+    r = client.get("/admin/readiness")
+
+    assert r.status_code == 200
+    preflight_check = next(c for c in r.json()["checks"] if c["key"] == "preflight")
+    assert preflight_check["status"] == "good"
+    assert preflight_check["cached"] is False
+
+
 # ── stats ────────────────────────────────────────────────────────────────────
 
 def test_stats_combines_lead_status_counts_and_calls_today(client, monkeypatch):
@@ -694,3 +706,14 @@ def test_sheets_status_handles_no_sync_having_run_yet(client, monkeypatch):
     body = r.json()
     assert body["configured"] is True
     assert body["last_sync_at"] is None
+
+
+def test_sheets_status_does_not_500_on_malformed_cache(client, monkeypatch):
+    monkeypatch.setattr(admin_system.app_config, "GOOGLE_SHEET_ID", "sheet-123")
+    redis = _FakeRedis({admin_system.scheduler_module.SHEETS_LAST_SYNC_KEY: "not-json"})
+    monkeypatch.setattr(admin_system.redis_client, "get_redis", lambda: redis)
+
+    r = client.get("/admin/sheets-status")
+
+    assert r.status_code == 200
+    assert "malformed" in r.json()["last_error"]

@@ -7,6 +7,8 @@ bypassed (create_campaign's own ValueError still surfaces as a 422).
 from datetime import datetime, timezone
 from uuid import uuid4
 
+from fastapi import BackgroundTasks
+
 from app.admin import campaigns as admin_campaigns
 
 
@@ -594,6 +596,38 @@ def test_the_reported_backend_follows_the_rollback_switch(client, monkeypatch):
 # delivered call.
 #
 # So the render is warmed when the campaign is created, off the request path.
+
+async def test_creating_a_telugu_campaign_returns_before_the_optional_warmup(
+    monkeypatch,
+):
+    """A slow Sarvam render must not make a saved campaign look failed."""
+    warmed = {}
+
+    async def fake_create(**kwargs):
+        return _campaign(mode="oneway", language="te", script=kwargs["script"])
+
+    async def fake_render(script, *, language_style=None):
+        warmed["script"] = script
+        return "rendered"
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
+    monkeypatch.setattr(admin_campaigns.sarvam_llm, "render", fake_render)
+    tasks = BackgroundTasks()
+    script = "This is an automated AI call. Our course starts Monday."
+
+    campaign = await admin_campaigns.create_campaign(
+        admin_campaigns.CampaignCreate(
+            name="Telugu", mode="oneway", language="te", agent_id="agent_1",
+            script=script,
+        ),
+        tasks,
+    )
+
+    assert campaign.name == "Demo"
+    assert warmed == {}, "the route must return before Sarvam is contacted"
+    await tasks()
+    assert warmed["script"] == script
+
 
 def test_creating_a_telugu_campaign_warms_the_render(client, monkeypatch):
     warmed = {}
