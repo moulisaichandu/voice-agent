@@ -227,7 +227,12 @@ async def test_audio_health_is_logged_once_per_utterance(connected, caplog):
     caplog.set_level("INFO")
     connected(_FakeSTTWS([_vad("START_SPEECH"), _vad("END_SPEECH")]))
 
-    quiet = (0).to_bytes(2, "little", signed=True) * 80
+    # Nonzero, not silence: _rms(0, 0) ("nothing measured") and the RMS of
+    # true zero-amplitude audio both render as 0.0, which would make the
+    # silence_rms assertion below pass even if silence accumulation were
+    # deleted entirely. A small nonzero amplitude keeps the assertion
+    # actually discriminating.
+    quiet = (200).to_bytes(2, "little", signed=True) * 80
     loud = (12000).to_bytes(2, "little", signed=True) * 80
     quiet_mulaw_b64 = base64.b64encode(ulaw.encode(quiet)).decode()
     loud_mulaw_b64 = base64.b64encode(ulaw.encode(loud)).decode()
@@ -253,6 +258,66 @@ async def test_audio_health_is_logged_once_per_utterance(connected, caplog):
     assert f"silence_rms={expected_silence:.1f}" in line
     assert f"speech_rms={expected_speech:.1f}" in line
     assert "frames=2" in line
+
+
+async def test_audio_health_resets_between_consecutive_utterances(connected, caplog):
+    """A second utterance's logged line must reflect only ITS OWN frames —
+    not a running total across the whole call. Guards against a refactor
+    that moves or drops one of the resets (e.g. the speech-window reset
+    currently at START_SPEECH): if silence/speech/frame accumulators ever
+    stopped resetting at the right VAD boundary, utterance 2 would silently
+    report a blend of utterance 1's and utterance 2's audio, and every line
+    after the first would be wrong in a call with real back-and-forth.
+    """
+    caplog.set_level("INFO")
+    connected(_FakeSTTWS([
+        _vad("START_SPEECH"), _vad("END_SPEECH"),
+        _vad("START_SPEECH"), _vad("END_SPEECH"),
+    ]))
+
+    # Deliberately different amplitudes per utterance and per window, so a
+    # carry-over bug (utterance 2's line still including utterance 1's
+    # samples) produces a visibly wrong number rather than an accidental match.
+    quiet_1 = (200).to_bytes(2, "little", signed=True) * 80
+    loud_1 = (12000).to_bytes(2, "little", signed=True) * 80
+    quiet_2 = (900).to_bytes(2, "little", signed=True) * 80
+    loud_2 = (6000).to_bytes(2, "little", signed=True) * 80
+    quiet_1_b64 = base64.b64encode(ulaw.encode(quiet_1)).decode()
+    loud_1_b64 = base64.b64encode(ulaw.encode(loud_1)).decode()
+    quiet_2_b64 = base64.b64encode(ulaw.encode(quiet_2)).decode()
+    loud_2_b64 = base64.b64encode(ulaw.encode(loud_2)).decode()
+
+    async with sarvam_stt.SarvamSTT(lead_id="lead-two") as stt:
+        events_iter = stt.events()
+
+        # utterance 1
+        await stt.send_audio(quiet_1_b64)
+        started_1 = await events_iter.__anext__()
+        assert started_1.kind == "speech_started"
+        await stt.send_audio(loud_1_b64)
+        ended_1 = await events_iter.__anext__()
+        assert ended_1.kind == "speech_ended"
+
+        # utterance 2 — its own silence and speech windows
+        await stt.send_audio(quiet_2_b64)
+        started_2 = await events_iter.__anext__()
+        assert started_2.kind == "speech_started"
+        await stt.send_audio(loud_2_b64)
+        ended_2 = await events_iter.__anext__()
+        assert ended_2.kind == "speech_ended"
+
+    expected_silence_2 = sarvam_stt._rms(*sarvam_stt._sumsq_and_count(ulaw.decode(
+        base64.b64decode(quiet_2_b64))))
+    expected_speech_2 = sarvam_stt._rms(*sarvam_stt._sumsq_and_count(ulaw.decode(
+        base64.b64decode(loud_2_b64))))
+
+    lines = [r.message for r in caplog.records if "audio health" in r.message]
+    assert len(lines) == 2, f"expected exactly 2 audio-health lines, got {lines}"
+    second_line = lines[1]
+    assert "lead=lead-two" in second_line
+    assert f"silence_rms={expected_silence_2:.1f}" in second_line
+    assert f"speech_rms={expected_speech_2:.1f}" in second_line
+    assert "frames=2" in second_line
 
 
 async def test_lead_id_defaults_to_empty_string(connected, caplog):
