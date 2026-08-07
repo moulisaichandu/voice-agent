@@ -822,7 +822,7 @@ async def _run_two_way(call: plivo_stream.PlivoCall, *, lead_id: str,
                                  system_prompt=system_prompt, turns=turns)
 
     async with sarvam_tts.SarvamTTS(language=SARVAM_STT_LANGUAGE) as tts, \
-            sarvam_stt.SarvamSTT() as stt:
+            sarvam_stt.SarvamSTT(lead_id=lead_id) as stt:
 
         async def to_sarvam(payload_b64: str) -> None:
             await stt.send_audio(payload_b64)

@@ -1234,6 +1234,21 @@ async def test_a_turn_logs_where_the_lead_s_wait_actually_went(two_way, caplog):
     assert "gate=" in lines[0] and "llm=" in lines[0] and "total=" in lines[0]
 
 
+async def test_the_lead_id_reaches_the_audio_health_log(two_way, caplog):
+    """SarvamSTT logs its own [sarvam-stt] audio-health line (see
+    app/telephony/sarvam_stt.py) — this only confirms the bridge actually
+    threads the call's lead_id into it, so that line can be correlated
+    against this call's other [sarvam] lines afterward."""
+    caplog.set_level("INFO")
+    two_way([_speech_ended()], replies=[])
+
+    await _run(_FakePlivoWS(), one_way=False, lead_id="lead-audio-health")
+
+    lines = [r.message for r in caplog.records if "audio health" in r.message]
+    assert lines, "no audio-health line was logged"
+    assert "lead=lead-audio-health" in lines[0]
+
+
 async def test_the_latency_line_is_measured_from_the_first_unanswered_word(
     two_way, caplog, monkeypatch,
 ):
