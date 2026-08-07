@@ -103,6 +103,8 @@ async def _run(plivo, **kwargs):
     return await asyncio.wait_for(sarvam_bridge.bridge(plivo, **defaults), timeout=5)
 
 
+
+
 # ── the one-way call ─────────────────────────────────────────────────────────
 
 async def test_a_one_way_call_delivers_its_message_and_ends(bridged):
@@ -347,6 +349,10 @@ def _barge_in():
     return json.dumps({"type": "events", "data": {"signal_type": "START_SPEECH"}})
 
 
+def _speech_ended():
+    return json.dumps({"type": "events", "data": {"signal_type": "END_SPEECH"}})
+
+
 @pytest.fixture
 def two_way(monkeypatch):
     """A two-way bridge with both sockets and the LLM faked."""
@@ -401,6 +407,35 @@ def _reply(text="", tools=()):
 def _tool(name, **arguments):
     return sarvam_bridge.conversation_llm.ToolCall(
         call_id="c1", name=name, arguments=arguments)
+
+
+@pytest.mark.parametrize("text", [
+    "Bye.", "goodbye", "Good bye!", "Bye bye", "That's all, thank you.",
+    "I have no questions.", "బై",
+])
+def test_explicit_lead_goodbyes_are_detected(text):
+    assert sarvam_bridge._is_lead_goodbye(text)
+
+
+@pytest.mark.parametrize("text", ["okay", "thanks", "by the way, fees?", "hi"])
+def test_non_goodbye_transcripts_are_not_treated_as_hangup(text):
+    assert not sarvam_bridge._is_lead_goodbye(text)
+
+
+async def test_lead_goodbye_hangs_up_without_waiting_for_the_model(two_way):
+    seen, _tts, _stt = two_way([_said("Bye")])
+
+    outcome = await _run(_FakePlivoWS(), one_way=False)
+
+    assert outcome["status"] == "done"
+    assert not any(t.role == "agent" and t.text == "Ok."
+                   for t in outcome["transcript"])
+    assert not seen["histories"], "goodbye must not spend an LLM turn"
+
+
+def test_lead_goodbye_is_a_clean_exit():
+    from app.telephony import plivo_stream
+    assert "sarvam_lead_goodbye" in plivo_stream._CLEAN_EXITS
 
 
 async def test_the_agent_speaks_first_on_a_two_way_call(two_way):
@@ -474,6 +509,79 @@ async def test_search_permissive_is_never_reachable(two_way, monkeypatch):
     await _run(_FakePlivoWS(), one_way=False)
 
 
+async def test_a_slow_course_lookup_does_not_hold_the_lead_in_silence(
+    two_way, monkeypatch,
+):
+    """search_relevant() has no deadline of its own — an 8s embed timeout with
+    one SDK retry is ~16s — and the two-way silence watchdog will not save the
+    lead either, since an in-flight reply counts as activity. The voice call
+    site bounds it instead, and on a timeout the model is handed the same note
+    a genuine miss returns, so the agent still says something instead of
+    holding the line."""
+    monkeypatch.setattr(sarvam_bridge, "RAG_VOICE_DEADLINE_S", 0.05)
+    seen, _tts, _stt = two_way(
+        [_said("Fee enta?")],
+        replies=[_reply(tools=[_tool("search_course_material", query="fees")]),
+                 _reply(text="Aa vivaram naa daggara ledu.")],
+    )
+
+    async def glacial(query, *a, **kw):
+        await asyncio.sleep(5)
+        return "never arrives"
+
+    monkeypatch.setattr(sarvam_bridge, "search_relevant", glacial)
+
+    outcome = await _run(_FakePlivoWS(), one_way=False)
+
+    tool_messages = [m for h in seen["histories"] for m in h
+                     if m.get("role") == "tool"]
+    assert tool_messages, "the model must still be handed a tool result"
+    assert all(m["content"] == sarvam_bridge.NO_MATERIAL_NOTE
+               for m in tool_messages), (
+        "a bespoke 'the search timed out' string would be read out verbatim "
+        "by the synthesiser instead of going through the prompt's own rule "
+        "for a genuine miss"
+    )
+    assert any(t.role == "agent" and "naa daggara ledu" in t.text
+               for t in outcome["transcript"]), (
+        "the agent must still say something, not sit in silence"
+    )
+
+
+async def test_a_failed_course_lookup_still_allows_a_spoken_answer(
+    two_way, monkeypatch,
+):
+    """A RAG outage must become a safe fallback, not a silent call.
+
+    The direct Sarvam path used to let embedding/database exceptions escape
+    from _run_tools. _reply caught them at the outer boundary, so the lead's
+    question was recorded but the answer turn disappeared entirely.
+    """
+    seen, _tts, _stt = two_way(
+        [_said("Fee enta?")],
+        replies=[
+            _reply(tools=[_tool("search_course_material", query="fees")]),
+            _reply(text="Aa vivaram ippudu naa daggara ledu."),
+        ],
+    )
+
+    async def broken_search(query, *args, **kwargs):
+        raise RuntimeError("embedding service unavailable")
+
+    monkeypatch.setattr(sarvam_bridge, "search_relevant", broken_search)
+
+    outcome = await _run(_FakePlivoWS(), one_way=False)
+
+    tool_messages = [m for h in seen["histories"] for m in h
+                     if m.get("role") == "tool"]
+    assert tool_messages
+    assert tool_messages[-1]["content"] == sarvam_bridge.NO_MATERIAL_NOTE
+    assert any(
+        t.role == "agent" and "naa daggara ledu" in t.text
+        for t in outcome["transcript"]
+    )
+
+
 # ── ending the call ──────────────────────────────────────────────────────────
 
 async def test_the_agent_can_end_the_call_cleanly(two_way):
@@ -486,6 +594,47 @@ async def test_the_agent_can_end_the_call_cleanly(two_way):
     outcome = await _run(_FakePlivoWS(), one_way=False)
 
     assert outcome["status"] == "done"
+
+
+async def test_the_farewell_is_spoken_when_the_model_ends_the_call(two_way):
+    """CONFIRMED on two live calls on 2026-08-07: every call the model ended
+    itself (as opposed to the silence watchdog) hung up in total silence right
+    after the lead's last word — reading exactly like "the agent stopped
+    answering". end_call's own tool description tells the model to send its
+    farewell "together with" the tool call, and unlike the search tool's
+    filler there is no next round for that text to arrive in, so it must be
+    spoken rather than treated as commentary to suppress.
+
+    Said as "Okay, thank you." on purpose, not an explicit goodbye: this must
+    reach the model rather than exit through _is_lead_goodbye's fast path, the
+    same way the live calls did — Sarvam's STT transcribed a spoken "bye" as
+    "బాయ్", a spelling _GOODBYE_PHRASES does not recognise, so it fell through
+    to the model exactly like this."""
+    two_way([_said("Okay, thank you.")],
+            replies=[_reply(text="Dhanyavadalu, namaskaram.",
+                            tools=[_tool("end_call")])])
+
+    outcome = await _run(_FakePlivoWS(), one_way=False)
+
+    spoken = [t.text for t in outcome["transcript"] if t.role == "agent"]
+    assert any("Dhanyavadalu" in t for t in spoken), (
+        f"the model's farewell was dropped as filler: {spoken}"
+    )
+
+
+async def test_a_canned_farewell_is_spoken_when_the_model_gives_none(two_way):
+    """CLAUDE.md: measured against the live API, the model sometimes calls
+    end_call with no farewell text attached at all (not suppressed — never
+    generated). That must not read as the earlier "farewell dropped" bug —
+    there is nothing to speak that the code failed to pass through — but the
+    lead still deserves something other than dead air on disconnect."""
+    two_way([_said("Okay, thank you.")],
+            replies=[_reply(text="", tools=[_tool("end_call")])])
+
+    outcome = await _run(_FakePlivoWS(), one_way=False)
+
+    spoken = [t.text for t in outcome["transcript"] if t.role == "agent"]
+    assert spoken and spoken[-1] == sarvam_bridge._FALLBACK_FAREWELL
 
 
 # ── barge-in ─────────────────────────────────────────────────────────────────
@@ -827,6 +976,452 @@ async def test_everything_the_lead_said_reaches_the_model(two_way):
     last = seen["histories"][-1]
     said = " ".join(m.get("content") or "" for m in last if m.get("role") == "user")
     assert "ఫీజు ఎంత?" in said and "మరియు ఎన్ని నెలలు?" in said
+
+
+# ── a burst DURING the model call must not starve the agent either ───────────
+#
+# REGRESSION from a live call, 2026-08-07 — the sequel to the burst above.
+# That fix collapses fragments arriving before the model is ever called. It
+# does not cover fragments arriving AFTER: on a real call two consecutive
+# turns logged 0 rounds, nothing spoken, on an ordinary mid-conversation
+# question (not an ending). Cancel-and-restart on every fragment, applied
+# unconditionally, means a lead who keeps talking for the length of one model
+# round-trip can cancel that round right as it would have finished, forever —
+# the burst-collapse fix and this bug are the same mechanism pointed at two
+# different windows in the same turn.
+
+async def test_a_fragment_mid_call_does_not_cancel_the_committed_round(monkeypatch):
+    """Once conversation_llm.turn() is actually in flight, a new fragment must
+    not cancel it — that round has to be allowed to finish and speak."""
+    monkeypatch.setattr(sarvam_bridge, "SARVAM_REPLY_SETTLE_S", 0)
+    monkeypatch.setattr(sarvam_bridge, "SARVAM_REPLY_MAX_WAIT_S", 0)
+
+    call = sarvam_bridge.plivo_stream.PlivoCall(
+        _FakePlivoWS(), lead_id="l", one_way=False, protect_opening=False)
+    turns = []
+    convo = sarvam_bridge._Conversation(
+        call, lead_id="l", system_prompt="s", turns=turns)
+
+    calls: list[list[dict]] = []
+    first_call_started = asyncio.Event()
+    release_first_call = asyncio.Event()
+
+    async def controlled_turn(history):
+        calls.append([dict(m) for m in history])
+        if len(calls) == 1:
+            first_call_started.set()
+            await release_first_call.wait()
+        return sarvam_bridge.conversation_llm.LLMReply(
+            text=f"Answer {len(calls)}.", tool_calls=[])
+
+    monkeypatch.setattr(sarvam_bridge.conversation_llm, "turn", controlled_turn)
+
+    class _FakeTTS:
+        async def speak(self, text):
+            yield _FRAME, 500
+
+    tts = _FakeTTS()
+
+    await convo.on_lead_said(tts, "Course fee?")
+    await asyncio.wait_for(first_call_started.wait(), timeout=1)
+    assert len(calls) == 1
+
+    # A second fragment lands while the round above is still in flight.
+    await convo.on_lead_said(tts, "and the duration?")
+
+    assert len(calls) == 1, (
+        "a fragment that arrived mid-call cancelled the committed round — "
+        "this is the live 'agent never answered' bug"
+    )
+
+    release_first_call.set()
+    for _ in range(50):
+        if any(t.role == "agent" for t in turns):
+            break
+        await asyncio.sleep(0)
+
+    spoken = [t.text for t in turns if t.role == "agent"]
+    assert spoken, "the committed round must still be spoken, not dropped"
+    assert "Answer 1." in spoken[0]
+
+
+async def test_a_fragment_missed_mid_call_still_gets_its_own_answer(monkeypatch):
+    """The fragment that could not cancel the in-flight round (previous test)
+    must not be silently dropped either — it gets answered in a follow-up
+    pass once that round is done, via _missed_while_committed."""
+    monkeypatch.setattr(sarvam_bridge, "SARVAM_REPLY_SETTLE_S", 0)
+    monkeypatch.setattr(sarvam_bridge, "SARVAM_REPLY_MAX_WAIT_S", 0)
+
+    call = sarvam_bridge.plivo_stream.PlivoCall(
+        _FakePlivoWS(), lead_id="l", one_way=False, protect_opening=False)
+    turns = []
+    convo = sarvam_bridge._Conversation(
+        call, lead_id="l", system_prompt="s", turns=turns)
+
+    calls: list[list[dict]] = []
+    first_call_started = asyncio.Event()
+    release_first_call = asyncio.Event()
+
+    async def controlled_turn(history):
+        calls.append([dict(m) for m in history])
+        if len(calls) == 1:
+            first_call_started.set()
+            await release_first_call.wait()
+        return sarvam_bridge.conversation_llm.LLMReply(
+            text=f"Answer {len(calls)}.", tool_calls=[])
+
+    monkeypatch.setattr(sarvam_bridge.conversation_llm, "turn", controlled_turn)
+
+    class _FakeTTS:
+        async def speak(self, text):
+            yield _FRAME, 500
+
+    tts = _FakeTTS()
+
+    await convo.on_lead_said(tts, "Course fee?")
+    await asyncio.wait_for(first_call_started.wait(), timeout=1)
+    await convo.on_lead_said(tts, "and the duration?")
+    release_first_call.set()
+
+    for _ in range(200):
+        if len(calls) >= 2 and len([t for t in turns if t.role == "agent"]) >= 2:
+            break
+        await asyncio.sleep(0)
+
+    spoken = [t.text for t in turns if t.role == "agent"]
+    assert len(spoken) >= 2, (
+        f"the fragment that arrived mid-call was never answered: {spoken}"
+    )
+    assert "Answer 2." in spoken[-1]
+
+
+# ── the reply gate is driven by Sarvam's END_SPEECH, not a blind timer ───────
+#
+# sarvam_stt.py always decoded Sarvam's END_SPEECH VAD signal into a
+# 'speech_ended' event; converse() had no branch for it and it fell through
+# doing nothing, so the agent blind-waited SARVAM_REPLY_MAX_WAIT_S on every
+# single turn even when the vendor had already said the line was quiet.
+# Sarvam does not guarantee whether END_SPEECH arrives before or after the
+# final transcript for the same utterance, so none of this may assume an
+# order.
+
+async def test_end_speech_before_the_transcript_answers_without_the_full_ceiling(
+    two_way, monkeypatch,
+):
+    """END_SPEECH landing before the transcript must not still pay the old
+    fixed wait — the ceiling is a fallback, not a floor.
+
+    Proven by squeezing CALL_MAX_DURATION_S between the settle time and the
+    ceiling: if the reply is still blind-waiting the 5s ceiling, the call ends
+    before it ever gets spoken and the assertion below fails. A tight outer
+    asyncio.wait_for can't prove this on its own — plivo_stream.PlivoCall.run
+    always blocks for the full CALL_MAX_DURATION_S regardless of how fast the
+    reply was, since nothing else ends a two-way call early.
+    """
+    monkeypatch.setattr(sarvam_bridge, "SARVAM_REPLY_SETTLE_S", 0.02)
+    monkeypatch.setattr(sarvam_bridge, "SARVAM_REPLY_MAX_WAIT_S", 5.0)
+    monkeypatch.setattr(sarvam_bridge.plivo_stream, "CALL_MAX_DURATION_S", 0.3)
+    two_way(
+        [_barge_in(), _speech_ended(), _said("Fee enta?")],
+        replies=[_reply(text="Iravai vela.")],
+    )
+
+    outcome = await _run(_FakePlivoWS(), one_way=False)
+
+    assert any(t.role == "agent" and "Iravai vela." in t.text
+               for t in outcome["transcript"]), (
+        "the reply did not land inside the 0.3s call — it is still "
+        "blind-waiting the 5s ceiling regardless of END_SPEECH"
+    )
+
+
+async def test_end_speech_after_the_transcript_also_answers_promptly(
+    two_way, monkeypatch,
+):
+    """The opposite order must also not block for the full ceiling — the poll
+    loop has to pick up END_SPEECH once it lands. Same proof technique as
+    above: a short CALL_MAX_DURATION_S that only a prompt reply can beat."""
+    monkeypatch.setattr(sarvam_bridge, "SARVAM_REPLY_SETTLE_S", 0.02)
+    monkeypatch.setattr(sarvam_bridge, "SARVAM_REPLY_MAX_WAIT_S", 5.0)
+    monkeypatch.setattr(sarvam_bridge, "_SILENCE_POLL_S", 0.02)
+    monkeypatch.setattr(sarvam_bridge.plivo_stream, "CALL_MAX_DURATION_S", 0.3)
+    two_way(
+        [_barge_in(), _said("Fee enta?"), _speech_ended()],
+        replies=[_reply(text="Iravai vela.")],
+    )
+
+    outcome = await _run(_FakePlivoWS(), one_way=False)
+
+    assert any(t.role == "agent" and "Iravai vela." in t.text
+               for t in outcome["transcript"])
+
+
+async def test_missing_end_speech_still_answers_on_the_ceiling(two_way, monkeypatch):
+    """If END_SPEECH never arrives for an utterance — a vendor hiccup, a VAD
+    that doesn't fire — the reply must still happen, bounded by
+    SARVAM_REPLY_MAX_WAIT_S rather than stuck forever. CALL_MAX_DURATION_S is
+    set comfortably above the ceiling here, the opposite of the two tests
+    above, so the reply has time to land."""
+    monkeypatch.setattr(sarvam_bridge, "SARVAM_REPLY_SETTLE_S", 0.02)
+    monkeypatch.setattr(sarvam_bridge, "SARVAM_REPLY_MAX_WAIT_S", 0.1)
+    monkeypatch.setattr(sarvam_bridge, "_SILENCE_POLL_S", 0.02)
+    monkeypatch.setattr(sarvam_bridge.plivo_stream, "CALL_MAX_DURATION_S", 0.5)
+    two_way(
+        [_barge_in(), _said("Fee enta?")],
+        replies=[_reply(text="Iravai vela.")],
+    )
+
+    outcome = await _run(_FakePlivoWS(), one_way=False)
+
+    assert any(t.role == "agent" and "Iravai vela." in t.text
+               for t in outcome["transcript"])
+
+
+async def test_a_burst_still_costs_one_completion_with_vad_signals_interleaved(
+    two_way, monkeypatch,
+):
+    """The regression the old debounce fixed, replayed with the VAD events a
+    real call actually produces around each utterance — not just bare
+    transcripts. Must still collapse to one answer, one completion."""
+    monkeypatch.setattr(sarvam_bridge, "SARVAM_REPLY_SETTLE_S", 0.02)
+    monkeypatch.setattr(sarvam_bridge, "SARVAM_REPLY_MAX_WAIT_S", 0.3)
+    monkeypatch.setattr(sarvam_bridge, "_SILENCE_POLL_S", 0.02)
+    seen, _tts, _stt = two_way(
+        [_barge_in(), _said("హలో."), _speech_ended(),
+         _barge_in(), _said("ఓకే ఓకే."), _speech_ended(),
+         _barge_in(), _said("హలో."), _speech_ended(),
+         _barge_in(), _said("ఓకే."), _speech_ended()],
+        replies=[_reply(text="Cheppandi.")],
+    )
+
+    await _run(_FakePlivoWS(), one_way=False)
+
+    assert len(seen["histories"]) <= 2, (
+        f"a burst of 4 utterances triggered {len(seen['histories'])} model "
+        "calls with VAD signals in play; they should still collapse into one"
+    )
+
+
+def test_the_bridge_knows_about_every_kind_of_thing_the_lead_can_do():
+    """REGRESSION GUARD. speech_ended was decoded by sarvam_stt and thrown
+    away by converse() for the whole of two-way's first life: it branched on
+    speech_started and transcript and let END_SPEECH fall through to nothing,
+    so the agent blind-waited a timer while the vendor was telling it the
+    answer. If a fourth EventKind is ever added, this fails until someone
+    decides what converse() does with it."""
+    from typing import get_args
+
+    assert set(get_args(sarvam_bridge.sarvam_stt.EventKind)) == {
+        "transcript", "speech_started", "speech_ended",
+    }
+
+
+# ── one measured line per turn ───────────────────────────────────────────────
+#
+# "The agent replies late" was unattributable for the whole of two-way's first
+# life: the only per-call logging was call start and call end, so the gate, the
+# model, the course lookup and the synthesiser — four completely different
+# fixes — could not be told apart from the logs of a real call.
+
+async def test_a_turn_logs_where_the_lead_s_wait_actually_went(two_way, caplog):
+    caplog.set_level("INFO")
+    two_way([_said("Fee enta?")], replies=[_reply(text="Iravai vela.")])
+
+    await _run(_FakePlivoWS(), one_way=False)
+
+    lines = [r.message for r in caplog.records if "turn latency" in r.message]
+    assert lines, "a turn that answered the lead logged no latency line"
+    assert "gate=" in lines[0] and "llm=" in lines[0] and "total=" in lines[0]
+
+
+async def test_the_latency_line_is_measured_from_the_first_unanswered_word(
+    two_way, caplog, monkeypatch,
+):
+    """A burst is ONE turn. Measuring from the LAST fragment would report a
+    fast reply to a lead who had been waiting since the first one."""
+    caplog.set_level("INFO")
+    monkeypatch.setattr(sarvam_bridge, "SARVAM_REPLY_SETTLE_S", 0.02)
+    monkeypatch.setattr(sarvam_bridge, "SARVAM_REPLY_MAX_WAIT_S", 0.3)
+    two_way([_said("ఫీజు ఎంత?"), _said("మరియు ఎన్ని నెలలు?")],
+            replies=[_reply(text="సరే.")])
+
+    await _run(_FakePlivoWS(), one_way=False)
+
+    lines = [r.message for r in caplog.records if "turn latency" in r.message]
+    assert len(lines) == 1, (
+        f"a burst of 2 utterances logged {len(lines)} turns; it is one turn "
+        "from the lead's point of view"
+    )
+
+
+async def test_a_turn_that_says_nothing_is_still_logged(two_way, caplog, monkeypatch):
+    """The 'agent never answered me' symptom. A turn swallowed by _reply's
+    catch-all used to leave no trace of how long the lead waited for it."""
+    caplog.set_level("INFO")
+
+    async def failing_turn(history):
+        raise sarvam_bridge.conversation_llm.TurnFailed("boom")
+
+    two_way([_said("Fee enta?")])
+    monkeypatch.setattr(sarvam_bridge.conversation_llm, "turn", failing_turn)
+
+    await _run(_FakePlivoWS(), one_way=False)
+
+    lines = [r.message for r in caplog.records if "turn latency" in r.message]
+    assert lines and "NOTHING SPOKEN" in lines[0], (
+        "a turn that left the lead in silence must say so in the log"
+    )
+
+
+async def test_the_opening_is_not_counted_as_a_turn(two_way, caplog):
+    """Nobody is waiting on an answer during the disclosure — counting it
+    would report a huge false 'latency' on every single call."""
+    caplog.set_level("INFO")
+    two_way([])
+
+    await _run(_FakePlivoWS(), one_way=False)
+
+    assert not [r.message for r in caplog.records if "turn latency" in r.message]
+
+
+# ── a sound with no words must not orphan the question before it ────────────
+#
+# REGRESSION. Sarvam drops empty transcripts (sarvam_stt.py) — a cough, a line
+# pop, a syllable under the transcription threshold — so START_SPEECH can fire
+# with no transcript ever following it. on_barge_in() unconditionally cancels
+# whatever reply was in flight. Before on_lead_stopped repaired this, nothing
+# then re-armed the answer to the question the lead asked BEFORE that sound:
+# they would sit in silence until the watchdog hung up on them 20s later,
+# which is indistinguishable from "the agent never replied".
+
+class _SilentTTS:
+    async def speak(self, text):
+        return
+        yield  # pragma: no cover - makes this an async generator
+
+    async def reset_after_cancel(self):
+        return None
+
+
+async def test_a_sound_with_no_words_does_not_orphan_the_question(monkeypatch):
+    monkeypatch.setattr(sarvam_bridge, "SARVAM_REPLY_SETTLE_S", 0.01)
+    monkeypatch.setattr(sarvam_bridge, "SARVAM_REPLY_MAX_WAIT_S", 0.05)
+
+    called = asyncio.Event()
+
+    async def fake_turn(history):
+        called.set()
+        return sarvam_bridge.conversation_llm.LLMReply(text="Sare.", tool_calls=[])
+
+    monkeypatch.setattr(sarvam_bridge.conversation_llm, "turn", fake_turn)
+
+    call = sarvam_bridge.plivo_stream.PlivoCall(
+        _FakePlivoWS(), lead_id="l", one_way=False, protect_opening=False)
+    convo = sarvam_bridge._Conversation(
+        call, lead_id="l", system_prompt="s", turns=[])
+    tts = _SilentTTS()
+
+    await convo.on_lead_said(tts, "Fee enta?")
+    # A sound with no words behind it: Sarvam still fires START_SPEECH, which
+    # cancels the reply just queued for the question above.
+    await convo.on_barge_in()
+    assert convo.reply_task is None, "the barge-in should have cancelled it"
+
+    # The sound ends. Nothing else will ever re-ask this question.
+    convo.on_lead_stopped(tts)
+
+    assert convo.reply_task is not None, (
+        "END_SPEECH must re-arm a reply when a question is still unanswered"
+    )
+    await asyncio.wait_for(called.wait(), timeout=1.0)
+
+
+async def test_cancelled_tool_lookup_does_not_leave_invalid_history(monkeypatch):
+    call = sarvam_bridge.plivo_stream.PlivoCall(
+        _FakePlivoWS(), lead_id="l", one_way=False, protect_opening=False)
+    convo = sarvam_bridge._Conversation(
+        call, lead_id="l", system_prompt="s", turns=[])
+
+    convo.history.extend([
+        {"role": "user", "content": "What is the fee?"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "call_1", "type": "function",
+             "function": {"name": "search_course_material",
+                           "arguments": '{"query":"fees"}'}},
+        ]},
+    ])
+    task = asyncio.create_task(asyncio.sleep(10))
+    convo.reply_task = task
+    await convo._cancel_reply()
+
+    assert convo.history == [{"role": "system", "content": "s"},
+                             {"role": "user", "content": "What is the fee?"}]
+
+
+async def test_end_speech_does_not_re_arm_a_question_already_answered(monkeypatch):
+    """The other side of the same guard: END_SPEECH must not conjure up a
+    duplicate answer once the agent has actually replied."""
+    called = asyncio.Event()
+
+    async def fake_turn(history):
+        called.set()
+        return sarvam_bridge.conversation_llm.LLMReply(text="x", tool_calls=[])
+
+    monkeypatch.setattr(sarvam_bridge.conversation_llm, "turn", fake_turn)
+
+    call = sarvam_bridge.plivo_stream.PlivoCall(
+        _FakePlivoWS(), lead_id="l", one_way=False, protect_opening=False)
+    convo = sarvam_bridge._Conversation(
+        call, lead_id="l", system_prompt="s", turns=[])
+    convo.history.append({"role": "user", "content": "Fee enta?"})
+    convo.history.append({"role": "assistant", "content": "Iravai vela."})
+
+    convo.on_lead_stopped(_SilentTTS())
+
+    assert convo.reply_task is None
+    await asyncio.sleep(0.05)
+    assert not called.is_set()
+
+
+async def test_awaiting_answer_survives_a_cancelled_lookup():
+    """A tool lookup cancelled mid-flight leaves an assistant message with
+    tool_calls and no content, plus a tool result, sitting on top of a
+    question that is still unanswered — neither counts as an answer."""
+    call = sarvam_bridge.plivo_stream.PlivoCall(
+        _FakePlivoWS(), lead_id="l", one_way=False, protect_opening=False)
+    convo = sarvam_bridge._Conversation(
+        call, lead_id="l", system_prompt="s", turns=[])
+    convo.history.extend([
+        {"role": "user", "content": "Fee enta?"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": "search_course_material",
+                          "arguments": "{}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "c1", "content": "..."},
+    ])
+
+    assert convo._awaiting_answer() is True
+
+
+async def test_awaiting_answer_is_false_once_the_agent_has_spoken():
+    call = sarvam_bridge.plivo_stream.PlivoCall(
+        _FakePlivoWS(), lead_id="l", one_way=False, protect_opening=False)
+    convo = sarvam_bridge._Conversation(
+        call, lead_id="l", system_prompt="s", turns=[])
+    convo.history.append({"role": "user", "content": "Fee enta?"})
+    convo.history.append({"role": "assistant", "content": "Iravai vela."})
+
+    assert convo._awaiting_answer() is False
+
+
+async def test_awaiting_answer_is_false_with_nothing_said_yet():
+    call = sarvam_bridge.plivo_stream.PlivoCall(
+        _FakePlivoWS(), lead_id="l", one_way=False, protect_opening=False)
+    convo = sarvam_bridge._Conversation(
+        call, lead_id="l", system_prompt="s", turns=[])
+
+    assert convo._awaiting_answer() is False
 
 
 # ── the disclosure must be HEARD before the shield comes down ────────────────

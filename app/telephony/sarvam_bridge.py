@@ -41,9 +41,16 @@ import re
 
 from fastapi import WebSocket
 
-from app.config import SARVAM_API_KEY, SARVAM_STT_LANGUAGE, SARVAM_TWOWAY_ENABLED
+from app.config import (
+    RAG_VOICE_DEADLINE_S,
+    SARVAM_API_KEY,
+    SARVAM_REPLY_MAX_WAIT_S,
+    SARVAM_REPLY_SETTLE_S,
+    SARVAM_STT_LANGUAGE,
+    SARVAM_TWOWAY_ENABLED,
+)
 from app.db.models import TranscriptTurn
-from app.rag.search import search_relevant
+from app.rag.search import NO_MATERIAL_NOTE, search_relevant
 from app.telephony import (
     conversation_llm,
     plivo_stream,
@@ -83,6 +90,45 @@ _SENTENCE_END = re.compile(r"(?<=[.!?।])\s+")
 # hang up on someone.
 TWOWAY_MAX_SILENT_S = 20.0
 
+# The lead's goodbye is a call-control signal, not a question for the model.
+# Relying on the end_call tool alone leaves the line open when the model says a
+# polite farewell but omits the tool (observed with the live Sarvam model).
+_GOODBYE_RE = re.compile(
+    r"(?:^|\s)(?:bye|goodbye|good\s+bye|bye\s+bye|alvida)(?:[.!?,\s]|$)",
+    re.IGNORECASE,
+)
+_GOODBYE_PHRASES = (
+    "that's all",
+    "thats all",
+    "no more questions",
+    "i have no questions",
+    "ఇక అంతే",
+    "బై",
+)
+
+# Spoken when the model calls end_call with no farewell text at all — not
+# suppressed (see _reply's ends_call handling), just never generated. Per
+# CLAUDE.md, measured against the live API: told to say goodbye AND call
+# end_call in the same turn, the model sometimes does the tool with no words
+# attached (0/3 in one measurement). Ending in total silence either way is
+# what CONFIRMED as the "the agent stopped answering" symptom on 2026-08-07 —
+# a plain canned farewell is strictly better than nothing.
+_FALLBACK_FAREWELL = "ధన్యవాదాలు, శుభదినం."
+
+
+def _is_lead_goodbye(text: str) -> bool:
+    """Whether a transcript is an explicit request to finish the call.
+
+    Keep this deliberately narrow: thanks, okay, and other ordinary turn
+    closers must still receive an answer. The LLM remains responsible for
+    nuanced decisions; this is the reliable fast path for an unambiguous
+    goodbye.
+    """
+    normalized = " ".join(text.strip().split()).casefold()
+    return bool(_GOODBYE_RE.search(normalized)) or any(
+        phrase in normalized for phrase in _GOODBYE_PHRASES
+    )
+
 # How long to wait for the lead to finish before answering.
 #
 # Not politeness — this is what stops a burst of utterances starving the agent
@@ -96,7 +142,17 @@ TWOWAY_MAX_SILENT_S = 20.0
 # Sarvam's STT emits an utterance per pause, so this is the normal shape of
 # speech, not an edge case. Waiting briefly collapses a burst into one answer
 # that has heard all of it — and costs one completion instead of six.
-_REPLY_DEBOUNCE_S = 0.7
+#
+# Originally a single fixed sleep (SARVAM_REPLY_MAX_WAIT_S, née
+# _REPLY_DEBOUNCE_S) paid on EVERY turn regardless of whether Sarvam had
+# already told us the lead stopped. sarvam_stt.py decodes Sarvam's own
+# END_SPEECH signal — see _Conversation.on_lead_stopped below — so
+# _reply_when_they_stop now waits only SARVAM_REPLY_SETTLE_S (to absorb
+# END_SPEECH/transcript arriving in either order for the same utterance) and
+# then answers immediately once END_SPEECH has actually landed.
+# SARVAM_REPLY_MAX_WAIT_S survives as a CEILING, not a floor: if END_SPEECH
+# never arrives for some reason, this is the fallback wait, unchanged from
+# before — a turn can never be slower than it used to be.
 _SILENCE_POLL_S = 0.25
 
 
@@ -183,6 +239,25 @@ class _Conversation:
         # more sentences at the lead after they interrupted.
         self.generation = 0
         self.reply_task: asyncio.Task | None = None
+        # True only while a conversation_llm.turn() HTTP call is actually in
+        # flight for the current reply. Read by _cancel_reply(): a fragment
+        # arriving mid-call used to cancel-and-restart unconditionally, and on
+        # a lead who speaks in several quick bursts that restart kept winning
+        # the race against the model ever finishing a single round — CONFIRMED
+        # live on 2026-08-07 (two consecutive turns logged 0 rounds, nothing
+        # spoken, on an ordinary mid-conversation question, not an ending).
+        # Scoped to just the LLM call, not the whole reply, so cancellation
+        # during a tool lookup keeps working exactly as before (see
+        # _discard_incomplete_tool_turn) — that path is already tested and
+        # intentional.
+        self._reply_committed = False
+        # Set when a fragment arrives while _reply_committed is True, so the
+        # cancel that would normally have restarted the reply is skipped and
+        # the fragment's text lands in history too late for the in-flight
+        # round to see it. Checked once that round finishes so the fragment
+        # still gets its own follow-up reply, rather than silently reading as
+        # "already answered" once it is sitting behind the assistant's turn.
+        self._missed_while_committed = False
         # Wall-clock of the last thing either side did. The silence watchdog
         # measures against this rather than against call start, so a lead who
         # is mid-question is never hung up on.
@@ -191,6 +266,65 @@ class _Conversation:
         # Index into self.turns / self.history of the agent turn currently
         # being spoken, so a barge-in can rewrite exactly that one.
         self._agent_turn_index: int | None = None
+        # Sarvam's own view of whether the lead is mid-utterance, from its
+        # START_SPEECH / END_SPEECH VAD signals. Read by _reply_when_they_stop
+        # so a reply need not blind-wait the full ceiling once Sarvam has
+        # already said the lead stopped.
+        self._lead_speaking = False
+        # Per-turn latency accounting — see _log_turn_latency. Measured from
+        # the first thing the lead said that nobody had answered yet (a burst
+        # is ONE turn, so later fragments deliberately do not reset it) to the
+        # first audio frame they hear back. Without this, "the agent replies
+        # late" is unattributable: the gate, the model, the course lookup and
+        # the synthesiser are four very different fixes and the logs could not
+        # tell them apart.
+        self._turn_opened_at: float | None = None
+        self._turn_gate_done: float | None = None
+        self._turn_say_started: float | None = None
+        self._turn_llm_s = 0.0
+        self._turn_tool_s = 0.0
+        self._turn_llm_rounds = 0
+
+    # ── measuring ────────────────────────────────────────────────────────────
+
+    def _log_turn_latency(self, *, spoke: bool) -> None:
+        """One INFO line per turn: where the lead's wait actually went.
+
+        Emitted when the first audio frame of the answer reaches Plivo, which
+        is the moment the lead stops waiting — not when the model returned, and
+        not when the whole answer finished sending.
+
+        Also emitted with spoke=False when a turn ends without saying anything
+        (a cancelled reply, an end_call, or a turn that failed and was
+        swallowed). That case is the "the agent never answered me" symptom, and
+        it is worth exactly as much in the log as a slow one.
+        """
+        opened = self._turn_opened_at
+        if opened is None:
+            # The opening disclosure, or a turn already accounted for. Nobody
+            # was waiting on an answer, so there is no latency to attribute.
+            return
+        now = self._loop.time()
+        gate = (self._turn_gate_done - opened) if self._turn_gate_done else 0.0
+        speak = (now - self._turn_say_started) if self._turn_say_started else 0.0
+        logger.info(
+            f"[sarvam] lead={self.lead_id} turn latency: "
+            f"gate={gate:.2f}s llm={self._turn_llm_s:.2f}s"
+            f"({self._turn_llm_rounds} round"
+            f"{'' if self._turn_llm_rounds == 1 else 's'}) "
+            f"tools={self._turn_tool_s:.2f}s tts={speak:.2f}s "
+            f"total={now - opened:.2f}s"
+            f"{'' if spoke else ' NOTHING SPOKEN'}"
+        )
+        self._reset_turn_metrics()
+
+    def _reset_turn_metrics(self) -> None:
+        self._turn_opened_at = None
+        self._turn_gate_done = None
+        self._turn_say_started = None
+        self._turn_llm_s = 0.0
+        self._turn_tool_s = 0.0
+        self._turn_llm_rounds = 0
 
     # ── speaking ─────────────────────────────────────────────────────────────
 
@@ -215,17 +349,42 @@ class _Conversation:
         self.turns.append(TranscriptTurn(role="agent", text=text))
         self.history.append({"role": "assistant", "content": text})
 
-        for sentence in sentences:
-            if self.generation != generation or self.call.stop.is_set():
-                return
-            spoken_ms = 0
-            async for payload, duration_ms in tts.speak(sentence):
+        self._turn_say_started = self._loop.time()
+        spoke_a_frame = False
+
+        async def reset_tts_after_cancel() -> None:
+            # The production SarvamTTS exposes this hook. Keep the bridge
+            # tolerant of the tiny test/tool TTS adapters that only implement
+            # speak().
+            reset = getattr(tts, "reset_after_cancel", None)
+            if reset is not None:
+                await reset()
+
+        try:
+            for sentence in sentences:
                 if self.generation != generation or self.call.stop.is_set():
+                    await reset_tts_after_cancel()
                     return
-                await self.call.play(payload)
-                spoken_ms += duration_ms
-            self.ledger.add(sentence, spoken_ms)
-            self.note_activity()
+                spoken_ms = 0
+                async for payload, duration_ms in tts.speak(sentence):
+                    if self.generation != generation or self.call.stop.is_set():
+                        await reset_tts_after_cancel()
+                        return
+                    await self.call.play(payload)
+                    if not spoke_a_frame:
+                        # The lead's wait ends HERE, at the first frame — not
+                        # when the whole answer has been sent.
+                        spoke_a_frame = True
+                        self._log_turn_latency(spoke=True)
+                    spoken_ms += duration_ms
+                self.ledger.add(sentence, spoken_ms)
+                self.note_activity()
+        except asyncio.CancelledError:
+            # The cancellation can land while call.play() is awaiting Plivo,
+            # after speak() already yielded a frame. Reset explicitly because
+            # the async generator may not receive that cancellation itself.
+            await reset_tts_after_cancel()
+            raise
 
     async def deliver_opening(self, tts: sarvam_tts.SarvamTTS,
                               opening: str) -> None:
@@ -322,7 +481,12 @@ class _Conversation:
     # ── listening ────────────────────────────────────────────────────────────
 
     async def on_barge_in(self) -> None:
-        """The lead started talking over the agent."""
+        """The lead started talking — over the agent, or into a silence."""
+        # Set before the interrupt check below: the lead IS speaking either
+        # way, whether or not there was anything to interrupt. This is what
+        # _reply_when_they_stop polls, so a reply gated on it must not depend
+        # on whether the agent happened to be talking at the same moment.
+        self._lead_speaking = True
         if not await self.call.interrupt():
             # Inside the opening-disclosure guard or the greeting grace window.
             # PlivoCall said no, and it owns that decision.
@@ -331,54 +495,220 @@ class _Conversation:
         await self._cancel_reply()
         self.truncate_to_what_was_heard()
 
-    async def _cancel_reply(self) -> None:
-        task, self.reply_task = self.reply_task, None
-        if task is not None and not task.done():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
+    def on_lead_stopped(self, tts: sarvam_tts.SarvamTTS) -> None:
+        """Sarvam's END_SPEECH signal: the lead's current utterance ended.
+
+        Two jobs.
+
+        RELEASE: lets a reply already waiting in _reply_when_they_stop skip the
+        rest of its ceiling instead of always paying SARVAM_REPLY_MAX_WAIT_S in
+        full.
+
+        REPAIR: on_barge_in() cancels the in-flight reply the instant the lead
+        makes ANY sound — right when that sound turns into words, wrong when it
+        doesn't. Sarvam drops empty transcripts (a cough, a line pop, a
+        syllable under the transcription threshold), so START_SPEECH can fire
+        with no transcript ever following it. Without this, the question the
+        lead asked BEFORE that sound stays cancelled and nothing re-asks it —
+        the lead sits in silence until the watchdog hangs up on them 20s later,
+        which looks identical to "the agent never replied". END_SPEECH is the
+        right place to notice something is still unanswered, because it means
+        the interrupting sound is over and the line is genuinely quiet again.
+        """
+        self._lead_speaking = False
+        if self.reply_task is not None and not self.reply_task.done():
+            return  # already armed — the wait it's polling will now unblock
+        if self._awaiting_answer():
+            self.reply_task = asyncio.create_task(self._reply_when_they_stop(tts))
+
+    def _awaiting_answer(self) -> bool:
+        """Whether the lead has said something the agent has not yet answered.
+
+        Walks history backward to the first thing that settles it: a user
+        message means yes; an assistant message WITH WORDS means no. Tool
+        bookkeeping — an assistant message carrying tool_calls with no content,
+        or a tool result — is skipped on purpose: a lookup cancelled mid-flight
+        leaves exactly that sitting on top of a question that is still
+        unanswered.
+        """
+        for message in reversed(self.history):
+            role = message.get("role")
+            if role == "user":
+                return True
+            if role == "assistant" and message.get("content"):
+                return False
+        return False
+
+    async def _cancel_reply(self, *, force: bool = False) -> None:
+        """Cancel the in-flight reply, unless its model call cannot be undone.
+
+        *force* skips that protection — used only where the call itself is
+        ending (an explicit goodbye, or teardown), so there is no reason to
+        let a stale model call keep running in the background.
+        """
+        task = self.reply_task
+        if task is None or task.done():
+            self.reply_task = None
+            return
+        if self._reply_committed and not force:
+            # The model's HTTP round-trip is already in flight; see
+            # _reply_committed's docstring. Let this round finish and speak —
+            # a later fragment still gets answered via _missed_while_committed
+            # rather than being lost to a restart that never lands.
+            return
+        self.reply_task = None
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+        self._discard_incomplete_tool_turn()
+
+    def _discard_incomplete_tool_turn(self) -> None:
+        """Remove a tool-call turn interrupted by barge-in/cancellation.
+
+        OpenAI requires every assistant ``tool_calls`` message to be followed
+        by a tool result for each call ID. If a lead interrupts while RAG is in
+        flight, cancellation used to leave that assistant message in history
+        without its result; the next completion then returned HTTP 400 and the
+        lead heard silence on every subsequent question.
+        """
+        for index in range(len(self.history) - 1, -1, -1):
+            message = self.history[index]
+            if message.get("role") != "assistant" or not message.get("tool_calls"):
+                continue
+            expected = {
+                str(call.get("id") or "")
+                for call in message["tool_calls"]
+            }
+            result_ids: set[str] = set()
+            end = index + 1
+            while end < len(self.history) and self.history[end].get("role") == "tool":
+                result_ids.add(str(self.history[end].get("tool_call_id") or ""))
+                end += 1
+            if result_ids != expected:
+                del self.history[index:end]
+            return
 
     async def on_lead_said(self, tts: sarvam_tts.SarvamTTS, text: str) -> None:
         """A completed lead utterance: record it and answer it."""
         self.turns.append(TranscriptTurn(role="lead", text=text))
         self.history.append({"role": "user", "content": text})
+        if _is_lead_goodbye(text):
+            # Do not ask the model to decide whether an explicit goodbye ends
+            # the call. Cancelling first prevents a reply already waiting on
+            # the speech-settle gate from speaking after the lead said bye.
+            # force=True: the call is ending regardless, so there is nothing
+            # to protect an in-flight model call for.
+            await self._cancel_reply(force=True)
+            self.call.note_exit("sarvam_lead_goodbye")
+            self.call.stop.set()
+            return
+        if self._turn_opened_at is None:
+            # First unanswered thing the lead has said. A burst is ONE turn
+            # from their point of view — they have been waiting since this
+            # fragment, not since the last one — so later fragments must not
+            # restart the clock.
+            self._reset_turn_metrics()
+            self._turn_opened_at = self._loop.time()
         # One reply at a time, and not until the lead has actually stopped.
         # Cancelling here is what starved the agent on a live call (see
-        # _REPLY_DEBOUNCE_S): the cancel is cheap only because the replacement
-        # waits before calling the model, so a burst collapses into one answer
-        # rather than N answers of which N-1 are discarded.
+        # SARVAM_REPLY_MAX_WAIT_S's comment above): the cancel is cheap only
+        # because the replacement waits before calling the model, so a burst
+        # collapses into one answer rather than N answers of which N-1 are
+        # discarded.
         await self._cancel_reply()
+        if self.reply_task is not None and not self.reply_task.done():
+            # _cancel_reply() left it running — its model call is already
+            # committed. This fragment's text is already in history (above)
+            # but arrived too late for that round to see it; flag it so
+            # _reply_when_they_stop answers it in a follow-up pass instead of
+            # a second task racing the first.
+            self._missed_while_committed = True
+            return
         self.reply_task = asyncio.create_task(self._reply_when_they_stop(tts))
 
     # ── answering ────────────────────────────────────────────────────────────
 
     async def _reply_when_they_stop(self, tts: sarvam_tts.SarvamTTS) -> None:
-        """Wait out _REPLY_DEBOUNCE_S, then answer everything said so far.
+        """Wait for the lead to actually be done, then answer everything said
+        so far.
 
-        Cancelled by the next transcript if one arrives inside the window, and
-        cancelled here is free: no completion has been requested yet. That is
-        the whole point — the model is called once, after the lead has
-        finished, instead of once per fragment with every answer but the last
-        thrown away.
+        Signal-driven, not a blind sleep: Sarvam's END_SPEECH tells us when
+        the lead stopped (on_lead_stopped sets self._lead_speaking = False),
+        but the transcript that triggered this coroutine and that signal can
+        arrive in EITHER order for the same utterance, so this cannot simply
+        check the flag once. SARVAM_REPLY_SETTLE_S is a short, always-paid
+        pause that absorbs an END_SPEECH arriving just after the transcript;
+        if it arrived first, self._lead_speaking is already False and the
+        loop below never executes. SARVAM_REPLY_MAX_WAIT_S is a ceiling for
+        the case END_SPEECH never arrives at all — the previous fixed wait,
+        kept as a fallback rather than a floor, so a turn is never slower
+        than it was before this became signal-driven.
+
+        Cancelled by the next transcript or barge-in if one arrives inside the
+        window, and cancelled here is free: no completion has been requested
+        yet. That is the whole point — the model is called once, after the
+        lead has finished, instead of once per fragment with every answer but
+        the last thrown away.
         """
-        await asyncio.sleep(_REPLY_DEBOUNCE_S)
+        deadline = self._loop.time() + SARVAM_REPLY_MAX_WAIT_S
+        await asyncio.sleep(SARVAM_REPLY_SETTLE_S)
+        while (self._lead_speaking and self._loop.time() < deadline
+               and not self.call.stop.is_set()):
+            await asyncio.sleep(_SILENCE_POLL_S)
+        self._turn_gate_done = self._loop.time()
         await self._reply(tts)
+        if self._missed_while_committed and not self.call.stop.is_set():
+            # A fragment arrived while the round above was already committed
+            # to the model (see _reply_committed) and could not be folded in.
+            # It is in history now that the round is done, so answer it —
+            # this is what keeps a multi-part question from losing its last
+            # part to "already answered" once it lands behind an assistant
+            # turn that never actually saw it.
+            self._missed_while_committed = False
+            if self._turn_opened_at is None:
+                self._turn_opened_at = self._loop.time()
+            self.reply_task = asyncio.create_task(self._reply_when_they_stop(tts))
 
     async def _reply(self, tts: sarvam_tts.SarvamTTS) -> None:
         try:
             for _round in range(_MAX_TOOL_ROUNDS):
-                reply = await conversation_llm.turn(self.history)
+                _llm_started = self._loop.time()
+                self._reply_committed = True
+                try:
+                    reply = await conversation_llm.turn(self.history)
+                finally:
+                    self._reply_committed = False
+                self._turn_llm_s += self._loop.time() - _llm_started
+                self._turn_llm_rounds += 1
                 if not reply.tool_calls:
                     if reply.text:
                         await self.say(tts, reply.text)
                     return
-                # Text that arrives WITH a tool call is filler — "let me look
-                # that up for you". On a real call the agent announced its own
-                # lookup twice and then reported failure, which is three
-                # synthesised turns to deliver nothing. A search takes about a
-                # second; silence is shorter than saying so. The answer that
-                # follows is what the lead wants.
-                if reply.text:
+                # Text that arrives WITH a tool call is usually filler — "let
+                # me look that up for you". On a real call the agent
+                # announced its own lookup twice and then reported failure,
+                # which is three synthesised turns to deliver nothing. A
+                # search takes about a second; silence is shorter than saying
+                # so. The answer that follows is what the lead wants.
+                #
+                # end_call is the one exception: the tool's own description
+                # tells the model to send its farewell "together with"
+                # end_call, and there is no next round for that farewell to
+                # arrive in — this IS the only chance to say it. Treating it
+                # as filler was confirmed live on 2026-08-07: every Sarvam
+                # call ended by the model (as opposed to the silence
+                # watchdog) hung up in total silence, right after the lead's
+                # last word, which reads exactly like "the agent stopped
+                # answering."
+                ends_call = any(tc.name == conversation_llm.END_CALL_TOOL_NAME
+                                for tc in reply.tool_calls)
+                if ends_call:
+                    # No next round for this text to arrive in, so speak
+                    # whatever the model wrote — or, if it wrote nothing at
+                    # all, a canned farewell rather than hanging up in
+                    # silence. See _FALLBACK_FAREWELL.
+                    await self.say(tts, reply.text or _FALLBACK_FAREWELL)
+                elif reply.text:
                     logger.debug(f"[sarvam] lead={self.lead_id} not speaking "
                                  f"tool-call filler: {reply.text[:60]!r}")
                 if await self._run_tools(reply):
@@ -393,6 +723,12 @@ class _Conversation:
         except Exception as exc:  # noqa: BLE001 - one bad turn must not end the call
             logger.error(f"[sarvam] lead={self.lead_id} turn failed: "
                          f"{type(exc).__name__}: {exc}")
+        finally:
+            # Still set means say() never reached its first frame: the turn
+            # ended without the lead hearing anything. Log it rather than let
+            # it silently roll into the next turn's total — "the agent never
+            # answered me" is the symptom worth the loudest evidence.
+            self._log_turn_latency(spoke=False)
 
     async def _run_tools(self, reply: conversation_llm.LLMReply) -> bool:
         """Run the model's tool calls. Returns True if the call should end.
@@ -425,7 +761,46 @@ class _Conversation:
                 # rule. It applies the relevance floor and always returns
                 # something speakable, so the agent is never left with nothing
                 # to say to a lead who just asked a question.
-                answer = await search_relevant(str(tool_call.arguments.get("query") or ""))
+                #
+                # Bounded here, not inside search_relevant(): that function has
+                # no deadline of its own (an embed retry alone is ~16s), and it
+                # is also POST /rag/search, the ElevenLabs agent's live tool —
+                # a path already in production that must not change. The
+                # silence watchdog will not save the lead either; an in-flight
+                # reply counts as activity. On a timeout, the model gets the
+                # SAME note a genuine miss returns: the system prompt already
+                # knows how to say that in the lead's language without
+                # inventing a fact, whereas a bespoke "the search timed out"
+                # string would be read out to the lead verbatim.
+                query = str(tool_call.arguments.get("query") or "")
+                _tool_started = self._loop.time()
+                try:
+                    answer = await asyncio.wait_for(
+                        search_relevant(query), timeout=RAG_VOICE_DEADLINE_S)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"[sarvam] lead={self.lead_id} course lookup for "
+                        f"{query!r} did not finish inside "
+                        f"{RAG_VOICE_DEADLINE_S:.1f}s — telling the model "
+                        "there is no material rather than holding the lead "
+                        "on a silent line."
+                    )
+                    answer = NO_MATERIAL_NOTE
+                except Exception as exc:  # noqa: BLE001 - degrade one lookup
+                    # The live endpoint has the same contract, but this path
+                    # calls search_relevant() directly to avoid an HTTP hop.
+                    # Embedding, database, or translation failures must not
+                    # escape into _reply: that would cancel the entire turn
+                    # and leave the lead hearing silence after asking a
+                    # question. Give the model a normal no-material result so
+                    # its prompt can produce a short spoken fallback.
+                    logger.error(
+                        f"[sarvam] lead={self.lead_id} course lookup for "
+                        f"{query!r} failed: {type(exc).__name__}: {exc}"
+                    )
+                    answer = NO_MATERIAL_NOTE
+                finally:
+                    self._turn_tool_s += self._loop.time() - _tool_started
             else:
                 logger.warning(f"[sarvam] lead={self.lead_id} unknown tool "
                                f"{tool_call.name!r} — telling the model so.")
@@ -465,6 +840,8 @@ async def _run_two_way(call: plivo_stream.PlivoCall, *, lead_id: str,
                     conversation.note_activity()
                     if event.kind == "speech_started":
                         await conversation.on_barge_in()
+                    elif event.kind == "speech_ended":
+                        conversation.on_lead_stopped(tts)
                     elif event.kind == "transcript":
                         await conversation.on_lead_said(tts, event.text)
             except Exception as exc:  # noqa: BLE001 - the call must still be graded
@@ -472,7 +849,9 @@ async def _run_two_way(call: plivo_stream.PlivoCall, *, lead_id: str,
                 logger.error(f"[sarvam] lead={lead_id} conversation failed: "
                              f"{type(exc).__name__}: {exc}")
             finally:
-                await conversation._cancel_reply()
+                # force=True: the call is over either way, so there is no
+                # reason to let an in-flight model call keep running.
+                await conversation._cancel_reply(force=True)
                 call.stop.set()
 
         await call.run(call.read_events(to_sarvam), converse(),

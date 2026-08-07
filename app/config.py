@@ -325,6 +325,21 @@ CONVERSATION_LLM_MODEL = os.getenv("CONVERSATION_LLM_MODEL", "")
 # already decided the line is dead.
 CONVERSATION_LLM_TIMEOUT_S = _float("CONVERSATION_LLM_TIMEOUT_S", 12.0)
 
+# How long to wait, after the lead's speech settles, before answering. Short —
+# it exists to absorb Sarvam's transcript and END_SPEECH signal arriving in
+# either order for the same utterance, not to detect end-of-speech itself
+# (that's END_SPEECH; see app/telephony/sarvam_stt.py). Tunable because it is
+# a straight trade: too low risks answering mid-sentence on a lead who pauses
+# briefly, too high adds dead air to every single turn.
+SARVAM_REPLY_SETTLE_S = _float("SARVAM_REPLY_SETTLE_S", 0.25)
+
+# Ceiling on the same wait if END_SPEECH never arrives for an utterance —
+# preserves the previous fixed-debounce behaviour as a FALLBACK rather than a
+# floor, so a turn can never be slower than it was before this became
+# signal-driven. See app/telephony/sarvam_bridge.py's _reply_when_they_stop for
+# why a burst of short utterances still collapses into one reply either way.
+SARVAM_REPLY_MAX_WAIT_S = _float("SARVAM_REPLY_MAX_WAIT_S", 0.7)
+
 # ── EMBEDDINGS (OpenAI text-embedding-3-small) ────────────────────────────────
 # A separate credential from ElevenLabs — text-embedding-3-small is an OpenAI
 # model. RAG ingestion/search cannot run for real without this; code + tests run
@@ -351,6 +366,18 @@ RAG_TOP_K = _int("RAG_TOP_K", 4)
 # English and retried once. English queries (the common case) never pay for it.
 RAG_TRANSLATE_ON_MISS = _bool("RAG_TRANSLATE_ON_MISS", True)
 RAG_TRANSLATE_MODEL = os.getenv("RAG_TRANSLATE_MODEL", "gpt-4o-mini")
+
+# The live Sarvam voice call's own deadline on ONE search_relevant() lookup.
+# That function has no deadline of its own — an 8s embed timeout with one SDK
+# retry is ~16s, and a miss adds a translate call (6s, also retried once,
+# ~12s) plus a SECOND embed+match — and it is also POST /rag/search, the
+# ElevenLabs agent's live tool, so it cannot be given one internally without
+# changing a path that is already in production. Bounded here instead, on the
+# voice call site only (app/telephony/sarvam_bridge.py). The two-way silence
+# watchdog will NOT save the lead from a slow lookup — a reply already in
+# flight counts as activity — so without this a lead who asks a course
+# question can sit in total silence for the better part of a minute.
+RAG_VOICE_DEADLINE_S = _float("RAG_VOICE_DEADLINE_S", 4.0)
 
 # ── GOOGLE SHEETS ─────────────────────────────────────────────────────────────
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "sa.json")

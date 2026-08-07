@@ -74,13 +74,15 @@ _ONEWAY_POLL_S = 0.25
 # conversation the agent chose to end, not a dropped call. Without it every
 # Telugu conversation that finished properly would be stored 'failed', mark its
 # lead failed, and burn a retry on someone who already said goodbye.
+# sarvam_lead_goodbye is Sarvam's deterministic transcript path: an explicit
+# goodbye ends the call even when the model omits its end_call tool.
 # twoway_silence is sarvam_bridge's own watchdog: a conversation where neither
 # side has spoken for TWOWAY_MAX_SILENT_S has finished, whether or not the model
 # remembered to call its end_call tool (measured against the live API, it
 # mostly does not). A conversation that ran its course is not a failed call.
 _CLEAN_EXITS = ("plivo_stop", "plivo_disconnect", "max_duration", "oneway_complete",
                 "elevenlabs_closed:1000", "openai_end_call", "sarvam_end_call",
-                "twoway_silence")
+                "sarvam_lead_goodbye", "twoway_silence")
 
 
 def answer_xml(lead_id: str) -> str:
