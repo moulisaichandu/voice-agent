@@ -99,6 +99,32 @@ def _stt_url() -> str:
     return f"{_STT_URL}?{urlencode(params, safe=':')}"
 
 
+def _sumsq_and_count(pcm: bytes) -> tuple[int, int]:
+    """Sum of squared samples and sample count, for RMS accumulation.
+
+    Raw sums, not a single RMS — multiple frames combine correctly this way;
+    averaging per-frame RMS values is NOT the same as the RMS of the
+    combined signal. A trailing odd byte cannot be half a sample, so it is
+    dropped, matching ulaw.encode()'s existing convention.
+    """
+    usable = len(pcm) - (len(pcm) % 2)
+    samples = [
+        int.from_bytes(pcm[i:i + 2], "little", signed=True)
+        for i in range(0, usable, 2)
+    ]
+    return sum(s * s for s in samples), len(samples)
+
+
+def _rms(sumsq: int, count: int) -> float:
+    """Root-mean-square from an accumulated sum-of-squares and sample count.
+
+    0 samples returns 0.0 — "nothing was measured", not "the signal was
+    silent". Callers only pass a genuine zero-sample window when nothing
+    happened during it (e.g. an utterance with no leading silence).
+    """
+    return (sumsq / count) ** 0.5 if count else 0.0
+
+
 class SarvamSTT:
     """One STT socket for the life of a call.
 

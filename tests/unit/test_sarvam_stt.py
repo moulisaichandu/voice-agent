@@ -27,6 +27,37 @@ _MULAW_FRAME = b"\x7f" * 160          # 20 ms at 8 kHz
 _MULAW_B64 = base64.b64encode(_MULAW_FRAME).decode()
 
 
+# ── audio-health accumulation ────────────────────────────────────────────────
+
+def test_sumsq_and_count_of_known_samples():
+    """Two samples, 3 and 4 — sum of squares is 25, count is 2. Chosen so the
+    RMS ends up being sqrt(12.5), an easy value to check by hand."""
+    pcm = (3).to_bytes(2, "little", signed=True) + (4).to_bytes(2, "little", signed=True)
+    assert sarvam_stt._sumsq_and_count(pcm) == (25, 2)
+
+
+def test_sumsq_and_count_of_empty_pcm_is_zero():
+    assert sarvam_stt._sumsq_and_count(b"") == (0, 0)
+
+
+def test_sumsq_and_count_drops_a_trailing_odd_byte():
+    """A stray half-sample must not be read as a sample — same reasoning as
+    ulaw.encode()'s trailing-byte handling."""
+    pcm = (5).to_bytes(2, "little", signed=True) + b"\x01"
+    assert sarvam_stt._sumsq_and_count(pcm) == (25, 1)
+
+
+def test_rms_of_the_3_4_example():
+    assert sarvam_stt._rms(25, 2) == pytest.approx(12.5 ** 0.5)
+
+
+def test_rms_with_no_samples_is_zero():
+    """Zero samples measured, not a silent signal — the caller (send_audio's
+    accumulator) never has zero samples for a frame it actually received, but
+    the function must not divide by zero if it's ever called with none."""
+    assert sarvam_stt._rms(0, 0) == 0.0
+
+
 def _transcript(text: str) -> str:
     return json.dumps({"type": "data", "data": {"transcript": text,
                                                 "request_id": "r1"}})
