@@ -184,6 +184,13 @@ def test_a_missing_sheet_id_is_reported_as_a_reason(monkeypatch):
     assert reason and "GOOGLE_SHEET_ID" in reason
 
 
+def test_a_sheet_url_is_rejected_in_favour_of_the_spreadsheet_id(monkeypatch):
+    from app.sheets import client as sheets_client
+    monkeypatch.setattr(sheets_client, "GOOGLE_SHEET_ID", "https://docs.google.com/spreadsheets/d/sheet-1/edit")
+    reason = sheets_client.unconfigured_reason()
+    assert reason and "spreadsheet ID" in reason
+
+
 def test_a_fully_configured_sheet_reports_no_reason(monkeypatch, tmp_path):
     from app.sheets import client as sheets_client
     creds = tmp_path / "sa.json"

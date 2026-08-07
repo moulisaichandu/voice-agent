@@ -20,6 +20,19 @@ _SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 _client: gspread.Client | None = None
 
 
+def _sheet_id_reason() -> str | None:
+    if not GOOGLE_SHEET_ID:
+        return ("GOOGLE_SHEET_ID is not set, so there is no Sheet to read or "
+                "write. Set it in .env.")
+    if GOOGLE_SHEET_ID.lower().startswith(("http://", "https://")):
+        return (
+            "GOOGLE_SHEET_ID contains a URL, but gspread.open_by_key needs the "
+            "spreadsheet ID only. Copy the ID between /d/ and /edit in the "
+            "Google Sheets URL and set that value in .env."
+        )
+    return None
+
+
 def unconfigured_reason() -> str | None:
     """Why the Sheet cannot be reached at all, or None if it can.
 
@@ -34,9 +47,9 @@ def unconfigured_reason() -> str | None:
     not a probe of the API. It runs on every sweep and must never itself be the
     slow or failing thing.
     """
-    if not GOOGLE_SHEET_ID:
-        return ("GOOGLE_SHEET_ID is not set, so there is no Sheet to read or "
-                "write. Set it in .env.")
+    sheet_id_reason = _sheet_id_reason()
+    if sheet_id_reason:
+        return sheet_id_reason
     if not Path(GOOGLE_SERVICE_ACCOUNT_FILE).is_file():
         return (
             f"the Google service-account key file "
@@ -50,10 +63,9 @@ def unconfigured_reason() -> str | None:
 def _get_client() -> gspread.Client:
     global _client
     if _client is None:
-        if not GOOGLE_SHEET_ID:
-            raise RuntimeError(
-                "GOOGLE_SHEET_ID is not set — cannot reach the leads Sheet."
-            )
+        sheet_id_reason = _sheet_id_reason()
+        if sheet_id_reason:
+            raise RuntimeError(sheet_id_reason)
         creds = Credentials.from_service_account_file(
             GOOGLE_SERVICE_ACCOUNT_FILE, scopes=_SCOPES,
         )
