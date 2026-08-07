@@ -176,6 +176,37 @@ async def test_the_stream_ends_on_the_final_event(connected):
     assert len(chunks) == 1
 
 
+async def test_cancelled_synthesis_reconnects_before_the_next_turn(monkeypatch):
+    """A barge-in must not leave stale audio/final frames on the reusable
+    socket, or the next answer can finish immediately without speaking."""
+    monkeypatch.setattr(sarvam_tts, "SARVAM_API_KEY", "sk-test")
+    sockets = [
+        _FakeSarvamWS([]),
+        _FakeSarvamWS([_audio(), _final()]),
+    ]
+    connected_sockets = []
+
+    async def fake_connect(*a, **kw):
+        ws = sockets.pop(0)
+        connected_sockets.append(ws)
+        return ws
+
+    monkeypatch.setattr(sarvam_tts, "_connect", fake_connect)
+
+    async with sarvam_tts.SarvamTTS(language="te-IN") as tts:
+        task = asyncio.create_task(tts.collect("first answer"))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        chunks = await tts.collect("second answer")
+
+    assert len(connected_sockets) == 2
+    assert chunks == [(_FRAME, 20)]
+    assert connected_sockets[0].closed is True
+
+
 async def test_an_error_frame_stops_the_stream_rather_than_hanging(connected):
     """A rejected config (bad speaker, expired key) arrives as an error frame
     and then silence. Treating it as end-of-utterance turns a 300-second billed

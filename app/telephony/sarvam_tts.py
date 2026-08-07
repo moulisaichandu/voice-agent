@@ -32,6 +32,7 @@ have.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import json
@@ -122,6 +123,11 @@ class SarvamTTS:
         self._ws: Any = None
 
     async def __aenter__(self) -> SarvamTTS:
+        await self._open()
+        return self
+
+    async def _open(self) -> None:
+        """Open and configure the socket used by the next synthesis."""
         if not SARVAM_API_KEY:
             raise SarvamNotConfigured(
                 "SARVAM_API_KEY is not set — Telugu calls cannot be voiced."
@@ -130,7 +136,34 @@ class SarvamTTS:
         self._ws = await _connect(url, {"Api-Subscription-Key": SARVAM_API_KEY})
         await self._ws.send(json.dumps(
             _config_frame(self._language, self._speaker)))
-        return self
+
+    async def _reset_connection(self) -> None:
+        """Discard a socket whose utterance was cancelled mid-stream.
+
+        Sarvam keeps one WebSocket open across utterances. If a barge-in
+        cancels ``speak()`` while the server is still streaming audio, the
+        unread audio/final frames remain on that socket. Reusing it lets the
+        next turn consume stale frames (often the old ``final`` immediately),
+        producing no audio for the answer the lead is waiting for. A fresh
+        configured socket is cheap compared with another silent turn.
+        """
+        ws, self._ws = self._ws, None
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:  # noqa: BLE001 - cleanup must not mask cancellation
+                logger.debug("[sarvam-tts] cancelled socket close failed",
+                             exc_info=True)
+
+    async def reset_after_cancel(self) -> None:
+        """Public cancellation hook for a consumer stopped during a chunk.
+
+        Cancelling the caller while it is inside ``call.play`` can happen
+        after ``speak()`` yielded a frame, before the async generator receives
+        the cancellation itself. The bridge calls this hook so that case also
+        cannot leave the reusable socket mid-utterance.
+        """
+        await self._reset_connection()
 
     async def __aexit__(self, *exc_info) -> bool:
         if self._ws is not None:
@@ -160,29 +193,37 @@ class SarvamTTS:
             # audio Sarvam has no reason to produce is a hang, not a no-op.
             return
 
-        await self._ws.send(json.dumps({"type": "text", "data": {"text": cleaned}}))
-        await self._ws.send(json.dumps({"type": "flush"}))
+        if self._ws is None:
+            # This is the normal path only after a cancelled prior utterance;
+            # __aenter__ opens the first socket for a call.
+            await self._open()
+        try:
+            await self._ws.send(json.dumps({"type": "text", "data": {"text": cleaned}}))
+            await self._ws.send(json.dumps({"type": "flush"}))
 
-        async for raw in self._ws:
-            try:
-                event = json.loads(raw)
-            except (ValueError, TypeError):
-                continue
-            etype = event.get("type")
-            data = event.get("data") or {}
+            async for raw in self._ws:
+                try:
+                    event = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                etype = event.get("type")
+                data = event.get("data") or {}
 
-            if etype == "audio":
-                payload = data.get("audio")
-                if payload:
-                    yield payload, _duration_ms(payload)
-            elif etype == "event" and data.get("event_type") == "final":
-                return
-            elif etype == "error":
-                logger.error(
-                    f"[sarvam-tts] refused to synthesise: "
-                    f"{data.get('message') or event} (code={data.get('code')})"
-                )
-                return
+                if etype == "audio":
+                    payload = data.get("audio")
+                    if payload:
+                        yield payload, _duration_ms(payload)
+                elif etype == "event" and data.get("event_type") == "final":
+                    return
+                elif etype == "error":
+                    logger.error(
+                        f"[sarvam-tts] refused to synthesise: "
+                        f"{data.get('message') or event} (code={data.get('code')})"
+                    )
+                    return
+        except asyncio.CancelledError:
+            await self._reset_connection()
+            raise
 
     async def collect(self, text: str) -> list[tuple[str, int]]:
         """speak() drained into a list. For one-way calls, which have a single
