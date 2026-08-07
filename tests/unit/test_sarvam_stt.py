@@ -320,6 +320,109 @@ async def test_audio_health_resets_between_consecutive_utterances(connected, cap
     assert "frames=2" in second_line
 
 
+async def test_aexit_flushes_unlogged_audio_health_on_teardown(connected, caplog):
+    """A call that ends without a clean final END_SPEECH — the lead hangs up
+    mid-utterance, or no VAD boundary ever fires — must not silently discard
+    whatever was accumulated. These are exactly the pathological calls most
+    worth measuring, so __aexit__ flushes them rather than losing the data.
+    """
+    caplog.set_level("INFO")
+    # Only a START_SPEECH ever arrives — the call ends mid-utterance, before
+    # any END_SPEECH would normally trigger a log line.
+    connected(_FakeSTTWS([_vad("START_SPEECH")]))
+
+    quiet = (200).to_bytes(2, "little", signed=True) * 80
+    loud = (12000).to_bytes(2, "little", signed=True) * 80
+    quiet_b64 = base64.b64encode(ulaw.encode(quiet)).decode()
+    loud_b64 = base64.b64encode(ulaw.encode(loud)).decode()
+
+    async with sarvam_stt.SarvamSTT(lead_id="lead-flush") as stt:
+        await stt.send_audio(quiet_b64)  # before START_SPEECH: silence window
+        events_iter = stt.events()
+        started = await events_iter.__anext__()
+        assert started.kind == "speech_started"
+        await stt.send_audio(loud_b64)   # after START_SPEECH: speech window
+        # the lead hangs up here — no END_SPEECH ever arrives
+
+    expected_silence = sarvam_stt._rms(*sarvam_stt._sumsq_and_count(ulaw.decode(
+        base64.b64decode(quiet_b64))))
+    expected_speech = sarvam_stt._rms(*sarvam_stt._sumsq_and_count(ulaw.decode(
+        base64.b64decode(loud_b64))))
+
+    lines = [r.message for r in caplog.records if "audio health" in r.message]
+    assert lines, "no audio-health line was flushed on teardown despite tracked frames"
+    line = lines[0]
+    assert "lead=lead-flush" in line
+    assert f"silence_rms={expected_silence:.1f}" in line
+    assert f"speech_rms={expected_speech:.1f}" in line
+    assert "frames=2" in line
+
+
+async def test_aexit_logs_nothing_when_no_frames_were_ever_tracked(connected, caplog):
+    """A call that enters and exits without a single tracked frame has
+    nothing to report — flushing here would spam an empty line for every
+    connection that never received audio (e.g. a call that failed before
+    Plivo ever streamed anything)."""
+    caplog.set_level("INFO")
+    connected(_FakeSTTWS([]))
+
+    async with sarvam_stt.SarvamSTT(lead_id="lead-empty"):
+        pass
+
+    lines = [r.message for r in caplog.records if "audio health" in r.message]
+    assert not lines, f"expected no audio-health line for zero tracked frames, got: {lines}"
+
+
+async def test_an_unpaired_end_speech_reports_zero_speech_rms_not_a_stale_value(
+    connected, caplog,
+):
+    """END_SPEECH firing twice in a row with no intervening START_SPEECH is a
+    real reachable scenario (see test_sarvam_bridge.py's
+    test_the_lead_id_reaches_the_audio_health_log, which drives a bare
+    END_SPEECH with no prior START_SPEECH). The second line must honestly
+    report that no speech was measured for it (speech_rms=0.0, matching
+    _rms's own "0 samples = nothing measured" convention) — not carry over
+    the previous utterance's speech_rms.
+    """
+    caplog.set_level("INFO")
+    connected(_FakeSTTWS([
+        _vad("START_SPEECH"), _vad("END_SPEECH"),
+        _vad("END_SPEECH"),
+    ]))
+
+    loud = (12000).to_bytes(2, "little", signed=True) * 80
+    loud_b64 = base64.b64encode(ulaw.encode(loud)).decode()
+
+    async with sarvam_stt.SarvamSTT(lead_id="lead-unpaired") as stt:
+        events_iter = stt.events()
+
+        # utterance 1 — real speech, so line 1 has a nonzero speech_rms
+        started = await events_iter.__anext__()
+        assert started.kind == "speech_started"
+        await stt.send_audio(loud_b64)
+        ended_1 = await events_iter.__anext__()
+        assert ended_1.kind == "speech_ended"
+
+        # a second, unpaired END_SPEECH — no START_SPEECH, no frames at all
+        ended_2 = await events_iter.__anext__()
+        assert ended_2.kind == "speech_ended"
+
+    expected_speech_1 = sarvam_stt._rms(*sarvam_stt._sumsq_and_count(ulaw.decode(
+        base64.b64decode(loud_b64))))
+
+    lines = [r.message for r in caplog.records if "audio health" in r.message]
+    assert len(lines) == 2, f"expected exactly 2 audio-health lines, got {lines}"
+    assert f"speech_rms={expected_speech_1:.1f}" in lines[0]
+    assert expected_speech_1 != pytest.approx(0.0), (
+        "test setup bug: utterance 1's speech_rms must be nonzero for this "
+        "test to actually discriminate a stale carry-over from a real reset"
+    )
+    assert "speech_rms=0.0" in lines[1], (
+        f"expected the unpaired END_SPEECH to report speech_rms=0.0 (nothing "
+        f"measured), got: {lines[1]!r}"
+    )
+
+
 async def test_lead_id_defaults_to_empty_string(connected, caplog):
     """The constructor's lead_id is optional so every other test in this
     file (and every existing call site) keeps constructing SarvamSTT() with

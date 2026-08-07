@@ -2,7 +2,9 @@
 
 Hearing the lead. Owns one thing: turning Plivo's inbound mu-law frames into
 transcripts and speech-boundary signals. It knows nothing about calls, turns or
-prompts — app/telephony/sarvam_bridge.py decides what to do with what it hears.
+prompts, beyond an opaque lead_id used only to correlate its own diagnostic
+log lines — app/telephony/sarvam_bridge.py decides what to do with what it
+hears.
 
 Wire protocol (docs.sarvam.ai, verified 2026-07-27):
 
@@ -158,6 +160,13 @@ class SarvamSTT:
         return self
 
     async def __aexit__(self, *exc_info) -> bool:
+        if self._frame_count:
+            # The call ended without a clean final END_SPEECH — a hangup
+            # mid-utterance, or no VAD boundary ever fired. Flush whatever
+            # was accumulated rather than discarding it silently: these
+            # pathological calls are exactly the ones most worth measuring.
+            # A call that never tracked a single frame has nothing to say.
+            self._log_audio_health()
         if self._ws is not None:
             try:
                 await self._ws.close()
@@ -203,6 +212,12 @@ class SarvamSTT:
     def _track_frame(self, pcm: bytes) -> None:
         """Accumulate one successfully decoded inbound frame into whichever
         RMS window is currently active, and update frame-delivery timing.
+
+        A frame that failed to decode never reaches here (see send_audio's
+        early return), so `_last_frame_at` isn't advanced for it either — the
+        gap is simply absorbed into whichever successfully-tracked frame
+        arrives next. That's desirable, not a bug: a dropped frame IS a
+        delivery problem, and widening the next gap is how it shows up here.
         """
         sumsq, count = _sumsq_and_count(pcm)
         if self._speaking:
@@ -242,6 +257,16 @@ class SarvamSTT:
         )
         self._silence_sumsq = 0
         self._silence_count = 0
+        # _speech_sumsq/_speech_count are ALSO reset here, not only at
+        # START_SPEECH: if END_SPEECH ever fires twice with no intervening
+        # START_SPEECH (a real reachable shape — see
+        # test_sarvam_bridge.py's test_the_lead_id_reaches_the_audio_health_log,
+        # which drives exactly a bare END_SPEECH with no prior START_SPEECH),
+        # the second line must honestly report "nothing measured"
+        # (speech_rms=0.0, per _rms's own convention) rather than carry over
+        # whatever speech was last measured.
+        self._speech_sumsq = 0
+        self._speech_count = 0
         self._frame_gap_max_ms = 0.0
         self._frame_count = 0
 
