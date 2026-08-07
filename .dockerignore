@@ -9,3 +9,7 @@ htmlcov/
 .git/
 .env
 sa.json
+frontend/node_modules/
+frontend/.next/
+frontend/.next-build/
+voice-samples/

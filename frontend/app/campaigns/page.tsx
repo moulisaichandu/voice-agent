@@ -139,7 +139,7 @@ export default function CampaignsPage() {
         <form onSubmit={handleCreate} className="flex max-w-lg flex-col gap-4">
           <Field
             label="Language"
-            hint="Every lead in this file is called in this language. A Language column in the file overrides it for that row. Telugu and Tinglish run on a different voice engine because ElevenLabs does not support Telugu — the Voice column shows which one. Two-way is not available for them yet, so choose one-way."
+            hint="Every lead in this file is called in this language. A Language column in the file overrides it for that row. Telugu and Tinglish use the Sarvam voice engine because ElevenLabs does not support Telugu. The Voice column shows which backend will carry the call."
           >
             <select
               className={fieldControlClass}
