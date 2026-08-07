@@ -548,6 +548,28 @@ timestamp. Read the result against the two hypotheses from the design doc:
   verified live, not once the underlying question is answered from one
   batch.
 
+**Two confounds to read around**, found in the whole-branch review after this
+plan's three tasks landed:
+
+- **The FIRST utterance's `silence_rms` of every call is not clean.**
+  `sarvam_bridge.py`'s `converse()` calls `deliver_opening()` — which blocks
+  in real time until the AI-disclosure opening finishes playing — before it
+  starts consuming `stt.events()`. So for the whole 15-30s of the opening, no
+  VAD signal is processed and every inbound frame during that window lands
+  in the silence accumulator. The first `[sarvam-stt]` line of every call
+  will show an inflated `silence_rms` and a large `frames` count reflecting
+  conditions DURING the agent's own opening speech (echo/leakage risk
+  included), not genuine pre-speech quiet. Don't read an elevated
+  first-utterance `silence_rms` as ambient noise — read the call's later
+  utterances instead, or treat the first line as uninformative for the
+  noise-vs-connection question.
+- **`frame_gap_max_ms` can reflect event-loop scheduling delay, not only
+  network jitter** — it's measured between successive `_track_frame` calls in
+  a process shared with TTS playback, the reply task, and LLM HTTP
+  round-trips. A healthy loop schedules in well under a millisecond; treat
+  gaps in the tens-of-ms range as the meaningful signal for a connection
+  problem, not sub-millisecond variation.
+
 This task has no automated pass/fail — its deliverable is the data and the
 owner's read of it, which determines whether there is a Task 5 at all and
 what it should be.
