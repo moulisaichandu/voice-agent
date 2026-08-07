@@ -11,6 +11,8 @@ switched off. Hence a provider-agnostic client speaking the OpenAI-compatible
 protocol both vendors implement.
 """
 
+import asyncio
+
 import pytest
 
 from app.telephony import conversation_llm
@@ -60,6 +62,13 @@ def llm(monkeypatch):
     monkeypatch.setattr(conversation_llm, "SARVAM_API_KEY", "sk-sarvam")
     monkeypatch.setattr(conversation_llm, "CONVERSATION_LLM_PROVIDER", "openai")
     monkeypatch.setattr(conversation_llm, "CONVERSATION_LLM_MODEL", "")
+    # turn() now reuses one client via _get_client() instead of opening one per
+    # call — see that function's docstring. Without this reset, a client built
+    # (and configured) by a PREVIOUS test would still be sitting in the module
+    # global and every test after the first would silently talk to it instead
+    # of the fake this test is about to install.
+    monkeypatch.setattr(conversation_llm, "_client", None)
+    monkeypatch.setattr(conversation_llm, "_client_loop", None)
 
     def _install(**client_kwargs):
         monkeypatch.setattr(
@@ -232,3 +241,121 @@ async def test_the_search_tool_demands_an_english_query(llm):
         "the model treated 'as a concise search query in English' as advice "
         "and sent Telugu anyway"
     )
+
+
+# ── one connection, not one per turn ─────────────────────────────────────────
+#
+# turn() used to build and tear down an httpx.AsyncClient inside itself, so
+# every completion paid a fresh DNS + TCP + TLS handshake to api.openai.com —
+# and a course question pays it TWICE, once for the tool call and once for the
+# answer, with a real person hearing silence for all of it.
+
+async def test_two_turns_share_one_client_instead_of_handshaking_twice(llm, monkeypatch):
+    """A course question costs two completions back to back. Each used to open
+    its own connection; now both should reuse the same one."""
+    llm()
+    built = []
+    monkeypatch.setattr(
+        conversation_llm.httpx, "AsyncClient",
+        lambda **kw: built.append(_FakeAsyncClient()) or built[-1],
+    )
+
+    await conversation_llm.turn(_HISTORY)
+    await conversation_llm.turn(_HISTORY)
+
+    assert len(built) == 1, (
+        f"expected one shared client across two turns, got {len(built)} — "
+        "turn() is opening a fresh connection per call again"
+    )
+
+
+def test_the_pool_survives_the_gap_between_two_turns():
+    """httpx's default keepalive_expiry is 5s. Between two completions on one
+    call the agent speaks its answer and the lead takes their own turn —
+    commonly 10-20s — so the default would discard the connection between
+    every single turn and this whole change would silently do nothing."""
+    assert conversation_llm._LIMITS.keepalive_expiry >= 10.0
+
+
+def test_the_pool_is_sized_for_every_concurrent_call_not_just_one():
+    """The pool is process-wide. At MAX_CONCURRENT_CALLS there can be that
+    many completions in flight at once, each idling between turns rather than
+    closing — so a pool smaller than the call cap evicts live conversations'
+    connections and hands them back the TLS handshake this exists to remove."""
+    from app.config import MAX_CONCURRENT_CALLS
+
+    assert conversation_llm._LIMITS.max_keepalive_connections >= 2 * MAX_CONCURRENT_CALLS
+
+
+# ── one retry, and only when it is nearly free ───────────────────────────────
+#
+# sarvam_bridge._reply swallows TurnFailed, so at campaign scale a single 429
+# is not an error the operator sees — it is a lead who hears NOTHING on a call
+# that is still graded a clean exit.
+
+async def test_a_rate_limit_is_retried_once(llm, monkeypatch):
+    attempts = []
+
+    class _FlakyClient:
+        async def post(self, url, json=None, headers=None):
+            attempts.append(1)
+            code = 429 if len(attempts) == 1 else 200
+            return _FakeResponse(code, _reply(content="Twenty five thousand."))
+
+    monkeypatch.setattr(conversation_llm, "_get_client", lambda: _FlakyClient())
+    monkeypatch.setattr(conversation_llm, "_RETRY_BACKOFF_S", 0.0)
+
+    reply = await conversation_llm.turn(_HISTORY)
+
+    assert len(attempts) == 2, "a 429 must be retried once"
+    assert reply.text == "Twenty five thousand."
+
+
+async def test_a_bad_request_is_not_retried(llm, monkeypatch):
+    """401/400 are configuration errors. Retrying cannot fix them and only
+    spends more of the lead's patience."""
+    attempts = []
+
+    class _RefusingClient:
+        async def post(self, url, json=None, headers=None):
+            attempts.append(1)
+            return _FakeResponse(401, {})
+
+    monkeypatch.setattr(conversation_llm, "_get_client", lambda: _RefusingClient())
+
+    with pytest.raises(conversation_llm.TurnFailed):
+        await conversation_llm.turn(_HISTORY)
+    assert len(attempts) == 1
+
+
+async def test_a_slow_failure_is_not_retried(llm, monkeypatch):
+    """A 500 that burned most of the turn budget must not be retried — the
+    lead has already been waiting, and a second attempt spends what is left."""
+    attempts = []
+
+    class _SlowFailClient:
+        async def post(self, url, json=None, headers=None):
+            attempts.append(1)
+            await asyncio.sleep(0.05)
+            return _FakeResponse(500, {})
+
+    monkeypatch.setattr(conversation_llm, "_get_client", lambda: _SlowFailClient())
+    monkeypatch.setattr(conversation_llm, "CONVERSATION_LLM_TIMEOUT_S", 0.05)
+
+    with pytest.raises(conversation_llm.TurnFailed):
+        await conversation_llm.turn(_HISTORY)
+    assert len(attempts) == 1, "a slow failure left no budget for a retry"
+
+
+async def test_the_client_is_bound_to_the_loop_that_made_it(llm):
+    """Same guard as app/redis_client.get_redis() and app/db/pool.get_pool(),
+    for the same reason: a client's connections belong to one event loop, and
+    pytest-asyncio gives every test function its own."""
+    llm()
+    await conversation_llm.turn(_HISTORY)
+    assert conversation_llm._client_loop is asyncio.get_running_loop()
+
+
+async def test_closing_twice_is_safe():
+    await conversation_llm.aclose()
+    await conversation_llm.aclose()

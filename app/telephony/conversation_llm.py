@@ -29,6 +29,7 @@ stays one env var away for whenever their latency story changes.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass
@@ -166,6 +167,82 @@ class NoAnswer(RuntimeError):
     """
 
 
+# ONE client for the process, not one per turn.
+#
+# turn() used to build and tear down an httpx.AsyncClient inside itself, so
+# every completion paid a fresh DNS lookup, TCP handshake and TLS handshake to
+# api.openai.com — and a course question pays it TWICE, once for the tool call
+# and once for the answer, with a real person hearing silence for all of it.
+#
+# keepalive_expiry is the value that actually matters: httpx's default (5s) is
+# far too short for this traffic shape. Between two completions on one call the
+# agent speaks its answer and the lead takes their own turn — commonly 10-20s
+# — so at the default the pool would discard the connection between every
+# single turn and this change would silently do nothing.
+#
+# The pool is shared by every concurrent call in the process, so it has to be
+# sized against MAX_CONCURRENT_CALLS, not against one call. At 10 concurrent
+# calls there can be 10 completions in flight at once, and each idles between
+# turns rather than closing — so a pool of 8 would evict live conversations'
+# connections and hand them back a fresh TLS handshake, which is the exact cost
+# this exists to remove. Sized well clear of it instead: connections are cheap
+# to hold and the failure mode of too few is invisible.
+_LIMITS = httpx.Limits(max_keepalive_connections=32, max_connections=64,
+                       keepalive_expiry=120.0)
+
+# A turn the lead is waiting through, so a retry has to be nearly free or not
+# happen at all. 429 (rate limit) and 5xx are worth exactly one immediate
+# retry: at campaign scale they are the difference between a lead hearing an
+# answer and a lead hearing NOTHING, because sarvam_bridge._reply swallows
+# TurnFailed and the call is still graded a clean exit. Anything else (401,
+# 400) is a configuration error that retrying cannot fix.
+_RETRYABLE_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+_RETRY_BACKOFF_S = 0.25
+# Only retry if the first attempt failed FAST. A 429 that came back instantly
+# leaves plenty of the budget; one that burned 10s of a 12s timeout does not,
+# and a second attempt would just hold the lead in silence past the point where
+# they have decided the line is dead.
+_RETRY_IF_ELAPSED_UNDER = 0.4
+
+_client: httpx.AsyncClient | None = None
+_client_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    """The shared client, created on first use.
+
+    Loop-aware for the same reason app/redis_client.py's get_redis() and
+    app/db/pool.py's get_pool() are: a client's connections belong to the event
+    loop that opened them, and pytest-asyncio gives every test function its own
+    loop, so a naive process-global client breaks on the second test that
+    calls turn(). The real app has exactly one loop for its whole life and
+    never takes this branch.
+    """
+    global _client, _client_loop
+    current_loop = asyncio.get_running_loop()
+    if _client is not None and _client_loop is not current_loop:
+        _client = None  # can't close it on a dead loop; just drop the reference
+
+    if _client is None:
+        _client = httpx.AsyncClient(
+            timeout=CONVERSATION_LLM_TIMEOUT_S, limits=_LIMITS)
+        _client_loop = current_loop
+    return _client
+
+
+async def aclose() -> None:
+    """Close the shared client. Called from app/main.py's lifespan — nothing
+    else outlives it."""
+    global _client, _client_loop
+    if _client is not None:
+        # Same loop-aware guard as _get_client(): a client created under a now-
+        # dead event loop can't have its transport closed on THIS loop.
+        if _client_loop is asyncio.get_running_loop():
+            await _client.aclose()
+        _client = None
+        _client_loop = None
+
+
 def _provider() -> tuple[str, str, str, str]:
     """(url, model, key, key_name) for the configured provider."""
     url, default_model, key_name = _PROVIDERS.get(
@@ -215,6 +292,9 @@ async def turn(messages: list[dict]) -> LLMReply:
     before the model finished, which is the obvious next latency win — but
     streaming plus tool calls is a much larger piece of protocol handling, and
     the turn-taking has to be proven correct first.
+
+    Reuses one keepalived connection via _get_client() rather than opening a
+    fresh one per call — see that function's docstring.
     """
     url, model, key, key_name = _provider()
     if not key:
@@ -240,17 +320,45 @@ async def turn(messages: list[dict]) -> LLMReply:
         "max_tokens": 4096,
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=CONVERSATION_LLM_TIMEOUT_S) as client:
-            response = await client.post(
-                url, json=payload, headers={"Authorization": f"Bearer {key}"})
-    except httpx.HTTPError as exc:
-        raise TurnFailed(f"{CONVERSATION_LLM_PROVIDER} chat completions "
-                         f"unreachable: {type(exc).__name__}: {exc}") from exc
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    headers = {"Authorization": f"Bearer {key}"}
+    response = None
+    reason = "made no attempt"
 
-    if response.status_code != 200:
-        raise TurnFailed(f"{CONVERSATION_LLM_PROVIDER} chat completions "
-                         f"returned HTTP {response.status_code}.")
+    for attempt in (1, 2):
+        try:
+            response = await _get_client().post(url, json=payload, headers=headers)
+        except httpx.HTTPError as exc:
+            reason = f"unreachable: {type(exc).__name__}: {exc}"
+            response = None
+        else:
+            if response.status_code == 200:
+                break
+            reason = f"returned HTTP {response.status_code}"
+            if response.status_code not in _RETRYABLE_STATUSES:
+                break
+            response = None
+
+        spent = loop.time() - started
+        if attempt == 2 or spent > CONVERSATION_LLM_TIMEOUT_S * _RETRY_IF_ELAPSED_UNDER:
+            break
+        logger.warning(
+            f"[conversation] {CONVERSATION_LLM_PROVIDER} chat completions "
+            f"{reason} after {spent:.2f}s — retrying once. A lead is waiting "
+            "in silence for this."
+        )
+        await asyncio.sleep(_RETRY_BACKOFF_S)
+
+    if response is None or response.status_code != 200:
+        detail = ""
+        if response is not None:
+            try:
+                detail = f" body={response.text[:500]!r}"
+            except Exception:  # pragma: no cover - defensive logging only
+                pass
+        raise TurnFailed(
+            f"{CONVERSATION_LLM_PROVIDER} chat completions {reason}.{detail}")
 
     try:
         message = response.json()["choices"][0]["message"]
