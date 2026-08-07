@@ -37,6 +37,7 @@ import base64
 import binascii
 import json
 import logging
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -132,8 +133,20 @@ class SarvamSTT:
     can leak one.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, lead_id: str = "") -> None:
         self._ws: Any = None
+        # Audio-health accumulators — see _log_audio_health. All of this is
+        # measured from data this module already decodes for Sarvam; no new
+        # coupling to sarvam_bridge or call/turn state.
+        self._lead_id = lead_id
+        self._speaking = False
+        self._silence_sumsq = 0
+        self._silence_count = 0
+        self._speech_sumsq = 0
+        self._speech_count = 0
+        self._last_frame_at: float | None = None
+        self._frame_gap_max_ms = 0.0
+        self._frame_count = 0
 
     async def __aenter__(self) -> SarvamSTT:
         if not SARVAM_API_KEY:
@@ -165,6 +178,8 @@ class SarvamSTT:
             logger.warning("[sarvam-stt] undecodable inbound frame — dropped")
             return
 
+        self._track_frame(pcm)
+
         await self._ws.send(json.dumps({
             "audio": {
                 "data": base64.b64encode(pcm).decode(),
@@ -184,6 +199,51 @@ class SarvamSTT:
                 "sample_rate": "8000",
             },
         }))
+
+    def _track_frame(self, pcm: bytes) -> None:
+        """Accumulate one successfully decoded inbound frame into whichever
+        RMS window is currently active, and update frame-delivery timing.
+        """
+        sumsq, count = _sumsq_and_count(pcm)
+        if self._speaking:
+            self._speech_sumsq += sumsq
+            self._speech_count += count
+        else:
+            self._silence_sumsq += sumsq
+            self._silence_count += count
+
+        now = time.monotonic()
+        if self._last_frame_at is not None:
+            gap_ms = (now - self._last_frame_at) * 1000
+            self._frame_gap_max_ms = max(self._frame_gap_max_ms, gap_ms)
+        self._last_frame_at = now
+        self._frame_count += 1
+
+    def _log_audio_health(self) -> None:
+        """One INFO line per utterance: what the audio actually looked like,
+        from frames already decoded for Sarvam.
+
+        silence_rms covers the window since the PREVIOUS END_SPEECH (the
+        quiet stretch before this utterance); speech_rms covers the window
+        since the START_SPEECH that opened it. Correlate against
+        app/telephony/sarvam_bridge.py's [sarvam] transcript/turn-latency
+        lines by lead_id and timestamp to tell genuine background noise
+        (elevated silence_rms) apart from a connection/quality problem
+        (irregular frame_gap_max_ms) — see
+        docs/superpowers/specs/2026-08-07-audio-noise-diagnostics-design.md.
+        """
+        silence_rms = _rms(self._silence_sumsq, self._silence_count)
+        speech_rms = _rms(self._speech_sumsq, self._speech_count)
+        logger.info(
+            f"[sarvam-stt] lead={self._lead_id} audio health: "
+            f"silence_rms={silence_rms:.1f} speech_rms={speech_rms:.1f} "
+            f"frame_gap_max_ms={self._frame_gap_max_ms:.1f} "
+            f"frames={self._frame_count}"
+        )
+        self._silence_sumsq = 0
+        self._silence_count = 0
+        self._frame_gap_max_ms = 0.0
+        self._frame_count = 0
 
     async def events(self) -> AsyncIterator[STTEvent]:
         """Yield what the lead does until the socket ends or errors.
@@ -209,8 +269,13 @@ class SarvamSTT:
             elif etype == "events":
                 signal = data.get("signal_type")
                 if signal == "START_SPEECH":
+                    self._speaking = True
+                    self._speech_sumsq = 0
+                    self._speech_count = 0
                     yield STTEvent("speech_started")
                 elif signal == "END_SPEECH":
+                    self._speaking = False
+                    self._log_audio_health()
                     yield STTEvent("speech_ended")
             elif etype == "error":
                 logger.error(

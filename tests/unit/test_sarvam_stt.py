@@ -217,6 +217,63 @@ async def test_speech_start_and_end_are_surfaced(connected):
     assert kinds == ["speech_started", "speech_ended"]
 
 
+async def test_audio_health_is_logged_once_per_utterance(connected, caplog):
+    """One INFO line at END_SPEECH, correlating this utterance's noise floor
+    (before it started) against how loud the speech itself was — the whole
+    point being to tell genuine background noise apart from a connection
+    problem using real calls, not recorded audio (this project has none).
+    See docs/superpowers/specs/2026-08-07-audio-noise-diagnostics-design.md.
+    """
+    caplog.set_level("INFO")
+    connected(_FakeSTTWS([_vad("START_SPEECH"), _vad("END_SPEECH")]))
+
+    quiet = (0).to_bytes(2, "little", signed=True) * 80
+    loud = (12000).to_bytes(2, "little", signed=True) * 80
+    quiet_mulaw_b64 = base64.b64encode(ulaw.encode(quiet)).decode()
+    loud_mulaw_b64 = base64.b64encode(ulaw.encode(loud)).decode()
+
+    async with sarvam_stt.SarvamSTT(lead_id="lead-9") as stt:
+        await stt.send_audio(quiet_mulaw_b64)  # before START_SPEECH: silence window
+        events_iter = stt.events()
+        started = await events_iter.__anext__()
+        assert started.kind == "speech_started"
+        await stt.send_audio(loud_mulaw_b64)   # after START_SPEECH: speech window
+        ended = await events_iter.__anext__()
+        assert ended.kind == "speech_ended"
+
+    expected_silence = sarvam_stt._rms(*sarvam_stt._sumsq_and_count(ulaw.decode(
+        base64.b64decode(quiet_mulaw_b64))))
+    expected_speech = sarvam_stt._rms(*sarvam_stt._sumsq_and_count(ulaw.decode(
+        base64.b64decode(loud_mulaw_b64))))
+
+    lines = [r.message for r in caplog.records if "audio health" in r.message]
+    assert lines, "no audio-health line was logged for the utterance"
+    line = lines[0]
+    assert "lead=lead-9" in line
+    assert f"silence_rms={expected_silence:.1f}" in line
+    assert f"speech_rms={expected_speech:.1f}" in line
+    assert "frames=2" in line
+
+
+async def test_lead_id_defaults_to_empty_string(connected, caplog):
+    """The constructor's lead_id is optional so every other test in this
+    file (and every existing call site) keeps constructing SarvamSTT() with
+    no arguments."""
+    caplog.set_level("INFO")
+    connected(_FakeSTTWS([_vad("START_SPEECH"), _vad("END_SPEECH")]))
+
+    async with sarvam_stt.SarvamSTT() as stt:
+        async for event in stt.events():
+            if event.kind == "speech_ended":
+                break
+
+    lines = [r.message for r in caplog.records if "audio health" in r.message]
+    assert lines, "no audio-health line was logged"
+    assert "lead= audio health" in lines[0], (
+        f"expected an empty lead_id to render as 'lead= audio health', got: {lines[0]!r}"
+    )
+
+
 async def test_a_blank_transcript_is_not_surfaced(connected):
     """Sarvam emits empty transcripts for non-speech. Treating one as a turn
     would have the agent answer a cough."""
