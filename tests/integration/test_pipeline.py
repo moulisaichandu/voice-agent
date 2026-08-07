@@ -54,8 +54,14 @@ async def _isolate(request):
     await _clear()
     pool = await get_pool()
     await pool.execute("update campaigns set active = false")
-    yield
-    await _clear()
+    try:
+        yield
+    finally:
+        await _clear()
+        # Integration campaigns use a deliberately invalid fake agent. They
+        # must not remain active after a test run and block the real scheduler
+        # or readiness check in a shared development database.
+        await pool.execute("update campaigns set active = false where name like 'pipeline-%'")
 
 
 @pytest.fixture
@@ -87,7 +93,7 @@ def _patch_dial_path(monkeypatch):
     Placement is async now — Plivo's REST API over httpx — so the stand-in
     must be a coroutine function, not a plain callable.
     """
-    async def no_preflight_error(agent_id):
+    async def no_preflight_error(agent_id, language=None, **kwargs):
         return None
 
     monkeypatch.setattr(worker.preflight_module, "preflight", no_preflight_error)

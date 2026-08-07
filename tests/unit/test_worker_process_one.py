@@ -172,6 +172,7 @@ async def test_inactive_campaign_skips_without_dialling(mocks, monkeypatch):
 
     assert mocks.calls["mark_calling"] == []
     assert mocks.calls["create_call"] == []
+    assert mocks.calls["mark_result"] == [(mocks.lead.lead_id, "pending")]
 
 
 async def test_mark_calling_guard_rejection_skips_cleanly(mocks, monkeypatch):

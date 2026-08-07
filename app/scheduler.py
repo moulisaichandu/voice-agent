@@ -96,7 +96,27 @@ async def campaign_tick(campaign_id: UUID | None = None) -> int:
     queued = 0
     for lead in due:
         if await leads_db.mark_queued(lead.lead_id):
-            await worker.enqueue_lead(str(lead.lead_id))
+            try:
+                await worker.enqueue_lead(str(lead.lead_id))
+            except Exception:
+                # The DB transition and Redis enqueue cannot share a
+                # transaction. If Redis fails after mark_queued succeeds, a
+                # lead left queued is invisible to due_leads forever. Roll it
+                # back so the next tick can retry; a push that partially
+                # succeeded is harmless because worker.mark_calling() guards
+                # against duplicate dialing.
+                logger.exception(
+                    f"[scheduler] could not enqueue lead {lead.lead_id}; "
+                    "returning it to pending for retry"
+                )
+                try:
+                    await leads_db.mark_result(lead.lead_id, "pending")
+                except Exception:
+                    logger.exception(
+                        f"[scheduler] could not roll back queued lead "
+                        f"{lead.lead_id} after Redis enqueue failure"
+                    )
+                continue
             queued += 1
     return queued
 
@@ -131,10 +151,20 @@ async def dnd_refresh() -> None:
     `leads.dnd = true` flags already recorded in Supabase (e.g. from a lead
     explicitly asking not to be called again) into Redis for the worker's
     O(1) dial-time check."""
-    phones = await leads_db.dnd_phones()
+    phone_list = await leads_db.dnd_phones()
+    phones = set(phone_list)
     r = redis_client.get_redis()
-    if phones:
-        await r.sadd(worker.DND_SET_KEY, *phones)
+    # This is a real sync, not an append-only cache fill. A number can be
+    # cleared in the database by an operator or a corrected import; retaining
+    # it in Redis would make the dial-time SISMEMBER gate block that person
+    # forever. Remove stale members first, then add current ones. The worker's
+    # immediate mark_dnd() path still closes the opt-out window between runs.
+    existing = set(await r.smembers(worker.DND_SET_KEY))
+    stale = existing - phones
+    if stale:
+        await r.srem(worker.DND_SET_KEY, *stale)
+    if phone_list:
+        await r.sadd(worker.DND_SET_KEY, *phone_list)
 
 
 async def sheets_sync() -> None:

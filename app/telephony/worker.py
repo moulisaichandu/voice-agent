@@ -291,10 +291,15 @@ async def process_one(lead_id: str) -> None:
 
         if lead.campaign_id is None:
             logger.warning(f"[worker] lead {lead_id} has no campaign — skipping")
+            await leads_db.mark_result(lead.lead_id, "pending")
             return
         campaign = await campaigns_db.get_campaign(lead.campaign_id)
         if campaign is None or not campaign.active:
-            logger.warning(f"[worker] lead {lead_id}: campaign missing/inactive — skipping")
+            logger.warning(
+                f"[worker] lead {lead_id}: campaign missing/inactive — returning "
+                "to pending rather than stranding it in queued"
+            )
+            await leads_db.mark_result(lead.lead_id, "pending")
             return
 
         # Calling hours, re-checked HERE and not only in campaign_tick.

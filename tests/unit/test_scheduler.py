@@ -74,6 +74,32 @@ async def test_campaign_tick_does_not_enqueue_a_lead_whose_queue_guard_rejects(m
     assert enqueued == []
 
 
+async def test_campaign_tick_rolls_back_when_redis_enqueue_fails(monkeypatch):
+    monkeypatch.setattr(scheduler, "within_calling_hours", lambda: True)
+    lead = SimpleNamespace(lead_id=uuid4())
+    rolled_back = []
+
+    async def fake_due_leads(limit, campaign_id=None):
+        return [lead]
+
+    async def mark_queued(lead_id):
+        return True
+
+    async def fail_enqueue(lead_id):
+        raise ConnectionError("redis unavailable")
+
+    async def mark_result(lead_id, status):
+        rolled_back.append((lead_id, status))
+
+    monkeypatch.setattr(scheduler.leads_db, "due_leads", fake_due_leads)
+    monkeypatch.setattr(scheduler.leads_db, "mark_queued", mark_queued)
+    monkeypatch.setattr(scheduler.worker, "enqueue_lead", fail_enqueue)
+    monkeypatch.setattr(scheduler.leads_db, "mark_result", mark_result)
+
+    assert await scheduler.campaign_tick() == 0
+    assert rolled_back == [(lead.lead_id, "pending")]
+
+
 async def test_campaign_tick_passes_the_scope_through_to_due_leads(monkeypatch):
     """Scoping must reach the QUERY, not be applied afterwards — filtering a
     global result set would still have queued other campaigns' leads on the
@@ -126,6 +152,9 @@ async def test_dnd_refresh_syncs_flagged_phones_into_redis(monkeypatch):
     sadd_calls = []
 
     class _FakeRedis:
+        async def smembers(self, key):
+            return set()
+
         async def sadd(self, key, *values):
             sadd_calls.append((key, values))
 
@@ -145,14 +174,45 @@ async def test_dnd_refresh_is_a_noop_with_no_flagged_leads(monkeypatch):
     sadd_calls = []
 
     class _FakeRedis:
+        async def smembers(self, key):
+            return set()
+
         async def sadd(self, key, *values):
             sadd_calls.append((key, values))
+
+        async def srem(self, key, *values):
+            raise AssertionError("there are no stale members to remove")
 
     monkeypatch.setattr(scheduler.leads_db, "dnd_phones", fake_dnd_phones)
     monkeypatch.setattr(scheduler.redis_client, "get_redis", lambda: _FakeRedis())
 
     await scheduler.dnd_refresh()
     assert sadd_calls == []
+
+
+async def test_dnd_refresh_removes_numbers_cleared_in_the_database(monkeypatch):
+    async def fake_dnd_phones():
+        return ["+919876543210"]
+
+    removed, added = [], []
+
+    class _FakeRedis:
+        async def smembers(self, key):
+            return {"+919876543210", "+919812345678"}
+
+        async def srem(self, key, *values):
+            removed.append((key, values))
+
+        async def sadd(self, key, *values):
+            added.append((key, values))
+
+    monkeypatch.setattr(scheduler.leads_db, "dnd_phones", fake_dnd_phones)
+    monkeypatch.setattr(scheduler.redis_client, "get_redis", lambda: _FakeRedis())
+
+    await scheduler.dnd_refresh()
+
+    assert removed == [(scheduler.worker.DND_SET_KEY, ("+919812345678",))]
+    assert added == [(scheduler.worker.DND_SET_KEY, ("+919876543210",))]
 
 
 _WB_QUEUE = "sheets:writeback:queue"
