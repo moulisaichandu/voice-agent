@@ -28,6 +28,7 @@ from app.config import (
     ALLOWED_ORIGINS,
     APP_AUTH_TOKEN,
     CALL_WEBHOOK_SECRET,
+    CONVERSATION_LLM_PROVIDER,
     DATABASE_URL,
     ELEVENLABS_WEBHOOK_SECRET,
     LOG_LEVEL,
@@ -36,7 +37,7 @@ from app.config import (
     SCHEDULER_ENABLED,
     WORKER_ENABLED,
 )
-from app.telephony import worker
+from app.telephony import conversation_llm, worker
 
 setup_logging(LOG_LEVEL)
 
@@ -125,6 +126,23 @@ async def lifespan(app: FastAPI):
             "wildcard origin."
         )
 
+    # Not fail-fast: a one-way campaign never calls conversation_llm, so this is
+    # not always wrong. But a TWO-WAY Sarvam call answered by 'sarvam' fails
+    # almost silently — see app/telephony/preflight.py's dial-time refusal for
+    # the load-bearing check and the 21.8s measurement it's based on. This is
+    # the same misconfiguration surfaced where an operator is more likely to
+    # notice it before dialling anything.
+    if CONVERSATION_LLM_PROVIDER == conversation_llm.SARVAM:
+        logger.warning(
+            "[startup] CONVERSATION_LLM_PROVIDER=sarvam — Sarvam's chat models "
+            "are reasoning models measured at 21.8s on a real conversational "
+            "turn and cannot be told to stop reasoning. A two-way Sarvam call "
+            "will time out on most turns and the lead will hear silence. "
+            "preflight refuses to dial a two-way Sarvam campaign in this "
+            "configuration; set CONVERSATION_LLM_PROVIDER=openai unless this is "
+            "deliberate."
+        )
+
     # Redis unreachable at startup must NOT crash the app — health/RAG/Sheets-sync
     # can still function. The calling path (campaign_tick / worker) checks Redis
     # itself and hard-refuses to enqueue rather than silently losing leads.
@@ -192,6 +210,10 @@ async def lifespan(app: FastAPI):
             logger.exception("[shutdown] call worker had already failed.")
     scheduler.shutdown()
     await redis_client.close()
+    # The two-way conversation brain holds one keepalived connection to the
+    # completions API for the life of the process (conversation_llm._get_client)
+    # — close it rather than leaving the pool to be reaped.
+    await conversation_llm.aclose()
 
 
 app = FastAPI(

@@ -25,6 +25,8 @@ import httpx
 from app import languages as languages_module
 from app.config import (
     CALL_WEBHOOK_SECRET,
+    CONVERSATION_LLM_PROVIDER,
+    CONVERSATION_LLM_TIMEOUT_S,
     ELEVENLABS_API_KEY,
     ELEVENLABS_VOICE_ID,
     OPENAI_API_KEY,
@@ -34,6 +36,7 @@ from app.config import (
     PUBLIC_BASE_URL,
     SARVAM_API_KEY,
 )
+from app.telephony import conversation_llm
 from app.telephony.elevenlabs_client import agent_exists, agent_language_support
 
 _HEALTH_CHECK_TIMEOUT_S = 10.0
@@ -179,6 +182,27 @@ async def preflight(
                 "https://dashboard.sarvam.ai and set it in .env. To fall back "
                 "to the previous backend instead, set "
                 "TELUGU_BACKEND=openai_realtime."
+            )
+        # A two-way call on this backend is answered by conversation_llm.turn(),
+        # not by Sarvam's own chat models — see conversation_llm.py's docstring.
+        # Sarvam's are reasoning models measured at 21.8s on a real turn and
+        # cannot be told to stop reasoning, so pointing CONVERSATION_LLM_PROVIDER
+        # at 'sarvam' does not make the agent slow, it makes it silent: most
+        # turns exceed CONVERSATION_LLM_TIMEOUT_S, raise TurnFailed, and are
+        # swallowed by sarvam_bridge._reply's catch-all — the lead hears
+        # nothing, and the call is still graded a clean exit. Same discipline
+        # as the twoway-flag gate above: a config combination that is known not
+        # to work must refuse to dial, not degrade into a silent call.
+        if mode == "twoway" and CONVERSATION_LLM_PROVIDER == conversation_llm.SARVAM:
+            return (
+                f"This campaign dials in '{language}' as a two-way call. "
+                "CONVERSATION_LLM_PROVIDER is set to 'sarvam', but Sarvam's "
+                "chat models are reasoning models measured at 21.8s on a real "
+                f"conversational turn, against a "
+                f"{CONVERSATION_LLM_TIMEOUT_S:.0f}s CONVERSATION_LLM_TIMEOUT_S — "
+                "most turns would time out and the lead would hear silence, not "
+                "a slow reply. Set CONVERSATION_LLM_PROVIDER=openai in .env (or "
+                "remove the line; that is already the default) and restart."
             )
         return None
     if call_backend == languages_module.OPENAI_REALTIME:

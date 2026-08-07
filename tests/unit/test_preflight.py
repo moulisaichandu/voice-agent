@@ -52,6 +52,10 @@ def _configured(monkeypatch, **overrides):
         # pinning this a real .env value would change what preflight checks
         # depending on whose machine runs the suite. Voice tests set it.
         "ELEVENLABS_VOICE_ID": None,
+        # Same reason: whichever machine runs this suite may have
+        # CONVERSATION_LLM_PROVIDER=sarvam in its own .env, which would trip
+        # the new twoway/Sarvam guard below in every unrelated test.
+        "CONVERSATION_LLM_PROVIDER": "openai",
     }
     values.update(overrides)
     for name, value in values.items():
@@ -553,3 +557,55 @@ async def test_the_twoway_guard_needs_no_mode_argument_to_keep_working(monkeypat
     _configured(monkeypatch)
     monkeypatch.setattr(pf, "SARVAM_API_KEY", "sk-test")
     assert await pf.preflight("agent_1", "te") is None
+
+
+# ── CONVERSATION_LLM_PROVIDER=sarvam cannot answer a two-way Sarvam call ─────
+#
+# Sarvam's chat models are reasoning models measured at 21.8s on a real
+# conversational turn (conversation_llm.py's own docstring) and the reasoning
+# cannot be turned off. Against CONVERSATION_LLM_TIMEOUT_S (12s by default)
+# that is not a slow agent, it is TurnFailed on nearly every turn, swallowed
+# by sarvam_bridge._reply's catch-all — the lead hears silence, and the call
+# is still graded a clean exit. The danger was already documented in three
+# places (config.py, conversation_llm.py, CLAUDE.md) and enforced in none.
+
+async def test_a_twoway_sarvam_campaign_is_refused_when_the_llm_is_also_sarvam(
+    monkeypatch,
+):
+    _configured(monkeypatch)
+    _telugu_backend(monkeypatch, "sarvam")
+    _set_twoway(monkeypatch, "sarvam", True)
+    monkeypatch.setattr(pf, "CONVERSATION_LLM_PROVIDER", "sarvam")
+    reason = await pf.preflight("agent_1", "te", mode="twoway")
+    assert reason is not None
+    assert "CONVERSATION_LLM_PROVIDER" in reason
+    assert "openai" in reason
+
+
+async def test_a_twoway_sarvam_campaign_dials_when_the_llm_is_openai(monkeypatch):
+    _configured(monkeypatch)
+    _telugu_backend(monkeypatch, "sarvam")
+    _set_twoway(monkeypatch, "sarvam", True)
+    monkeypatch.setattr(pf, "CONVERSATION_LLM_PROVIDER", "openai")
+    assert await pf.preflight("agent_1", "te", mode="twoway") is None
+
+
+async def test_a_oneway_sarvam_campaign_is_never_refused_by_this_guard(monkeypatch):
+    """One-way never calls conversation_llm at all, so it must not gain a new
+    way to not dial."""
+    _configured(monkeypatch)
+    _telugu_backend(monkeypatch, "sarvam")
+    monkeypatch.setattr(pf, "CONVERSATION_LLM_PROVIDER", "sarvam")
+    assert await pf.preflight("agent_1", "te", mode="oneway") is None
+
+
+async def test_a_twoway_openai_realtime_campaign_is_unaffected_by_this_guard(
+    monkeypatch,
+):
+    """OPENAI_REALTIME never calls conversation_llm either — it carries its
+    own turn entirely on the Realtime session. This guard is Sarvam-specific."""
+    _configured(monkeypatch)
+    _telugu_backend(monkeypatch, "openai_realtime")
+    _set_twoway(monkeypatch, "openai_realtime", True)
+    monkeypatch.setattr(pf, "CONVERSATION_LLM_PROVIDER", "sarvam")
+    assert await pf.preflight("agent_1", "te", mode="twoway") is None
