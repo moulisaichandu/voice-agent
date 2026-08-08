@@ -406,9 +406,12 @@ class _Conversation:
                         # Only meaningful once THIS response has already
                         # started playing — the delay before the very first
                         # frame is normal startup latency, already captured
-                        # by _log_turn_latency's tts= figure, not a gap.
+                        # by _log_turn_latency's tts= figure, not a gap. The
+                        # play_end > 0.0 guard is the sentinel PlivoCall uses
+                        # for "nothing queued yet" (see its field comment) —
+                        # never a real gap, so it must not read as one.
                         now = self._loop.time()
-                        if now > self.call.play_end:
+                        if self.call.play_end > 0.0 and now > self.call.play_end:
                             gap_ms = (now - self.call.play_end) * 1000
                             gap_total_ms += gap_ms
                             gap_max_ms = max(gap_max_ms, gap_ms)

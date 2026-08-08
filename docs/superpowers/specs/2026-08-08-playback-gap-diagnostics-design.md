@@ -123,8 +123,12 @@ hypothesis, not an automated threshold.
   frequently outruns real time).
 - A test confirming the line is NOT logged when `say()` returns before
   playing any frame (e.g., interrupted before the first frame, or empty
-  text) — mirrors `_log_turn_latency`'s existing "nobody was waiting, no
-  log" guard.
+  text). This is a DIFFERENT guard from `_log_turn_latency`'s, not the same
+  one: `_log_turn_latency` still logs an unanswered turn (with
+  `" NOTHING SPOKEN"` appended) — its early return only covers the case
+  where nobody was waiting on an answer at all. `_log_playback_gaps` is
+  called only when `spoke_a_frame` is `True`, i.e. something was actually
+  played, which is the unrelated condition this test checks.
 - `pytest -q -m "not integration"` and `ruff check .` for the full suite.
 - Manual: place another real two-way Sarvam call and read the new
   `[sarvam] ... playback gaps: ...` lines back against what was actually
