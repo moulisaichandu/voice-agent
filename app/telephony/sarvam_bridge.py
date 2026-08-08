@@ -326,6 +326,31 @@ class _Conversation:
         self._turn_tool_s = 0.0
         self._turn_llm_rounds = 0
 
+    def _log_playback_gaps(self, gap_total_ms: float, gap_max_ms: float,
+                           sentences: int) -> None:
+        """One INFO line per spoken turn: how much dead air, if any, the lead
+        heard IN THE MIDDLE of this response.
+
+        self.call.play_end is the wall-clock time Plivo's queued audio will
+        finish playing, already maintained by PlivoCall.play() for every
+        backend. If a later frame arrives after play_end has passed, the
+        queue had already drained — dead air between whatever played last
+        and this new chunk. say() accumulates that across the whole
+        response and logs it here regardless of how the response ended, as
+        long as at least one frame was actually played.
+
+        A turn with zero gaps still logs (total=0.0ms) — the point is a
+        dataset across many real calls, the same reasoning
+        app/telephony/sarvam_stt.py's _log_audio_health uses for the
+        inbound side. See
+        docs/superpowers/specs/2026-08-08-playback-gap-diagnostics-design.md.
+        """
+        logger.info(
+            f"[sarvam] lead={self.lead_id} playback gaps: "
+            f"total={gap_total_ms:.1f}ms max={gap_max_ms:.1f}ms "
+            f"sentences={sentences}"
+        )
+
     # ── speaking ─────────────────────────────────────────────────────────────
 
     async def say(self, tts: sarvam_tts.SarvamTTS, text: str) -> None:
@@ -351,6 +376,12 @@ class _Conversation:
 
         self._turn_say_started = self._loop.time()
         spoke_a_frame = False
+        # Dead air detected IN THE MIDDLE of this response — see
+        # _log_playback_gaps for what these mean and why they're measured
+        # this way.
+        gap_total_ms = 0.0
+        gap_max_ms = 0.0
+        sentences_started = 0
 
         async def reset_tts_after_cancel() -> None:
             # The production SarvamTTS exposes this hook. Keep the bridge
@@ -365,11 +396,22 @@ class _Conversation:
                 if self.generation != generation or self.call.stop.is_set():
                     await reset_tts_after_cancel()
                     return
+                sentences_started += 1
                 spoken_ms = 0
                 async for payload, duration_ms in tts.speak(sentence):
                     if self.generation != generation or self.call.stop.is_set():
                         await reset_tts_after_cancel()
                         return
+                    if spoke_a_frame:
+                        # Only meaningful once THIS response has already
+                        # started playing — the delay before the very first
+                        # frame is normal startup latency, already captured
+                        # by _log_turn_latency's tts= figure, not a gap.
+                        now = self._loop.time()
+                        if now > self.call.play_end:
+                            gap_ms = (now - self.call.play_end) * 1000
+                            gap_total_ms += gap_ms
+                            gap_max_ms = max(gap_max_ms, gap_ms)
                     await self.call.play(payload)
                     if not spoke_a_frame:
                         # The lead's wait ends HERE, at the first frame — not
@@ -385,6 +427,12 @@ class _Conversation:
             # the async generator may not receive that cancellation itself.
             await reset_tts_after_cancel()
             raise
+        finally:
+            # Runs whether the response finished, was interrupted, or was
+            # cancelled — as long as something was actually played, there is
+            # something to report.
+            if spoke_a_frame:
+                self._log_playback_gaps(gap_total_ms, gap_max_ms, sentences_started)
 
     async def deliver_opening(self, tts: sarvam_tts.SarvamTTS,
                               opening: str) -> None:

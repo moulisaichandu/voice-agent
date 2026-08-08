@@ -14,6 +14,7 @@ it quietly mis-grades real calls and burns real retries.
 import asyncio
 import base64
 import json
+import re
 
 import pytest
 
@@ -673,6 +674,94 @@ async def test_barge_in_forgets_what_the_lead_never_heard():
         "the history still claims a sentence the lead never heard"
     )
     assert all("Two." not in t.text for t in turns)
+
+
+# ── playback gaps: dead air in the middle of the agent's own reply ──────────
+#
+# say() synthesizes one sentence at a time, sequentially — each is a fresh
+# WebSocket round trip to Sarvam. If a short sentence's synthesis takes
+# longer than its predecessor took to actually play out on the phone line,
+# Plivo's queue drains before the next chunk arrives: dead air mid-reply.
+# PlivoCall already tracks play_end (when queued audio finishes playing);
+# these tests prove say() actually reads it. See
+# docs/superpowers/specs/2026-08-08-playback-gap-diagnostics-design.md.
+
+async def test_a_playback_gap_mid_response_is_logged(caplog):
+    """A frame arriving well after the previous one finished playing is a
+    real gap the lead heard, and it must show up in the logged total."""
+    caplog.set_level("INFO")
+    call = sarvam_bridge.plivo_stream.PlivoCall(
+        _FakePlivoWS(), lead_id="gap-test", one_way=False, protect_opening=False)
+    turns = []
+    convo = sarvam_bridge._Conversation(
+        call, lead_id="gap-test", system_prompt="s", turns=turns)
+
+    class _GappyTTS:
+        async def speak(self, text):
+            yield _FRAME, 20
+            await asyncio.sleep(0.1)  # far longer than _FRAME's ~20ms play-out
+            yield _FRAME, 20
+
+    # No sentence-ending punctuation, so _split_sentences keeps this as ONE
+    # sentence — one call to speak(), isolating exactly the gap under test.
+    await convo.say(_GappyTTS(), "hello there")
+
+    lines = [r.message for r in caplog.records if "playback gaps" in r.message]
+    assert lines, "no playback-gap line was logged"
+    assert "lead=gap-test" in lines[0]
+    assert "sentences=1" in lines[0]
+    match = re.search(r"total=(\d+\.\d+)ms", lines[0])
+    assert match, f"couldn't parse total from: {lines[0]}"
+    assert float(match.group(1)) > 50, f"expected a gap of at least 50ms: {lines[0]}"
+
+
+async def test_fast_delivery_logs_zero_gap(caplog):
+    """Frames arriving well within the previous frame's play-out window —
+    the common case tonight's real calls already showed — must not be
+    reported as a gap."""
+    caplog.set_level("INFO")
+    call = sarvam_bridge.plivo_stream.PlivoCall(
+        _FakePlivoWS(), lead_id="fast-test", one_way=False, protect_opening=False)
+    turns = []
+    convo = sarvam_bridge._Conversation(
+        call, lead_id="fast-test", system_prompt="s", turns=turns)
+
+    class _FastTTS:
+        async def speak(self, text):
+            yield _FRAME, 20
+            yield _FRAME, 20
+            yield _FRAME, 20
+
+    await convo.say(_FastTTS(), "hello there")
+
+    lines = [r.message for r in caplog.records if "playback gaps" in r.message]
+    assert lines, "no playback-gap line was logged"
+    assert "total=0.0ms max=0.0ms" in lines[0], (
+        f"fast delivery must not read as a gap: {lines[0]}"
+    )
+    assert "sentences=1" in lines[0]
+
+
+async def test_no_gap_line_when_nothing_was_spoken(caplog):
+    """A TTS response that produces no audio frames at all (e.g. Sarvam
+    returned an error before any audio chunk) has nothing to report — same
+    guard _log_turn_latency already uses for an unanswered turn."""
+    caplog.set_level("INFO")
+    call = sarvam_bridge.plivo_stream.PlivoCall(
+        _FakePlivoWS(), lead_id="silent-test", one_way=False, protect_opening=False)
+    turns = []
+    convo = sarvam_bridge._Conversation(
+        call, lead_id="silent-test", system_prompt="s", turns=turns)
+
+    class _SilentTTS:
+        async def speak(self, text):
+            return
+            yield  # pragma: no cover - makes this an async generator
+
+    await convo.say(_SilentTTS(), "hello there")
+
+    lines = [r.message for r in caplog.records if "playback gaps" in r.message]
+    assert not lines, f"a gap line was logged for a turn that never spoke: {lines}"
 
 
 # ── the gate ─────────────────────────────────────────────────────────────────
