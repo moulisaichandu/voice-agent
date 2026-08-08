@@ -742,10 +742,83 @@ async def test_fast_delivery_logs_zero_gap(caplog):
     assert "sentences=1" in lines[0]
 
 
+async def test_gaps_accumulate_across_sentence_boundaries(caplog):
+    """THE actual production hypothesis this feature exists to investigate:
+    a gap occurring BETWEEN sentences, where each sentence is its own fresh
+    synthesis round trip to Sarvam. Both tests above use text with no
+    sentence-ending punctuation, so _split_sentences keeps it as ONE
+    sentence and only one speak() call ever happens — neither exercises
+    that at all.
+
+    Pins the two things a manual read of the code confirmed but no test
+    asserted: `total` accumulates across sentence boundaries, and `max`
+    tracks the single largest gap rather than their sum.
+    """
+    caplog.set_level("INFO")
+    call = sarvam_bridge.plivo_stream.PlivoCall(
+        _FakePlivoWS(), lead_id="multi-test", one_way=False, protect_opening=False)
+    turns = []
+    convo = sarvam_bridge._Conversation(
+        call, lead_id="multi-test", system_prompt="s", turns=turns)
+
+    class _StaggeredTTS:
+        """One frame per sentence. The 1st call never stalls — the very
+        first frame overall is never counted as a gap (see say()'s
+        spoke_a_frame gate), so delaying it would prove nothing. The 2nd
+        and 3rd calls stall by different amounts, so a gap can be pinned to
+        a specific sentence rather than an aggregate."""
+
+        def __init__(self, delays_s):
+            self._delays = list(delays_s)
+            self.calls = 0
+
+        async def speak(self, text):
+            self.calls += 1
+            if self.calls > 1:
+                await asyncio.sleep(self._delays[self.calls - 2])
+            yield _FRAME, 20
+
+    await convo.say(_StaggeredTTS([0.3, 0.1]), "One. Two. Three.")
+
+    lines = [r.message for r in caplog.records if "playback gaps" in r.message]
+    assert lines, "no playback-gap line was logged"
+    assert "lead=multi-test" in lines[0]
+    assert "sentences=3" in lines[0], "all three sentences must be attempted"
+
+    total_match = re.search(r"total=(\d+\.\d+)ms", lines[0])
+    max_match = re.search(r"max=(\d+\.\d+)ms", lines[0])
+    assert total_match and max_match, f"couldn't parse gaps from: {lines[0]}"
+    total_ms = float(total_match.group(1))
+    max_ms = float(max_match.group(1))
+
+    # The two stalls (300ms, 100ms) inject ~400ms of dead air between them.
+    # Each measured gap runs a little under its stall (play_end was already
+    # a little ahead when the stall began) and real scheduling adds some
+    # jitter either way, so use thresholds with headroom rather than an
+    # exact match.
+    assert total_ms > 200, (
+        f"total must accumulate BOTH gaps, not just the larger one: {lines[0]}"
+    )
+    # If max were computed as the sum instead of the largest single gap, it
+    # would land near total_ms (~350-400ms). Pinning it well under that, and
+    # comfortably above what the 100ms stall alone could produce (~80ms), is
+    # what actually proves max() over +=.
+    assert 150 < max_ms < 340, (
+        f"max must track the single larger gap (~300ms), not the sum of "
+        f"both (~400ms) nor the smaller gap alone (~80ms): {lines[0]}"
+    )
+
+
 async def test_no_gap_line_when_nothing_was_spoken(caplog):
     """A TTS response that produces no audio frames at all (e.g. Sarvam
-    returned an error before any audio chunk) has nothing to report — same
-    guard _log_turn_latency already uses for an unanswered turn."""
+    returned an error before any audio chunk) has nothing to report.
+
+    A different guard from _log_turn_latency's, not the same one:
+    _log_turn_latency still logs an unanswered turn (with " NOTHING SPOKEN"
+    appended) — its early return is only for when nobody was waiting on an
+    answer at all. _log_playback_gaps is called only when spoke_a_frame is
+    True, i.e. something was actually played, which is what this test
+    checks."""
     caplog.set_level("INFO")
     call = sarvam_bridge.plivo_stream.PlivoCall(
         _FakePlivoWS(), lead_id="silent-test", one_way=False, protect_opening=False)
