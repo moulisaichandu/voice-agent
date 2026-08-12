@@ -221,6 +221,45 @@ async def test_an_error_frame_stops_the_stream_rather_than_hanging(connected):
     assert chunks == []
 
 
+async def test_an_insufficient_credits_error_trips_the_circuit_breaker(
+    connected, monkeypatch
+):
+    """The same signal from the TTS leg — an account can run out of credits
+    mid-synthesis just as easily as at STT."""
+    tripped = {}
+
+    async def fake_trip(reason):
+        tripped["reason"] = reason
+
+    monkeypatch.setattr(sarvam_tts.sarvam_circuit_breaker, "trip", fake_trip)
+    connected(_FakeSarvamWS([json.dumps(
+        {"type": "error", "data": {"message": "Insufficient credits", "code": 402}}
+    )]))
+
+    async with sarvam_tts.SarvamTTS(language="te-IN") as tts:
+        chunks = await asyncio.wait_for(tts.collect("ఒకటి"), timeout=5)
+
+    assert chunks == []
+    assert tripped["reason"] == "Insufficient credits"
+
+
+async def test_an_unrelated_error_does_not_trip_the_circuit_breaker(
+    connected, monkeypatch
+):
+    async def must_not_be_called(reason):
+        raise AssertionError("an unrelated error must not trip the breaker")
+
+    monkeypatch.setattr(sarvam_tts.sarvam_circuit_breaker, "trip", must_not_be_called)
+    connected(_FakeSarvamWS([json.dumps(
+        {"type": "error", "data": {"message": "invalid speaker", "code": 400}}
+    )]))
+
+    async with sarvam_tts.SarvamTTS(language="te-IN") as tts:
+        chunks = await asyncio.wait_for(tts.collect("ఒకటి"), timeout=5)
+
+    assert chunks == []
+
+
 async def test_blank_text_never_opens_a_turn(connected):
     """An empty render must not send an empty text frame and then wait for
     audio Sarvam has no reason to produce."""

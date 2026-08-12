@@ -16,7 +16,7 @@ Wire protocol (docs.sarvam.ai, verified 2026-07-27):
                         "sample_rate": "8000"}}
     <-       {"type": "data",   "data": {"transcript": "...", ...}}
     <-       {"type": "events", "data": {"signal_type": "START_SPEECH"|"END_SPEECH"}}
-    <-       {"type": "error",  "data": {"error": "...", "code": "..."}}
+    <-       {"type": "error",  "data": {"message": "...", "code": "..."}}
 
 TWO THINGS HERE ARE LOAD-BEARING.
 
@@ -53,7 +53,7 @@ from app.config import (
     SARVAM_STT_MODEL,
     SARVAM_VAD_HIGH_SENSITIVITY,
 )
-from app.telephony import ulaw
+from app.telephony import sarvam_circuit_breaker, ulaw
 
 logger = logging.getLogger(__name__)
 
@@ -303,8 +303,20 @@ class SarvamSTT:
                     self._log_audio_health()
                     yield STTEvent("speech_ended")
             elif etype == "error":
+                # 'message', not 'error'. Sarvam populates the former, so the
+                # old key always missed and this fell through to dumping the
+                # raw event dict. That was not merely untidy: the credits
+                # check below reads this same value, so with the wrong key it
+                # could never have fired whatever Sarvam sent.
+                message = data.get("message") or event
                 logger.error(
                     f"[sarvam-stt] refused to transcribe: "
-                    f"{data.get('error') or event} (code={data.get('code')})"
+                    f"{message} (code={data.get('code')})"
                 )
+                # isinstance guard: message falls back to `event`, a dict, when
+                # the frame carries no 'message' — .lower() on that would raise
+                # inside the error handler and turn a reported failure into an
+                # unreported one.
+                if isinstance(message, str) and "insufficient credit" in message.lower():
+                    await sarvam_circuit_breaker.trip(message)
                 return

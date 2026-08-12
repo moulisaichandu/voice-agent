@@ -48,6 +48,7 @@ from app.config import (
     SARVAM_TTS_PACE,
     SARVAM_TTS_SPEAKER,
 )
+from app.telephony import sarvam_circuit_breaker
 
 logger = logging.getLogger(__name__)
 
@@ -216,10 +217,15 @@ class SarvamTTS:
                 elif etype == "event" and data.get("event_type") == "final":
                     return
                 elif etype == "error":
+                    message = data.get("message") or event
                     logger.error(
                         f"[sarvam-tts] refused to synthesise: "
-                        f"{data.get('message') or event} (code={data.get('code')})"
+                        f"{message} (code={data.get('code')})"
                     )
+                    # An account can run out of credits mid-synthesis just as
+                    # easily as at STT. See the identical guard in sarvam_stt.
+                    if isinstance(message, str) and "insufficient credit" in message.lower():
+                        await sarvam_circuit_breaker.trip(message)
                     return
         except asyncio.CancelledError:
             await self._reset_connection()

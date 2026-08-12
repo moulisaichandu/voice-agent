@@ -457,10 +457,93 @@ async def test_a_blank_transcript_is_not_surfaced(connected):
 
 async def test_an_error_frame_ends_the_stream_rather_than_hanging(connected):
     """Same reasoning as the TTS client: a rejected connection otherwise looks
-    exactly like a lead who never speaks, and costs the full call duration."""
+    exactly like a lead who never speaks, and costs the full call duration.
+
+    The fixture says "message", not "error", because that is the key Sarvam
+    actually populates — confirmed live:
+    {'type': 'error', 'data': {'message': 'Insufficient credits'}}."""
     connected(_FakeSTTWS([json.dumps(
-        {"type": "error", "data": {"error": "bad language", "code": "400"}}
+        {"type": "error", "data": {"message": "bad language", "code": "400"}}
     )]))
+
+    async with sarvam_stt.SarvamSTT() as stt:
+        events = [e async for e in stt.events()]
+
+    assert events == []
+
+
+async def test_the_error_message_itself_is_logged_not_the_raw_frame(connected, caplog):
+    """REGRESSION. The handler read data['error'], a key Sarvam never sends,
+    so it fell through to dumping the whole event dict — seen live as
+    "refused to transcribe: {'type': 'error', 'data': {...}} (code=None)".
+
+    Cosmetic on its own, and NOT cosmetic here: the insufficient-credits
+    substring match below runs on this same extracted message, so with the
+    wrong key it could never have fired no matter what Sarvam sent."""
+    connected(_FakeSTTWS([json.dumps(
+        {"type": "error", "data": {"message": "bad language", "code": "400"}}
+    )]))
+
+    with caplog.at_level("ERROR"):
+        async with sarvam_stt.SarvamSTT() as stt:
+            [e async for e in stt.events()]
+
+    assert "bad language" in caplog.text
+    assert "'type': 'error'" not in caplog.text, "logged the raw frame, not the message"
+
+
+async def test_an_insufficient_credits_error_trips_the_circuit_breaker(
+    connected, monkeypatch
+):
+    """The exact signal observed live: Sarvam's STT reports the account is out
+    of credits and the stream dies. Every later call on this backend fails the
+    same way until an admin clears the breaker, so it must stop dialling."""
+    tripped = {}
+
+    async def fake_trip(reason):
+        tripped["reason"] = reason
+
+    monkeypatch.setattr(sarvam_stt.sarvam_circuit_breaker, "trip", fake_trip)
+    connected(_FakeSTTWS([json.dumps(
+        {"type": "error", "data": {"message": "Insufficient credits", "code": "402"}}
+    )]))
+
+    async with sarvam_stt.SarvamSTT() as stt:
+        events = [e async for e in stt.events()]
+
+    assert events == []
+    assert tripped["reason"] == "Insufficient credits"
+
+
+async def test_an_unrelated_error_does_not_trip_the_circuit_breaker(
+    connected, monkeypatch
+):
+    """Scoped on purpose. Tripping on any error would halt every Sarvam
+    campaign over an ordinary transient blip — a call that would have
+    succeeded on the next attempt."""
+    async def must_not_be_called(reason):
+        raise AssertionError("an unrelated error must not trip the breaker")
+
+    monkeypatch.setattr(sarvam_stt.sarvam_circuit_breaker, "trip", must_not_be_called)
+    connected(_FakeSTTWS([json.dumps(
+        {"type": "error", "data": {"message": "bad language", "code": "400"}}
+    )]))
+
+    async with sarvam_stt.SarvamSTT() as stt:
+        events = [e async for e in stt.events()]
+
+    assert events == []
+
+
+async def test_an_error_frame_with_no_message_does_not_crash(connected, monkeypatch):
+    """message falls back to the whole event dict when Sarvam sends no
+    'message' key. Calling .lower() on a dict would raise inside the error
+    handler — turning a reported failure into an unreported one."""
+    async def fake_trip(reason):
+        raise AssertionError("a frame with no message cannot be a credits failure")
+
+    monkeypatch.setattr(sarvam_stt.sarvam_circuit_breaker, "trip", fake_trip)
+    connected(_FakeSTTWS([json.dumps({"type": "error", "data": {}})]))
 
     async with sarvam_stt.SarvamSTT() as stt:
         events = [e async for e in stt.events()]
