@@ -717,3 +717,31 @@ def test_sheets_status_does_not_500_on_malformed_cache(client, monkeypatch):
 
     assert r.status_code == 200
     assert "malformed" in r.json()["last_error"]
+
+
+async def test_billing_check_reuses_a_cache_warmed_by_elevenlabs_client_directly(
+    client, monkeypatch
+):
+    """THE property the whole move exists to guarantee: preflight.py and the
+    readiness dashboard must not each pay for their own ElevenLabs round-trip
+    inside the same cache window. Before the move they could not share one —
+    the caching lived in admin/system.py, where preflight cannot reach it."""
+    redis = _FakeRedis()
+    _mock_all_healthy(monkeypatch, redis=redis)
+    calls = {"n": 0}
+
+    def counted():
+        calls["n"] += 1
+        return {"status": "active", "character_count": 1, "character_limit": 2}
+
+    monkeypatch.setattr(admin_system.elevenlabs_client, "subscription_status", counted)
+
+    # Simulates preflight.py having warmed the cache moments earlier.
+    await admin_system.elevenlabs_client.cached_subscription_status()
+    assert calls["n"] == 1
+
+    r = client.get("/admin/readiness")
+
+    assert calls["n"] == 1, "the readiness dashboard must reuse the warm cache"
+    billing_check = next(c for c in r.json()["checks"] if c["key"] == "billing")
+    assert billing_check["status"] == "good"

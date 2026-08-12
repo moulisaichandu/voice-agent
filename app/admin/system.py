@@ -285,17 +285,21 @@ async def _compute_preflight() -> dict:
     return {"key": "preflight", "status": "warning", "label": "Preflight", "detail": detail}
 
 
-_GOOD_SUBSCRIPTION_STATUSES = {"active", "trialing"}
+async def _compute_billing(*, force_refresh: bool = False) -> dict:
+    """Format the shared account status into a ReadinessCheck.
 
-
-async def _compute_billing() -> dict:
+    The fetching and caching moved to elevenlabs_client.cached_subscription_status
+    so preflight.py can share this exact cache entry — see that function. This
+    is now only the presentation half; the dashboard output is unchanged.
+    """
     try:
-        sub = await asyncio.to_thread(elevenlabs_client.subscription_status)
+        sub = await elevenlabs_client.cached_subscription_status(
+            force_refresh=force_refresh)
     except Exception as exc:
         return {"key": "billing", "status": "critical", "label": "ElevenLabs billing",
                 "detail": f"Could not check: {type(exc).__name__}: {exc}"}
     status = sub["status"]
-    if status in _GOOD_SUBSCRIPTION_STATUSES:
+    if status in elevenlabs_client.GOOD_SUBSCRIPTION_STATUSES:
         usage = ""
         if sub.get("character_limit"):
             usage = f" ({sub['character_count']}/{sub['character_limit']} characters used)"
@@ -374,7 +378,8 @@ async def _build_readiness(*, force_refresh: bool) -> ReadinessResponse:
 
     if force_refresh:
         preflight_check = await _refresh_check("preflight", _compute_preflight)
-        billing_check = await _refresh_check("billing", _compute_billing)
+        billing_check = await _refresh_check(
+            "billing", lambda: _compute_billing(force_refresh=True))
     else:
         preflight_check = await _cached_check("preflight", _compute_preflight)
         billing_check = await _cached_check("billing", _compute_billing)
