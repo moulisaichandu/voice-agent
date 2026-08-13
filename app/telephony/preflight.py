@@ -36,8 +36,13 @@ from app.config import (
     PUBLIC_BASE_URL,
     SARVAM_API_KEY,
 )
-from app.telephony import conversation_llm
-from app.telephony.elevenlabs_client import agent_exists, agent_language_support
+from app.telephony import conversation_llm, sarvam_circuit_breaker
+from app.telephony.elevenlabs_client import (
+    GOOD_SUBSCRIPTION_STATUSES,
+    agent_exists,
+    agent_language_support,
+    cached_subscription_status,
+)
 
 _HEALTH_CHECK_TIMEOUT_S = 10.0
 
@@ -183,6 +188,20 @@ async def preflight(
                 "to the previous backend instead, set "
                 "TELUGU_BACKEND=openai_realtime."
             )
+        # Sarvam publishes no balance/credits endpoint, so this is the only
+        # way the account's state is knowable before dialling: a previous call
+        # already failed with it and tripped the breaker. Checked after the
+        # key (can we talk to Sarvam at all) and before the campaign-config
+        # guard below (is this campaign set up sanely).
+        breaker_reason = await sarvam_circuit_breaker.tripped_reason()
+        if breaker_reason:
+            return (
+                f"Sarvam reported {breaker_reason!r} on a recent call, and "
+                "dialling on this backend has been paused rather than risk "
+                "repeating it on every other lead. Check credits at "
+                "dashboard.sarvam.ai/usage, top up if needed, then clear it: "
+                "POST /admin/system/sarvam-circuit-breaker/clear."
+            )
         # A two-way call on this backend is answered by conversation_llm.turn(),
         # not by Sarvam's own chat models — see conversation_llm.py's docstring.
         # Sarvam's are reasoning models measured at 21.8s on a real turn and
@@ -213,6 +232,28 @@ async def preflight(
                 "Set it in .env — it is the same key the RAG embedder uses."
             )
         return None
+
+    # ElevenLabs billing applies to every call this backend carries, whatever
+    # the language or voice override — so this runs BEFORE the
+    # 'auto'-with-no-override early return just below. Placing it after would
+    # skip billing for exactly the commonest campaign shape there is, which is
+    # the one most likely to be dialling when an invoice goes unpaid.
+    #
+    # Fails closed, like agent_exists() above: a check that cannot answer is
+    # not evidence the account is fine.
+    try:
+        sub = await cached_subscription_status()
+    except Exception as exc:
+        return (f"Could not check ElevenLabs' billing status "
+                f"({type(exc).__name__}: {exc}). Not dialling while the "
+                "account's state is unknown.")
+    if sub["status"] not in GOOD_SUBSCRIPTION_STATUSES:
+        return (
+            f"ElevenLabs account status is {sub['status']!r} — no conversation "
+            "can run until this is resolved at elevenlabs.io (almost always a "
+            "payment issue). The agent WebSocket refuses the handshake in this "
+            "state, so every call would ring, connect, and go silent."
+        )
 
     # Nothing overridden -> nothing to validate, and NO API call. This is what
     # keeps an 'auto' campaign with no forced voice byte-identical to what it

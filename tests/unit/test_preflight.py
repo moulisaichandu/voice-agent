@@ -63,6 +63,19 @@ def _configured(monkeypatch, **overrides):
     monkeypatch.setattr(pf, "agent_exists", lambda agent_id: True)
     monkeypatch.setattr(pf.httpx, "AsyncClient", lambda **kw: _FakeAsyncClient())
 
+    # Both account-health gates healthy by default, so every pre-existing test
+    # keeps meaning "everything is configured correctly" now that preflight
+    # consults them too.
+    async def _good_billing(*, force_refresh: bool = False):
+        return {"status": "active", "character_count": 1, "character_limit": 2}
+
+    monkeypatch.setattr(pf, "cached_subscription_status", _good_billing)
+
+    async def _not_tripped():
+        return None
+
+    monkeypatch.setattr(pf.sarvam_circuit_breaker, "tripped_reason", _not_tripped)
+
 
 async def test_missing_elevenlabs_api_key(monkeypatch):
     _configured(monkeypatch, ELEVENLABS_API_KEY=None)
@@ -609,3 +622,126 @@ async def test_a_twoway_openai_realtime_campaign_is_unaffected_by_this_guard(
     _set_twoway(monkeypatch, "openai_realtime", True)
     monkeypatch.setattr(pf, "CONVERSATION_LLM_PROVIDER", "sarvam")
     assert await pf.preflight("agent_1", "te", mode="twoway") is None
+
+
+# ── ElevenLabs account billing must be healthy before any ElevenLabs call ────
+#
+# A past_due account refuses the agent WebSocket handshake with a payment-issue
+# error — verified live 2026-07. Checked here, not only on the readiness
+# dashboard, so a dead account stops dialling instead of ringing every lead
+# into instant silence.
+
+async def test_unhealthy_elevenlabs_billing_refuses_to_dial(monkeypatch):
+    _configured(monkeypatch)
+
+    async def past_due(*, force_refresh=False):
+        return {"status": "past_due", "character_count": 1, "character_limit": 2}
+
+    monkeypatch.setattr(pf, "cached_subscription_status", past_due)
+
+    reason = await pf.preflight("agent_1")
+    assert reason is not None
+    assert "past_due" in reason
+
+
+async def test_healthy_elevenlabs_billing_does_not_block(monkeypatch):
+    _configured(monkeypatch)
+    assert await pf.preflight("agent_1") is None
+
+
+async def test_an_unreachable_billing_check_refuses_rather_than_dials_blind(monkeypatch):
+    """Same discipline as agent_exists() above: a check that cannot answer must
+    not be read as "must be fine". A false refusal costs one paused campaign; a
+    false pass costs every lead on it."""
+    _configured(monkeypatch)
+
+    async def boom(*, force_refresh=False):
+        raise RuntimeError("ElevenLabs API down")
+
+    monkeypatch.setattr(pf, "cached_subscription_status", boom)
+
+    reason = await pf.preflight("agent_1")
+    assert reason is not None
+    assert "Could not check" in reason
+
+
+async def test_billing_is_checked_even_for_a_plain_auto_campaign(monkeypatch):
+    """THE ordering this check depends on. The 'auto'-with-no-voice-override
+    early return exists to skip an unnecessary ElevenLabs API call — but
+    billing applies to every ElevenLabs call regardless of override, so a
+    billing check placed after it would be skipped by exactly the commonest
+    campaign shape there is."""
+    _configured(monkeypatch, ELEVENLABS_VOICE_ID=None)
+
+    async def past_due(*, force_refresh=False):
+        return {"status": "past_due", "character_count": 1, "character_limit": 2}
+
+    monkeypatch.setattr(pf, "cached_subscription_status", past_due)
+
+    # language=None and no forced voice: the early-return path.
+    reason = await pf.preflight("agent_1")
+    assert reason is not None, "a plain 'auto' campaign skipped the billing check"
+    assert "past_due" in reason
+
+
+async def test_billing_is_not_checked_for_a_sarvam_backed_call(monkeypatch):
+    """One backend's outage must not ground the other's campaigns."""
+    _configured(monkeypatch, SARVAM_API_KEY="sk-test")
+
+    async def must_not_be_called(*, force_refresh=False):
+        raise AssertionError("must not check ElevenLabs billing for a Sarvam call")
+
+    monkeypatch.setattr(pf, "cached_subscription_status", must_not_be_called)
+    assert await pf.preflight("agent_1", "te") is None
+
+
+# ── the Sarvam circuit breaker must be clear before any Sarvam call ─────────
+#
+# Sarvam has no programmatic credits/balance API, so this is reactive: a call
+# already failed with "insufficient credits" and tripped it, and every later
+# Sarvam-backed dial must refuse until an admin clears it.
+
+async def test_a_tripped_sarvam_breaker_refuses_to_dial(monkeypatch):
+    _configured(monkeypatch, SARVAM_API_KEY="sk-test")
+
+    async def tripped():
+        return "Insufficient credits"
+
+    monkeypatch.setattr(pf.sarvam_circuit_breaker, "tripped_reason", tripped)
+
+    reason = await pf.preflight("agent_1", "te")
+    assert reason is not None
+    assert "Insufficient credits" in reason
+
+
+async def test_the_refusal_says_how_to_clear_the_breaker(monkeypatch):
+    """Manual-clear-only is the design, so the refusal has to carry the way
+    out — otherwise the operator is told dialling stopped and not how to
+    restart it."""
+    _configured(monkeypatch, SARVAM_API_KEY="sk-test")
+
+    async def tripped():
+        return "Insufficient credits"
+
+    monkeypatch.setattr(pf.sarvam_circuit_breaker, "tripped_reason", tripped)
+
+    reason = await pf.preflight("agent_1", "te")
+    assert "sarvam-circuit-breaker/clear" in reason
+    assert "dashboard.sarvam.ai" in reason
+
+
+async def test_a_clear_sarvam_breaker_does_not_block(monkeypatch):
+    _configured(monkeypatch, SARVAM_API_KEY="sk-test")
+    assert await pf.preflight("agent_1", "te") is None
+
+
+async def test_the_sarvam_breaker_is_not_checked_for_an_elevenlabs_backed_call(monkeypatch):
+    """The mirror of the billing test above: a Sarvam credits outage must not
+    stop English and Hindi campaigns that never touch Sarvam."""
+    _configured(monkeypatch)
+
+    async def must_not_be_called():
+        raise AssertionError("must not check the Sarvam breaker for an ElevenLabs call")
+
+    monkeypatch.setattr(pf.sarvam_circuit_breaker, "tripped_reason", must_not_be_called)
+    assert await pf.preflight("agent_1") is None
