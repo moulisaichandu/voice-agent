@@ -32,7 +32,7 @@ from app.db import calls as calls_db
 from app.db import campaigns as campaigns_db
 from app.db import leads as leads_db
 from app.db.pool import get_pool
-from app.telephony import elevenlabs_client
+from app.telephony import elevenlabs_client, sarvam_circuit_breaker
 from app.telephony import preflight as preflight_module
 from app.telephony import worker as worker_module
 
@@ -105,6 +105,34 @@ def _check_calling_hours() -> dict:
     return {"key": "calling_hours", "status": "warning", "label": "Calling hours",
             "detail": f"Outside the {window} window — campaign_tick will not enqueue "
                       "anything until it reopens"}
+
+
+async def _check_sarvam_circuit_breaker() -> dict:
+    """Whether a Sarvam credits failure has paused dialling on that backend.
+
+    Cheap by design — one Redis read, unlike billing's real API round-trip —
+    so unlike that check this needs no caching of its own.
+
+    A read failure reports critical rather than "not tripped". This endpoint
+    exists to answer "can this system dial right now, and if not why", and
+    "I could not tell" is the honest answer to that; silently reading as
+    healthy is how the original problem stayed invisible until a real call
+    failed.
+    """
+    try:
+        reason = await sarvam_circuit_breaker.tripped_reason()
+    except Exception as exc:  # noqa: BLE001 - one dead check must not take the dashboard down
+        return {"key": "sarvam_circuit_breaker", "status": "critical",
+                "label": "Sarvam circuit breaker",
+                "detail": f"Could not check: {type(exc).__name__}: {exc}"}
+    if reason:
+        return {"key": "sarvam_circuit_breaker", "status": "critical",
+                "label": "Sarvam circuit breaker",
+                "detail": f"Tripped: {reason}. Check credits at "
+                          "dashboard.sarvam.ai/usage, then clear it: POST "
+                          "/admin/system/sarvam-circuit-breaker/clear."}
+    return {"key": "sarvam_circuit_breaker", "status": "good",
+            "label": "Sarvam circuit breaker", "detail": "Not tripped"}
 
 
 _REQUIRED_FOR_DIALING = [
@@ -371,7 +399,10 @@ async def _build_readiness(*, force_refresh: bool) -> ReadinessResponse:
     config_check = _check_config()
     queue_check = await _check_queue_depth(worker_ok=worker_check["status"] == "good")
 
-    cheap = [db_check, redis_check, worker_check, hours_check, config_check, queue_check]
+    breaker_check = await _check_sarvam_circuit_breaker()
+
+    cheap = [db_check, redis_check, worker_check, hours_check, config_check,
+             queue_check, breaker_check]
     for c in cheap:
         c["cached"] = False
         c["checked_at"] = now_iso
@@ -437,6 +468,22 @@ async def refresh_readiness() -> ReadinessResponse:
     """Bypasses the 60s cache on the two expensive checks — for "I just fixed
     it, tell me right now" rather than waiting out the TTL."""
     return await _build_readiness(force_refresh=True)
+
+
+@router.post("/system/sarvam-circuit-breaker/clear")
+async def clear_sarvam_circuit_breaker() -> dict:
+    """Manual-only recovery, and the ONLY way out of a tripped breaker.
+
+    Sarvam publishes no way to confirm credits have been topped up, so a human
+    saying "this is fixed now" is the only reliable signal — an auto-expiring
+    timer would either resume into the same failure or stay paused long after
+    the account recovered. Mirrors PATCH /admin/campaigns/{id}
+    {"active": false}, the manual stopgap this replaces.
+
+    Clearing an untripped breaker is a no-op, so clicking it twice is safe.
+    """
+    await sarvam_circuit_breaker.clear()
+    return {"cleared": True}
 
 
 # ── Stats ──────────────────────────────────────────────────────────────────

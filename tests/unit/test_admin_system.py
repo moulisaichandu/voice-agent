@@ -21,9 +21,18 @@ class _FakeRedis:
     async def get(self, key):
         return self.store.get(key)
 
-    async def set(self, key, value, ex=None):
+    async def set(self, key, value, ex=None, nx=False):
+        # nx is not decoration: sarvam_circuit_breaker.trip() relies on
+        # set-if-not-exists for its first-trip-wins semantics, so a fake that
+        # ignored it would let a later, vaguer reason overwrite the original
+        # and the test would never notice.
+        if nx and key in self.store:
+            return None
         self.store[key] = value
         return True
+
+    async def delete(self, key):
+        return 1 if self.store.pop(key, None) is not None else 0
 
     async def llen(self, key):
         return 0
@@ -745,3 +754,97 @@ async def test_billing_check_reuses_a_cache_warmed_by_elevenlabs_client_directly
     assert calls["n"] == 1, "the readiness dashboard must reuse the warm cache"
     billing_check = next(c for c in r.json()["checks"] if c["key"] == "billing")
     assert billing_check["status"] == "good"
+
+
+# ── readiness: the Sarvam circuit breaker ────────────────────────────────────
+#
+# Tonight's whole problem was that this state was invisible until a real call
+# failed. The dashboard is where "can this system dial right now, and if not
+# why" is supposed to be answerable.
+
+async def test_readiness_can_dial_false_when_sarvam_circuit_breaker_is_tripped(
+    client, monkeypatch
+):
+    """The reactive half of the design: a call that already failed with
+    Sarvam's "insufficient credits" signal must stop every later Sarvam-backed
+    dial until an admin clears it."""
+    redis = _FakeRedis()
+    redis.store[admin_system.worker_module.HEARTBEAT_KEY] = "2026-01-01T00:00:00+00:00"
+    _mock_all_healthy(monkeypatch, redis=redis)
+    await admin_system.sarvam_circuit_breaker.trip("Insufficient credits")
+
+    r = client.get("/admin/readiness")
+
+    body = r.json()
+    assert body["can_dial"] is False
+    check = next(c for c in body["checks"] if c["key"] == "sarvam_circuit_breaker")
+    assert check["status"] == "critical"
+    assert "Insufficient credits" in check["detail"]
+
+
+async def test_the_tripped_check_says_how_to_clear_it(client, monkeypatch):
+    """Manual-clear-only means the dashboard has to carry the way out, or an
+    operator is shown a red light with no switch."""
+    redis = _FakeRedis()
+    redis.store[admin_system.worker_module.HEARTBEAT_KEY] = "2026-01-01T00:00:00+00:00"
+    _mock_all_healthy(monkeypatch, redis=redis)
+    await admin_system.sarvam_circuit_breaker.trip("Insufficient credits")
+
+    r = client.get("/admin/readiness")
+
+    check = next(c for c in r.json()["checks"] if c["key"] == "sarvam_circuit_breaker")
+    assert "sarvam-circuit-breaker/clear" in check["detail"]
+    assert "dashboard.sarvam.ai" in check["detail"]
+
+
+async def test_readiness_sarvam_circuit_breaker_good_when_not_tripped(
+    client, monkeypatch
+):
+    _mock_all_healthy(monkeypatch)
+
+    r = client.get("/admin/readiness")
+
+    check = next(c for c in r.json()["checks"] if c["key"] == "sarvam_circuit_breaker")
+    assert check["status"] == "good"
+
+
+async def test_an_unreadable_breaker_is_reported_not_swallowed(client, monkeypatch):
+    """A Redis failure must not take down the whole dashboard, and must not
+    quietly read as "not tripped" either — the dashboard exists to answer this
+    question, so "I could not tell" is the honest answer."""
+    _mock_all_healthy(monkeypatch)
+
+    async def boom():
+        raise ConnectionError("redis is down")
+
+    monkeypatch.setattr(admin_system.sarvam_circuit_breaker, "tripped_reason", boom)
+
+    r = client.get("/admin/readiness")
+
+    assert r.status_code == 200
+    check = next(c for c in r.json()["checks"] if c["key"] == "sarvam_circuit_breaker")
+    assert check["status"] == "critical"
+    assert "Could not check" in check["detail"]
+
+
+async def test_clear_sarvam_circuit_breaker_endpoint_clears_it(client, monkeypatch):
+    redis = _FakeRedis()
+    monkeypatch.setattr(admin_system.redis_client, "get_redis", lambda: redis)
+    await admin_system.sarvam_circuit_breaker.trip("Insufficient credits")
+
+    r = client.post("/admin/system/sarvam-circuit-breaker/clear")
+
+    assert r.status_code == 200
+    assert await admin_system.sarvam_circuit_breaker.tripped_reason() is None
+
+
+async def test_clearing_an_untripped_breaker_is_harmless(client, monkeypatch):
+    """An operator who clicks it twice, or clears one that recovered on its
+    own, must not get an error back."""
+    redis = _FakeRedis()
+    monkeypatch.setattr(admin_system.redis_client, "get_redis", lambda: redis)
+
+    r = client.post("/admin/system/sarvam-circuit-breaker/clear")
+
+    assert r.status_code == 200
+    assert await admin_system.sarvam_circuit_breaker.tripped_reason() is None
