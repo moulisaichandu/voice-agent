@@ -136,6 +136,13 @@ PLIVO_FROM_NUMBER: str | None = os.getenv("PLIVO_FROM_NUMBER")
 # PUBLIC_BASE_URL is set and this is empty, those routes are open to anyone who
 # finds the URL — app/main.py's startup check refuses to boot in that state.
 CALL_WEBHOOK_SECRET: str | None = os.getenv("CALL_WEBHOOK_SECRET")
+# Where to ask for the CURRENT quick-tunnel hostname, set by docker-compose to
+# cloudflared's own metrics port. Quick tunnels mint a new random hostname on
+# every start, so PUBLIC_BASE_URL above is only correct until cloudflared next
+# restarts — see app/telephony/public_url.py, which re-resolves from here.
+# Blank in production, where PUBLIC_BASE_URL is a real domain and there is no
+# cloudflared service to ask.
+TUNNEL_DISCOVERY_URL = os.getenv("TUNNEL_DISCOVERY_URL", "")
 
 # Guards POST /rag/search, the two-way agent's live tool. Same shape as
 # CALL_WEBHOOK_SECRET and for the same reason: ElevenLabs calls that endpoint

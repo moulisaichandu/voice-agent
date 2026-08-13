@@ -27,8 +27,8 @@ from app.telephony.plivo_stream import PlivoCall
 
 @pytest.fixture(autouse=True)
 def _public_url(monkeypatch):
-    monkeypatch.setattr(plivo_stream, "PUBLIC_BASE_URL",
-                        "https://example.trycloudflare.com")
+    monkeypatch.setattr(plivo_stream.public_url, "base",
+                        lambda: "https://example.trycloudflare.com")
     monkeypatch.setattr(plivo_stream, "CALL_WEBHOOK_SECRET", "s3cret")
 
 
@@ -73,7 +73,8 @@ def test_answer_xml_escapes_the_url():
 
 
 def test_answer_xml_handles_a_http_base_url(monkeypatch):
-    monkeypatch.setattr(plivo_stream, "PUBLIC_BASE_URL", "http://localhost:8091")
+    monkeypatch.setattr(plivo_stream.public_url, "base",
+                        lambda: "http://localhost:8091")
     xml = plivo_stream.answer_xml("lead-1")
     assert "ws://localhost:8091/calls/stream" in xml
 

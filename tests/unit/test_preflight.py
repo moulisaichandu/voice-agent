@@ -58,8 +58,18 @@ def _configured(monkeypatch, **overrides):
         "CONVERSATION_LLM_PROVIDER": "openai",
     }
     values.update(overrides)
+    # preflight no longer reads a module-level PUBLIC_BASE_URL: it resolves the
+    # live tunnel through public_url.refresh() so a hostname that rotated while
+    # the process was running cannot be handed to Plivo. Tests still set it by
+    # name here; it just drives the resolver instead of a global.
+    base_url = values.pop("PUBLIC_BASE_URL", "")
     for name, value in values.items():
         monkeypatch.setattr(pf, name, value)
+
+    async def _resolve_base():
+        return base_url or ""
+
+    monkeypatch.setattr(pf.public_url, "refresh", _resolve_base)
     monkeypatch.setattr(pf, "agent_exists", lambda agent_id: True)
     monkeypatch.setattr(pf.httpx, "AsyncClient", lambda **kw: _FakeAsyncClient())
 

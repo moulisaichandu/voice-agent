@@ -40,8 +40,8 @@ from app.config import (
     ONEWAY_MAX_SILENT_S,
     ONEWAY_SILENCE_TAIL_S,
     PLIVO_GREETING_GRACE_MS,
-    PUBLIC_BASE_URL,
 )
+from app.telephony import public_url
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +93,11 @@ def answer_xml(lead_id: str) -> str:
     treats the (empty) rest of the XML document as the whole call and hangs up
     the moment the stream is established.
     """
-    base = (PUBLIC_BASE_URL or "").rstrip("/")
+    # public_url.base(), not the import-time PUBLIC_BASE_URL: a quick tunnel
+    # mints a new hostname whenever cloudflared restarts, and a stream URL
+    # pointing at the old one connects to nothing — the call is answered and
+    # then silent. See app/telephony/public_url.py.
+    base = public_url.base().rstrip("/")
     wss = base.replace("https://", "wss://").replace("http://", "ws://")
     url = (f"{wss}/calls/stream?token={quote(CALL_WEBHOOK_SECRET or '')}"
            f"&lead={quote(lead_id)}")

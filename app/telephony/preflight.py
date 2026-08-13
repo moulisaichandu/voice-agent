@@ -33,10 +33,9 @@ from app.config import (
     PLIVO_AUTH_ID,
     PLIVO_AUTH_TOKEN,
     PLIVO_FROM_NUMBER,
-    PUBLIC_BASE_URL,
     SARVAM_API_KEY,
 )
-from app.telephony import conversation_llm, sarvam_circuit_breaker
+from app.telephony import conversation_llm, public_url, sarvam_circuit_breaker
 from app.telephony.elevenlabs_client import (
     GOOD_SUBSCRIPTION_STATUSES,
     agent_exists,
@@ -114,20 +113,28 @@ async def preflight(
         return ("No agent_id is set for this campaign. Set campaigns.agent_id to a "
                 "real ElevenLabs agent id.")
 
-    if not PUBLIC_BASE_URL:
+    # Re-resolve the tunnel FIRST. This runs once per campaign_tick batch,
+    # immediately before any dialling, which is the one moment being current
+    # actually matters: a quick tunnel mints a new hostname whenever cloudflared
+    # restarts, and nothing else re-resolves for the life of the process. A
+    # stale hostname here means every lead's phone rings and the call drops on
+    # answer, with nothing in our logs. See app/telephony/public_url.py.
+    base_url = await public_url.refresh()
+
+    if not base_url:
         return ("PUBLIC_BASE_URL is not set, so Plivo has no way to reach this "
                 "server. Every call would ring and then drop the instant it was "
                 "answered. Set it to the public HTTPS URL of this backend.")
 
     # Round-trip the real answer URL rather than /health: this validates the
     # webhook token and the XML too, which /health cannot.
-    url = (f"{PUBLIC_BASE_URL.rstrip('/')}/calls/answer"
+    url = (f"{base_url.rstrip('/')}/calls/answer"
            f"?token={CALL_WEBHOOK_SECRET or ''}&lead=preflight")
     try:
         async with httpx.AsyncClient(timeout=_HEALTH_CHECK_TIMEOUT_S) as client:
             resp = await client.post(url)
     except httpx.RequestError as exc:
-        return (f"PUBLIC_BASE_URL ({PUBLIC_BASE_URL}) is unreachable "
+        return (f"PUBLIC_BASE_URL ({base_url}) is unreachable "
                 f"({type(exc).__name__}). Plivo could not fetch the answer URL, so "
                 "every call would ring and drop on answer. Is the tunnel running?")
 
@@ -141,11 +148,11 @@ async def preflight(
                 if resp.status_code in (404, 502, 503, 504) else "")
         return (f"The answer URL returned HTTP {resp.status_code} instead of 200."
                 f"{hint} Plivo needs a 200 with <Stream> XML, so calls would drop "
-                f"on answer. URL: {PUBLIC_BASE_URL}/calls/answer")
+                f"on answer. URL: {base_url}/calls/answer")
     if "<Stream" not in resp.text:
         return ("The answer URL returned 200 but no <Stream> XML — something other "
                 "than this app is answering on that URL (a tunnel error page, or "
-                f"another service?). URL: {PUBLIC_BASE_URL}/calls/answer")
+                f"another service?). URL: {base_url}/calls/answer")
 
     # Cheapest last: this is the only check that costs an ElevenLabs API call.
     #

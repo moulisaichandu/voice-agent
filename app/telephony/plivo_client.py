@@ -34,6 +34,7 @@ from app.config import (
     PLIVO_FROM_NUMBER,
     PUBLIC_BASE_URL,
 )
+from app.telephony import public_url
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +63,11 @@ def _webhook_urls(lead_id: str) -> tuple[str, str]:
     stream webhooks — which Plivo calls, not us — find their way back to the
     right lead and call row. It is a UUID we generated, not a secret.
     """
-    base = (PUBLIC_BASE_URL or "").rstrip("/")
+    # public_url.base(), not the import-time PUBLIC_BASE_URL — see
+    # app/telephony/public_url.py. A stale hostname here means the lead's phone
+    # rings and the call drops the instant they answer, with nothing in our
+    # logs, because Plivo's request never reaches us at all.
+    base = public_url.base().rstrip("/")
     token = quote(CALL_WEBHOOK_SECRET or "")
     lead = quote(lead_id)
     return (f"{base}/calls/answer?token={token}&lead={lead}",
