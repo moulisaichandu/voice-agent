@@ -27,6 +27,42 @@ from app import redis_client
 
 _BREAKER_KEY = "sarvam:circuit_breaker"
 
+# Sarvam says "out of credits" in at least three different ways, all observed
+# from the same account state:
+#
+#   "Insufficient credits"                          (error frame, at design time)
+#   "No credits available."                         (TTS error frame, code 402)
+#   "Credits exhausted. Visit the API Dashboard..." (STT close frame, code 1003)
+#
+# The first version of this matched the literal string "insufficient credit"
+# and fired on NONE of the last two — it failed open on the first real
+# exhaustion after shipping, which is precisely the risk the design doc named.
+# Matching the word "credit" is wording-independent without being a blanket
+# "any error trips it": Sarvam does not use the word for anything else, and a
+# blanket net would halt every campaign over a transient blip.
+_CREDITS_MARKER = "credit"
+
+
+def looks_like_credits_exhausted(message: object) -> bool:
+    """Whether *message* is Sarvam saying the account has no credits left.
+
+    Takes `object`, not `str`, because the callers fall back to the WHOLE
+    event dict when a frame carries no 'message' key — and that fallback is
+    searched too, rather than dismissed as "not a string".
+
+    That is deliberate, and it is the second lesson from the same outage. This
+    code has already lost a credits signal once to a key rename: it read
+    data['error'] while Sarvam sent data['message'], so the check ran on a
+    dict and could never fire. Searching the stringified frame means the next
+    rename costs a scruffy log line, not a silent failure to stop dialling.
+
+    The cost is a Sarvam error frame that mentions credit without being an
+    exhaustion — a quota figure, say — refusing to dial. That is a fair price:
+    an error frame is already a failed call, and this errs toward the failure
+    an admin can see and clear rather than the one that rings real leads.
+    """
+    return _CREDITS_MARKER in str(message).lower()
+
 
 async def trip(reason: str) -> None:
     """Trip the breaker with *reason*, unless it is already tripped.

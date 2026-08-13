@@ -46,6 +46,7 @@ from typing import Any, Literal
 from urllib.parse import urlencode
 
 import websockets
+from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
 
 from app.config import (
     SARVAM_API_KEY,
@@ -100,6 +101,17 @@ def _stt_url() -> str:
     # legal unencoded in a query string, and matching the form Sarvam's own
     # documentation shows is the cheaper bet against an API we cannot inspect.
     return f"{_STT_URL}?{urlencode(params, safe=':')}"
+
+
+def _close_reason(exc: BaseException) -> str:
+    """The text a WebSocket close carried, or "" if it carried none.
+
+    A close WE initiate, or a connection that simply drops, reports code 1006
+    and an empty reason — so an ordinary untidy hangup can never look like a
+    credits failure. Defensive getattr: this runs on the failure path, where
+    raising would replace a diagnosed outage with an undiagnosed one.
+    """
+    return getattr(exc, "reason", "") or ""
 
 
 def _sumsq_and_count(pcm: bytes) -> tuple[int, int]:
@@ -271,52 +283,76 @@ class SarvamSTT:
         self._frame_count = 0
 
     async def events(self) -> AsyncIterator[STTEvent]:
-        """Yield what the lead does until the socket ends or errors.
+        """Yield what the lead does until the socket ends, errors or closes.
 
         An error frame ends the stream rather than being swallowed: a rejected
         connection otherwise looks exactly like a lead who never speaks, and
         costs a full CALL_MAX_DURATION_S of billed silence to discover.
-        """
-        async for raw in self._ws:
-            try:
-                event = json.loads(raw)
-            except (ValueError, TypeError):
-                continue
-            etype = event.get("type")
-            data = event.get("data") or {}
 
-            if etype == "data":
-                text = (data.get("transcript") or "").strip()
-                if text:
-                    # Sarvam emits empty transcripts for non-speech. Treating
-                    # one as a turn would have the agent answer a cough.
-                    yield STTEvent("transcript", text)
-            elif etype == "events":
-                signal = data.get("signal_type")
-                if signal == "START_SPEECH":
-                    self._speaking = True
-                    self._speech_sumsq = 0
-                    self._speech_count = 0
-                    yield STTEvent("speech_started")
-                elif signal == "END_SPEECH":
-                    self._speaking = False
-                    self._log_audio_health()
-                    yield STTEvent("speech_ended")
-            elif etype == "error":
-                # 'message', not 'error'. Sarvam populates the former, so the
-                # old key always missed and this fell through to dumping the
-                # raw event dict. That was not merely untidy: the credits
-                # check below reads this same value, so with the wrong key it
-                # could never have fired whatever Sarvam sent.
-                message = data.get("message") or event
-                logger.error(
-                    f"[sarvam-stt] refused to transcribe: "
-                    f"{message} (code={data.get('code')})"
-                )
-                # isinstance guard: message falls back to `event`, a dict, when
-                # the frame carries no 'message' — .lower() on that would raise
-                # inside the error handler and turn a reported failure into an
-                # unreported one.
-                if isinstance(message, str) and "insufficient credit" in message.lower():
-                    await sarvam_circuit_breaker.trip(message)
+        A CLOSE frame is read the same way, because Sarvam uses BOTH. When the
+        account ran out of credits on 2026-08-13 this leg sent no error frame
+        at all — it closed with 1003 and the reason "Credits exhausted. Visit
+        the API Dashboard...". The loop below never ran one iteration, so the
+        breaker could not fire however well it matched the wording, and all the
+        bridge saw was a bare ConnectionClosed that says nothing about why.
+        """
+        try:
+            async for raw in self._ws:
+                try:
+                    event = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                etype = event.get("type")
+                data = event.get("data") or {}
+
+                if etype == "data":
+                    text = (data.get("transcript") or "").strip()
+                    if text:
+                        # Sarvam emits empty transcripts for non-speech.
+                        # Treating one as a turn would have the agent answer
+                        # a cough.
+                        yield STTEvent("transcript", text)
+                elif etype == "events":
+                    signal = data.get("signal_type")
+                    if signal == "START_SPEECH":
+                        self._speaking = True
+                        self._speech_sumsq = 0
+                        self._speech_count = 0
+                        yield STTEvent("speech_started")
+                    elif signal == "END_SPEECH":
+                        self._speaking = False
+                        self._log_audio_health()
+                        yield STTEvent("speech_ended")
+                elif etype == "error":
+                    # 'message', not 'error'. Sarvam populates the former, so
+                    # the old key always missed and this fell through to
+                    # dumping the raw event dict. That was not merely untidy:
+                    # the credits check below reads this same value, so with
+                    # the wrong key it could never have fired at all.
+                    message = data.get("message") or event
+                    logger.error(
+                        f"[sarvam-stt] refused to transcribe: "
+                        f"{message} (code={data.get('code')})"
+                    )
+                    if sarvam_circuit_breaker.looks_like_credits_exhausted(message):
+                        await sarvam_circuit_breaker.trip(message)
+                    return
+        except ConnectionClosed as exc:
+            reason = _close_reason(exc)
+            credits = sarvam_circuit_breaker.looks_like_credits_exhausted(reason)
+            if isinstance(exc, ConnectionClosedOK) and not credits:
+                # A tidy end of call. websockets swallows this inside its own
+                # __aiter__, so this is belt-and-braces: ending the stream is
+                # the right response if it ever surfaces one.
                 return
+            logger.error(
+                f"[sarvam-stt] socket closed: "
+                f"{reason or '(no reason given)'} (code={getattr(exc, 'code', None)})"
+            )
+            if credits:
+                await sarvam_circuit_breaker.trip(reason)
+            # Re-raised on purpose. Swallowing it would leave the bridge with a
+            # finished listener and an unfinished call: the lead sits in
+            # silence until the watchdog, billed for it, and the call is
+            # recorded as a clean exit.
+            raise

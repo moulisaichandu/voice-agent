@@ -41,6 +41,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import websockets
+from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
 
 from app.config import (
     SARVAM_API_KEY,
@@ -87,6 +88,16 @@ async def _connect(url: str, headers: dict[str, str]) -> Any:
         return await websockets.connect(url, additional_headers=headers, max_size=None)
     except TypeError:
         return await websockets.connect(url, extra_headers=headers, max_size=None)
+
+
+def _close_reason(exc: BaseException) -> str:
+    """The text a WebSocket close carried, or "" if it carried none.
+
+    Mirrors sarvam_stt._close_reason. A close we initiate, or a connection
+    that simply drops, reports 1006 and an empty reason, so an untidy hangup
+    can never be mistaken for a credits failure.
+    """
+    return getattr(exc, "reason", "") or ""
 
 
 def _config_frame(language: str, speaker: str) -> dict:
@@ -224,11 +235,33 @@ class SarvamTTS:
                     )
                     # An account can run out of credits mid-synthesis just as
                     # easily as at STT. See the identical guard in sarvam_stt.
-                    if isinstance(message, str) and "insufficient credit" in message.lower():
+                    if sarvam_circuit_breaker.looks_like_credits_exhausted(message):
                         await sarvam_circuit_breaker.trip(message)
                     return
         except asyncio.CancelledError:
             await self._reset_connection()
+            raise
+        except ConnectionClosed as exc:
+            # Sarvam reports an outage by error frame OR by closing, and the
+            # close is the half that used to reach the bridge as a bare
+            # "conversation failed: ConnectionClosedOK" — no reason, no code,
+            # nothing to act on. See the same handler in sarvam_stt.events().
+            reason = _close_reason(exc)
+            credits = sarvam_circuit_breaker.looks_like_credits_exhausted(reason)
+            # The socket is dead either way: drop it so the next turn opens a
+            # fresh one instead of failing on send() and hiding the real cause.
+            await self._reset_connection()
+            if isinstance(exc, ConnectionClosedOK) and not credits:
+                # An utterance that ended on `final` never gets here. Reaching
+                # this means the server tidied up before finishing, which is
+                # not an error in itself — end the stream with what played.
+                return
+            logger.error(
+                f"[sarvam-tts] socket closed: "
+                f"{reason or '(no reason given)'} (code={getattr(exc, 'code', None)})"
+            )
+            if credits:
+                await sarvam_circuit_breaker.trip(reason)
             raise
 
     async def collect(self, text: str) -> list[tuple[str, int]]:

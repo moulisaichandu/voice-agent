@@ -560,3 +560,164 @@ async def test_unparseable_frames_are_skipped(connected):
             break
 
     assert first.text == "సరే"
+
+
+# ── the close frame: how Sarvam ACTUALLY reported the outage ─────────────────
+#
+# Everything above tests {"type": "error"} frames. On 2026-08-13, with the
+# account genuinely out of credits, the STT leg sent no error frame at all — it
+# closed the socket:
+#
+#     ConnectionClosedError: received 1003 (unsupported data)
+#     Credits exhausted. Visit the API Dashboard to review and manage your
+#     subscription.
+#
+# events() never saw a frame, so the breaker could not fire however well it
+# matched the wording. A close frame is a first-class failure signal here, not
+# a transport detail.
+
+from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
+from websockets.frames import Close
+
+_CREDITS_CLOSE = ("Credits exhausted. Visit the API Dashboard to review "
+                  "and manage your subscription.")
+
+
+class _ClosingSTTWS(_FakeSTTWS):
+    """A socket that yields its messages and then closes with *close*."""
+
+    def __init__(self, messages: list[str], close: Close):
+        super().__init__(messages)
+        self._close = close
+
+    def __aiter__(self):
+        async def _gen():
+            for m in self._messages:
+                yield m
+            raise ConnectionClosedError(self._close, None)
+        return _gen()
+
+
+async def test_a_credits_close_frame_trips_the_circuit_breaker(connected, monkeypatch):
+    """THE bug this section exists for. No error frame is ever sent."""
+    tripped = {}
+
+    async def fake_trip(reason):
+        tripped["reason"] = reason
+
+    monkeypatch.setattr(sarvam_stt.sarvam_circuit_breaker, "trip", fake_trip)
+    connected(_ClosingSTTWS([], Close(1003, _CREDITS_CLOSE)))
+
+    with pytest.raises(ConnectionClosedError):
+        async with sarvam_stt.SarvamSTT() as stt:
+            [e async for e in stt.events()]
+
+    assert tripped["reason"] == _CREDITS_CLOSE
+
+
+async def test_a_credits_close_still_ends_the_call(connected, monkeypatch):
+    """Tripping the breaker must not SWALLOW the close. Returning quietly
+    would leave the bridge with a listener that has ended and a call that has
+    not — silence until the watchdog, billed, and recorded as a clean exit."""
+    async def fake_trip(reason):
+        pass
+
+    monkeypatch.setattr(sarvam_stt.sarvam_circuit_breaker, "trip", fake_trip)
+    connected(_ClosingSTTWS([], Close(1003, _CREDITS_CLOSE)))
+
+    with pytest.raises(ConnectionClosedError):
+        async with sarvam_stt.SarvamSTT() as stt:
+            [e async for e in stt.events()]
+
+
+async def test_transcripts_before_a_close_are_still_delivered(connected, monkeypatch):
+    """The close ends the stream; it does not retract what the lead already
+    said. A turn dropped here is one the transcript loses forever."""
+    async def fake_trip(reason):
+        pass
+
+    monkeypatch.setattr(sarvam_stt.sarvam_circuit_breaker, "trip", fake_trip)
+    connected(_ClosingSTTWS(
+        [json.dumps({"type": "data", "data": {"transcript": "అవును"}})],
+        Close(1003, _CREDITS_CLOSE),
+    ))
+
+    heard = []
+    with pytest.raises(ConnectionClosedError):
+        async with sarvam_stt.SarvamSTT() as stt:
+            async for e in stt.events():
+                heard.append(e)
+
+    assert [e.text for e in heard] == ["అవును"]
+
+
+async def test_an_ordinary_close_does_not_trip_the_breaker(connected, monkeypatch):
+    """A dropped connection reports code 1006 and an EMPTY reason — including
+    when we are the side that closed. Tripping on that would ground every
+    Sarvam campaign the first time a call ended untidily."""
+    async def must_not_be_called(reason):
+        raise AssertionError("an ordinary disconnect must not trip the breaker")
+
+    monkeypatch.setattr(sarvam_stt.sarvam_circuit_breaker, "trip", must_not_be_called)
+    connected(_ClosingSTTWS([], Close(1006, "")))
+
+    with pytest.raises(ConnectionClosedError):
+        async with sarvam_stt.SarvamSTT() as stt:
+            [e async for e in stt.events()]
+
+
+async def test_an_unrelated_close_reason_does_not_trip_the_breaker(
+    connected, monkeypatch
+):
+    async def must_not_be_called(reason):
+        raise AssertionError("an unrelated close must not trip the breaker")
+
+    monkeypatch.setattr(sarvam_stt.sarvam_circuit_breaker, "trip", must_not_be_called)
+    connected(_ClosingSTTWS([], Close(1011, "internal error")))
+
+    with pytest.raises(ConnectionClosedError):
+        async with sarvam_stt.SarvamSTT() as stt:
+            [e async for e in stt.events()]
+
+
+async def test_the_close_reason_is_logged(connected, monkeypatch, caplog):
+    """The live symptom was a bare 'conversation failed: ConnectionClosedOK'
+    in the bridge, which says nothing about WHY. The reason Sarvam sent is the
+    whole diagnosis."""
+    async def fake_trip(reason):
+        pass
+
+    monkeypatch.setattr(sarvam_stt.sarvam_circuit_breaker, "trip", fake_trip)
+    connected(_ClosingSTTWS([], Close(1003, _CREDITS_CLOSE)))
+
+    with caplog.at_level("ERROR"):
+        with pytest.raises(ConnectionClosedError):
+            async with sarvam_stt.SarvamSTT() as stt:
+                [e async for e in stt.events()]
+
+    assert "Credits exhausted" in caplog.text
+    assert "1003" in caplog.text
+
+
+async def test_a_normal_close_ends_the_stream_without_raising(connected, monkeypatch):
+    """websockets swallows ConnectionClosedOK inside its own __aiter__, but
+    this module must not turn a tidy end-of-call into an exception if it ever
+    surfaces one."""
+    async def must_not_be_called(reason):
+        raise AssertionError("a normal close is not a credits failure")
+
+    monkeypatch.setattr(sarvam_stt.sarvam_circuit_breaker, "trip", must_not_be_called)
+
+    class _OKClosing(_FakeSTTWS):
+        def __aiter__(self):
+            async def _gen():
+                yield json.dumps({"type": "data", "data": {"transcript": "సరే"}})
+                raise ConnectionClosedOK(Close(1000, ""), None)
+            return _gen()
+
+    connected(_OKClosing([]))
+
+    async with sarvam_stt.SarvamSTT() as stt:
+        heard = [e async for e in stt.events()]
+
+    assert [e.text for e in heard] == ["సరే"]

@@ -38,7 +38,7 @@ import httpx
 from app.compliance.disclosure import has_ai_disclosure
 from app.config import SARVAM_API_KEY, SARVAM_LLM_MODEL
 from app.redis_client import get_redis
-from app.telephony import sarvam_prompts
+from app.telephony import sarvam_circuit_breaker, sarvam_prompts
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,11 @@ _CHAT_URL = "https://api.sarvam.ai/v1/chat/completions"
 # This was 20s, chosen before anyone had run it against the real API, and the
 # very first live render failed with ReadTimeout.
 _TIMEOUT_S = 60.0
+
+# How much of a failed response body is kept. Enough for Sarvam's own JSON
+# error objects, short enough that an upstream HTML error page cannot become
+# the breaker reason string shown on the readiness dashboard.
+_MAX_ERROR_BODY = 300
 
 # Sarvam's own default completion budget is 2048 tokens, and its reasoning
 # routinely spends all of it before writing a word of the answer. Measured over
@@ -146,8 +151,21 @@ async def _post_chat(payload: dict) -> dict:
         ) from exc
 
     if response.status_code != 200:
+        # The body, not just the status. A bare "HTTP 402" is a fact; "No
+        # credits available" is the diagnosis, and discarding it is how this
+        # leg stayed silent about an account outage that STT and TTS both
+        # reported. Truncated because an upstream HTML error page must not
+        # become the breaker reason an admin reads on the dashboard.
+        detail = (getattr(response, "text", "") or "")[:_MAX_ERROR_BODY].strip()
+        if sarvam_circuit_breaker.looks_like_credits_exhausted(detail):
+            # The same account, the same failure, the same breaker as the STT
+            # and TTS legs — rendering just reaches it over HTTP instead of a
+            # WebSocket. Without this, a campaign warmed while the account was
+            # empty would leave preflight happily dialling.
+            await sarvam_circuit_breaker.trip(detail)
         raise SarvamRenderFailed(
-            f"Sarvam chat completions returned HTTP {response.status_code}."
+            f"Sarvam chat completions returned HTTP {response.status_code}: "
+            f"{detail or '(no body)'}"
         )
 
     try:

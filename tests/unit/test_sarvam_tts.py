@@ -332,3 +332,160 @@ async def test_the_key_is_sent_as_the_subscription_header(monkeypatch):
 
     assert seen["headers"]["Api-Subscription-Key"] == "sk-test"
     assert seen["url"].startswith("wss://api.sarvam.ai/text-to-speech/ws")
+
+
+# ── the close frame ──────────────────────────────────────────────────────────
+#
+# The error frames above are only half of how Sarvam reports an outage. On
+# 2026-08-13 the account ran out of credits and this leg sent
+# {"message": "No credits available.", "code": 402} — and the socket then
+# closed, which is all the bridge managed to log:
+#
+#     [sarvam] lead=30c72ac1 conversation failed: ConnectionClosedOK
+#
+# A close carrying a reason is a diagnosis; a close that ends up logged like
+# that is not.
+
+from websockets.exceptions import ConnectionClosed, ConnectionClosedError, ConnectionClosedOK
+from websockets.frames import Close
+
+_CREDITS_CLOSE = "Credits exhausted. Visit the API Dashboard."
+
+
+class _ClosingWS(_FakeSarvamWS):
+    """Yields *messages*, then closes with *close* instead of going quiet."""
+
+    def __init__(self, messages: list[str], close: Close, ok: bool = False):
+        super().__init__(messages)
+        self._close = close
+        self._ok = ok
+
+    def _closed(self):
+        cls = ConnectionClosedOK if self._ok else ConnectionClosedError
+        return cls(self._close, None)
+
+    def __aiter__(self):
+        async def _gen():
+            for m in self._messages:
+                yield m
+            raise self._closed()
+        return _gen()
+
+
+async def test_a_credits_close_trips_the_circuit_breaker(connected, monkeypatch):
+    tripped = {}
+
+    async def fake_trip(reason):
+        tripped["reason"] = reason
+
+    monkeypatch.setattr(sarvam_tts.sarvam_circuit_breaker, "trip", fake_trip)
+    connected(_ClosingWS([], Close(1003, _CREDITS_CLOSE)))
+
+    with pytest.raises(ConnectionClosed):
+        async with sarvam_tts.SarvamTTS(language="te-IN") as tts:
+            await asyncio.wait_for(tts.collect("ఒకటి"), timeout=5)
+
+    assert tripped["reason"] == _CREDITS_CLOSE
+
+
+async def test_a_credits_close_trips_even_when_the_code_is_1000(
+    connected, monkeypatch
+):
+    """The live bridge log said ConnectionClosedOK — a NORMAL closure code.
+    'Tidy shutdown' and 'the account is empty' are not mutually exclusive, so
+    the reason decides, not the code."""
+    tripped = {}
+
+    async def fake_trip(reason):
+        tripped["reason"] = reason
+
+    monkeypatch.setattr(sarvam_tts.sarvam_circuit_breaker, "trip", fake_trip)
+    connected(_ClosingWS([], Close(1000, _CREDITS_CLOSE), ok=True))
+
+    with pytest.raises(ConnectionClosed):
+        async with sarvam_tts.SarvamTTS(language="te-IN") as tts:
+            await asyncio.wait_for(tts.collect("ఒకటి"), timeout=5)
+
+    assert tripped["reason"] == _CREDITS_CLOSE
+
+
+async def test_an_ordinary_close_does_not_trip_the_breaker(connected, monkeypatch):
+    """1006 with an empty reason is what a dropped connection looks like —
+    and what OUR own close looks like from inside. Tripping on it would ground
+    every Sarvam campaign the first time a call ended untidily."""
+    async def must_not_be_called(reason):
+        raise AssertionError("an ordinary disconnect must not trip the breaker")
+
+    monkeypatch.setattr(sarvam_tts.sarvam_circuit_breaker, "trip", must_not_be_called)
+    connected(_ClosingWS([], Close(1006, "")))
+
+    with pytest.raises(ConnectionClosed):
+        async with sarvam_tts.SarvamTTS(language="te-IN") as tts:
+            await asyncio.wait_for(tts.collect("ఒకటి"), timeout=5)
+
+
+async def test_a_normal_close_after_final_is_not_an_error(connected, monkeypatch):
+    """final ends the stream before the close is ever reached, so a server
+    tidying up after a completed utterance must not look like a failure."""
+    async def must_not_be_called(reason):
+        raise AssertionError("a completed utterance is not a credits failure")
+
+    monkeypatch.setattr(sarvam_tts.sarvam_circuit_breaker, "trip", must_not_be_called)
+    connected(_ClosingWS([_audio(), _final()], Close(1000, ""), ok=True))
+
+    async with sarvam_tts.SarvamTTS(language="te-IN") as tts:
+        chunks = await asyncio.wait_for(tts.collect("ఒకటి"), timeout=5)
+
+    assert [c[0] for c in chunks] == [_FRAME]
+
+
+async def test_audio_played_before_a_close_is_kept(connected, monkeypatch):
+    """Frames already handed to Plivo were HEARD by the lead. The ledger sizes
+    a barge-in from them, so losing them would misreport what was said."""
+    async def fake_trip(reason):
+        pass
+
+    monkeypatch.setattr(sarvam_tts.sarvam_circuit_breaker, "trip", fake_trip)
+    connected(_ClosingWS([_audio()], Close(1003, _CREDITS_CLOSE)))
+
+    heard = []
+    with pytest.raises(ConnectionClosed):
+        async with sarvam_tts.SarvamTTS(language="te-IN") as tts:
+            async for payload, _ms in tts.speak("ఒకటి"):
+                heard.append(payload)
+
+    assert heard == [_FRAME]
+
+
+async def test_the_close_reason_is_logged(connected, monkeypatch, caplog):
+    async def fake_trip(reason):
+        pass
+
+    monkeypatch.setattr(sarvam_tts.sarvam_circuit_breaker, "trip", fake_trip)
+    connected(_ClosingWS([], Close(1003, _CREDITS_CLOSE)))
+
+    with caplog.at_level("ERROR"):
+        with pytest.raises(ConnectionClosed):
+            async with sarvam_tts.SarvamTTS(language="te-IN") as tts:
+                await asyncio.wait_for(tts.collect("ఒకటి"), timeout=5)
+
+    assert "Credits exhausted" in caplog.text
+    assert "1003" in caplog.text
+
+
+async def test_a_closed_socket_is_not_reused_by_the_next_utterance(
+    connected, monkeypatch
+):
+    """A socket the far end closed is dead. Keeping it would make every later
+    turn of the call fail on send() rather than on the real cause — the same
+    reasoning as _reset_connection() after a barge-in."""
+    async def fake_trip(reason):
+        pass
+
+    monkeypatch.setattr(sarvam_tts.sarvam_circuit_breaker, "trip", fake_trip)
+    connected(_ClosingWS([], Close(1006, "")))
+
+    async with sarvam_tts.SarvamTTS(language="te-IN") as tts:
+        with pytest.raises(ConnectionClosed):
+            await asyncio.wait_for(tts.collect("ఒకటి"), timeout=5)
+        assert tts._ws is None, "a closed socket must not be kept for the next turn"

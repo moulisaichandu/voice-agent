@@ -14,8 +14,9 @@ _TELUGU = "ఇది కృత్రిమ మేధ ద్వారా చే�
 
 
 class _FakeResponse:
-    def __init__(self, status_code=200, payload=None):
+    def __init__(self, status_code=200, payload=None, text=""):
         self.status_code = status_code
+        self.text = text
         self._payload = payload if payload is not None else {
             "choices": [{"message": {"content": _TELUGU}}]
         }
@@ -29,10 +30,11 @@ class _FakeAsyncClient:
 
     calls: list[dict] = []
 
-    def __init__(self, *, status_code=200, payload=None, raise_error=None):
+    def __init__(self, *, status_code=200, payload=None, raise_error=None, text=""):
         self._status_code = status_code
         self._payload = payload
         self._raise_error = raise_error
+        self._text = text
 
     async def __aenter__(self):
         return self
@@ -44,7 +46,7 @@ class _FakeAsyncClient:
         type(self).calls.append({"url": url, "json": json, "headers": headers})
         if self._raise_error:
             raise self._raise_error
-        return _FakeResponse(self._status_code, self._payload)
+        return _FakeResponse(self._status_code, self._payload, self._text)
 
 
 class _FakeRedis:
@@ -256,3 +258,97 @@ async def test_the_render_asks_for_enough_tokens_to_finish_thinking(llm):
     assert sent.get("max_tokens", 0) >= 4000, (
         "Sarvam's 2048 default is below what its own reasoning consumes"
     )
+
+
+# ── the third leg: rendering ─────────────────────────────────────────────────
+#
+# STT and TTS both trip the circuit breaker when Sarvam reports no credits.
+# This module talks to the same account over HTTP, and until now it discarded
+# the body and reported a bare "HTTP 402" — the one line that would have named
+# the cause, thrown away, and the breaker left clear so preflight went on
+# letting campaigns dial.
+
+async def test_a_credits_failure_trips_the_circuit_breaker(llm, monkeypatch):
+    tripped = {}
+
+    async def fake_trip(reason):
+        tripped["reason"] = reason
+
+    monkeypatch.setattr(sarvam_llm.sarvam_circuit_breaker, "trip", fake_trip)
+    llm(status_code=402, payload={},
+        text='{"error":{"message":"No credits available."}}')
+
+    with pytest.raises(sarvam_llm.SarvamRenderFailed):
+        await sarvam_llm.render(_SCRIPT, language_style=None)
+
+    assert "No credits available." in tripped["reason"]
+
+
+async def test_an_ordinary_http_failure_does_not_trip_the_breaker(llm, monkeypatch):
+    """A 500 is a blip; the next render may well succeed. Halting every Sarvam
+    campaign over one would cost far more than the retry."""
+    async def must_not_be_called(reason):
+        raise AssertionError("an ordinary HTTP failure must not trip the breaker")
+
+    monkeypatch.setattr(sarvam_llm.sarvam_circuit_breaker, "trip", must_not_be_called)
+    llm(status_code=500, payload={}, text="internal server error")
+
+    with pytest.raises(sarvam_llm.SarvamRenderFailed):
+        await sarvam_llm.render(_SCRIPT, language_style=None)
+
+
+async def test_the_failure_names_the_body_not_just_the_status(llm, monkeypatch):
+    """"HTTP 402" is a fact; "No credits available" is the diagnosis. The
+    operator reading this line is the one who has to fix the account."""
+    async def fake_trip(reason):
+        pass
+
+    monkeypatch.setattr(sarvam_llm.sarvam_circuit_breaker, "trip", fake_trip)
+    llm(status_code=402, payload={},
+        text='{"error":{"message":"No credits available."}}')
+
+    with pytest.raises(sarvam_llm.SarvamRenderFailed) as excinfo:
+        await sarvam_llm.render(_SCRIPT, language_style=None)
+
+    assert "402" in str(excinfo.value)
+    assert "No credits available." in str(excinfo.value)
+
+
+async def test_a_huge_error_body_is_truncated(llm, monkeypatch):
+    """An HTML error page must not become the breaker's reason string, which
+    an admin reads on the readiness dashboard."""
+    async def fake_trip(reason):
+        pass
+
+    monkeypatch.setattr(sarvam_llm.sarvam_circuit_breaker, "trip", fake_trip)
+    llm(status_code=502, payload={}, text="x" * 5000)
+
+    with pytest.raises(sarvam_llm.SarvamRenderFailed) as excinfo:
+        await sarvam_llm.render(_SCRIPT, language_style=None)
+
+    assert len(str(excinfo.value)) < 600
+
+
+async def test_a_response_with_no_body_attribute_does_not_crash(llm, monkeypatch):
+    """Defensive: this runs on the failure path, where raising something
+    unexpected would replace a diagnosed failure with an undiagnosed one."""
+    async def must_not_be_called(reason):
+        raise AssertionError("no body cannot be a credits failure")
+
+    monkeypatch.setattr(sarvam_llm.sarvam_circuit_breaker, "trip", must_not_be_called)
+
+    class _NoBodyResponse:
+        status_code = 500
+
+        def json(self):
+            return {}
+
+    class _NoBodyClient(_FakeAsyncClient):
+        async def post(self, url, json=None, headers=None):
+            return _NoBodyResponse()
+
+    monkeypatch.setattr(sarvam_llm.httpx, "AsyncClient", lambda **kw: _NoBodyClient())
+    monkeypatch.setattr(sarvam_llm, "get_redis", lambda: _FakeRedis())
+
+    with pytest.raises(sarvam_llm.SarvamRenderFailed):
+        await sarvam_llm.render(_SCRIPT, language_style=None)
