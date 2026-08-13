@@ -132,6 +132,18 @@ the only transcoding anywhere in the project. It is pure-Python on purpose —
   `OPENAI_TWOWAY_ENABLED`), resolved through `languages.twoway_enabled()`;
   enabling one must never enable the other, because each needs its own live
   call to prove it.
+- **`term_repair` rewrites the lead's words, so it stays deliberately timid.**
+  Sarvam's STT has no custom vocabulary or phrase hints, so it cannot be told
+  the brand exists — it returned "డిజిటల్ బ్రౌనీ" and "డిజిటల్ బ్రానీ" on a
+  live call and the agent refused a customer asking about its own courses,
+  because the garbled name goes into the RAG query too. `app/telephony/
+  term_repair.py` fixes it in `on_lead_said`, before anything reads the text.
+  The anchor rule is the load-bearing part: of the four words within edit
+  distance 2 of "బ్రోలీ" across every recorded utterance, two are the brand
+  and two are "briefly" and "bro", so a weak match is only trusted when
+  "డిజిటల్" precedes it. Adding a term is a licence to put words in a lead's
+  mouth — replay `TERMS` over the stored transcripts before adding one, and
+  keep the false-positive count at zero.
 - **Barge-in on Sarvam is the one thing no other backend needs.** ElevenLabs
   and OpenAI own their own conversation history, and OpenAI is told what the
   lead actually heard via `conversation.item.truncate`. On Sarvam the history

@@ -359,3 +359,55 @@ async def test_the_client_is_bound_to_the_loop_that_made_it(llm):
 async def test_closing_twice_is_safe():
     await conversation_llm.aclose()
     await conversation_llm.aclose()
+
+
+# ── the newer OpenAI models renamed the token-budget parameter ──────────────
+#
+# Found by running the real API rather than by reading docs: gpt-5.4-mini
+# rejects the request outright.
+#
+#   HTTP 400  "Unsupported parameter: 'max_tokens' is not supported with this
+#              model. Use 'max_completion_tokens' instead."
+#
+# Setting CONVERSATION_LLM_MODEL=gpt-5.4-mini in .env without this would have
+# failed EVERY two-way Telugu turn — the model that answers the lead — while
+# looking like a one-line config change.
+
+async def test_a_gpt5_model_gets_max_completion_tokens(llm, monkeypatch):
+    llm()
+    monkeypatch.setattr(conversation_llm, "CONVERSATION_LLM_MODEL", "gpt-5.4-mini")
+    await conversation_llm.turn(_HISTORY)
+
+    body = _FakeAsyncClient.calls[0]["json"]
+    assert body["max_completion_tokens"] == 4096
+    assert "max_tokens" not in body, (
+        "gpt-5 rejects max_tokens with HTTP 400 — every turn would fail")
+
+
+async def test_an_older_model_still_gets_max_tokens(llm, monkeypatch):
+    """gpt-4o-mini takes the original spelling, and Sarvam NEEDS it: its
+    reasoning eats the default 2048 budget and returns no content at all."""
+    llm()
+    monkeypatch.setattr(conversation_llm, "CONVERSATION_LLM_MODEL", "gpt-4o-mini")
+    await conversation_llm.turn(_HISTORY)
+
+    body = _FakeAsyncClient.calls[0]["json"]
+    assert body["max_tokens"] == 4096
+    assert "max_completion_tokens" not in body
+
+
+async def test_the_o_series_also_gets_the_new_spelling(llm, monkeypatch):
+    """o3/o4 are the same generation of API change."""
+    llm()
+    monkeypatch.setattr(conversation_llm, "CONVERSATION_LLM_MODEL", "o4-mini")
+    await conversation_llm.turn(_HISTORY)
+
+    assert "max_completion_tokens" in _FakeAsyncClient.calls[0]["json"]
+
+
+async def test_a_sarvam_model_keeps_max_tokens(llm, monkeypatch):
+    llm()
+    monkeypatch.setattr(conversation_llm, "CONVERSATION_LLM_PROVIDER", "sarvam")
+    await conversation_llm.turn(_HISTORY)
+
+    assert _FakeAsyncClient.calls[0]["json"]["max_tokens"] == 4096

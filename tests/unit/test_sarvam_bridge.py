@@ -1641,3 +1641,37 @@ async def test_the_opening_stays_protected_until_it_has_actually_played(two_way)
     )
     await asyncio.wait_for(task, timeout=10)
     assert await call.interrupt(), "the shield must come down once it has played"
+
+
+# ── the brand name reaches the model spelled correctly ──────────────────────
+#
+# app/telephony/term_repair.py fixes what STT could not know; this is the wiring
+# test that it happens on the path a real call takes, not merely in isolation.
+# The sentence is verbatim from the call where the agent refused a customer
+# asking about its own courses.
+
+async def test_a_mangled_brand_name_is_repaired_before_the_model_sees_it(monkeypatch):
+    """The model, the RAG query it writes, and the stored transcript are all
+    built from this one string, so the repair has to land before any of them."""
+    call = sarvam_bridge.plivo_stream.PlivoCall(
+        _FakePlivoWS(), lead_id="l", one_way=False, protect_opening=False)
+    turns = []
+    convo = sarvam_bridge._Conversation(
+        call, lead_id="l", system_prompt="s", turns=turns)
+
+    async def never_reply(*a, **kw):
+        raise AssertionError("this test is about the transcript, not the reply")
+
+    monkeypatch.setattr(convo, "_reply_when_they_stop", never_reply)
+
+    class _FakeTTS:
+        async def speak(self, text):
+            yield _FRAME, 500
+
+    await convo.on_lead_said(_FakeTTS(), "డిజిటల్ బ్రౌనీలో ఉన్న కోర్సెస్ చెప్తారా?")
+    # Let the reply task the call schedules die quietly.
+    await convo._cancel_reply(force=True)
+
+    assert "బ్రోలీలో" in turns[0].text, "the stored transcript still says Brownie"
+    assert "బ్రోలీలో" in (convo.history[-1]["content"] or ""), \
+        "the model was still handed a company that does not exist"

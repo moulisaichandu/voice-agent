@@ -58,6 +58,7 @@ from app.telephony import (
     sarvam_prompts,
     sarvam_stt,
     sarvam_tts,
+    term_repair,
 )
 
 logger = logging.getLogger(__name__)
@@ -641,6 +642,14 @@ class _Conversation:
 
     async def on_lead_said(self, tts: sarvam_tts.SarvamTTS, text: str) -> None:
         """A completed lead utterance: record it and answer it."""
+        # Repair known names BEFORE anything reads the text. Everything
+        # downstream is built from this one string — the model's history, the
+        # RAG query the model writes from it, and the transcript the operator
+        # reads afterwards — so repairing it once here keeps all three
+        # agreeing about what the lead said. A live call was lost to this: the
+        # brand came back as "బ్రౌనీ" and the agent refused a question about
+        # its own courses. See term_repair's docstring.
+        text = term_repair.repair(text)
         self.turns.append(TranscriptTurn(role="lead", text=text))
         self.history.append({"role": "user", "content": text})
         if _is_lead_goodbye(text):

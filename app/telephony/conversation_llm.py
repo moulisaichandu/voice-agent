@@ -280,6 +280,28 @@ def _parse_tool_calls(message: dict) -> list[ToolCall]:
     return parsed
 
 
+# OpenAI renamed the token-budget parameter for its newer families and made
+# the OLD name a hard error rather than a deprecation: gpt-5.4-mini answers
+# max_tokens with HTTP 400, "Unsupported parameter ... Use
+# 'max_completion_tokens' instead". Since this is the model that answers a
+# lead mid-call, sending the wrong one fails every turn of every two-way
+# Telugu call — while looking like a one-line .env change.
+#
+# Matched by prefix rather than an allow-list of exact model names, so a
+# gpt-5.5 or o5 works the day it is switched on. Everything else — gpt-4o,
+# gpt-4.1 and every Sarvam model — keeps the original spelling, and Sarvam
+# NEEDS it (see this module's docstring on its reasoning budget).
+_NEW_TOKEN_PARAM_PREFIXES = ("gpt-5", "o1", "o3", "o4", "o5")
+
+
+def _token_budget_param(model: str) -> str:
+    """Which spelling of the completion-token cap *model* accepts."""
+    name = (model or "").lower()
+    if any(name.startswith(p) for p in _NEW_TOKEN_PARAM_PREFIXES):
+        return "max_completion_tokens"
+    return "max_tokens"
+
+
 async def turn(messages: list[dict]) -> LLMReply:
     """One conversational turn: what to say next, or which tools to run first.
 
@@ -317,7 +339,7 @@ async def turn(messages: list[dict]) -> LLMReply:
         # tokens. Load-bearing if CONVERSATION_LLM_PROVIDER is flipped back to
         # sarvam: its default budget is 2048 and its reasoning eats all of it,
         # returning content=null — see sarvam_llm._MAX_TOKENS.
-        "max_tokens": 4096,
+        _token_budget_param(model): 4096,
     }
 
     loop = asyncio.get_running_loop()
