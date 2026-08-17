@@ -1431,9 +1431,13 @@ async def test_the_latency_line_is_measured_from_the_first_unanswered_word(
     )
 
 
-async def test_a_turn_that_says_nothing_is_still_logged(two_way, caplog, monkeypatch):
-    """The 'agent never answered me' symptom. A turn swallowed by _reply's
-    catch-all used to leave no trace of how long the lead waited for it."""
+async def test_a_failed_turn_is_answered_with_a_fallback_not_silence(
+        two_way, caplog, monkeypatch):
+    """The 'agent never answered me' symptom, on the path a real call takes.
+
+    A turn swallowed by _reply's catch-all used to leave the lead with nothing;
+    now it hears the reprompt, so the latency line reports a turn that SPOKE.
+    """
     caplog.set_level("INFO")
 
     async def failing_turn(history):
@@ -1442,7 +1446,34 @@ async def test_a_turn_that_says_nothing_is_still_logged(two_way, caplog, monkeyp
     two_way([_said("Fee enta?")])
     monkeypatch.setattr(sarvam_bridge.conversation_llm, "turn", failing_turn)
 
-    await _run(_FakePlivoWS(), one_way=False)
+    outcome = await _run(_FakePlivoWS(), one_way=False)
+
+    assert sarvam_bridge._FALLBACK_REPROMPT in [
+        t.text for t in outcome["transcript"] if t.role == "agent"
+    ], "the lead was left in silence after asking a question"
+    lines = [r.message for r in caplog.records if "turn latency" in r.message]
+    assert lines and "NOTHING SPOKEN" not in lines[0], (
+        "the turn spoke a fallback, so it must not be logged as silent"
+    )
+
+
+async def test_a_turn_that_could_not_even_speak_is_still_logged(
+        two_way, caplog, monkeypatch):
+    """NOTHING SPOKEN must survive for the genuinely silent case — a turn
+    whose fallback could not be synthesised either."""
+    caplog.set_level("INFO")
+
+    async def failing_turn(history):
+        raise sarvam_bridge.conversation_llm.TurnFailed("boom")
+
+    call = sarvam_bridge.plivo_stream.PlivoCall(
+        _FakePlivoWS(), lead_id="lead-1", one_way=False, protect_opening=False)
+    convo = sarvam_bridge._Conversation(
+        call, lead_id="lead-1", system_prompt="s", turns=[])
+    monkeypatch.setattr(sarvam_bridge.conversation_llm, "turn", failing_turn)
+    convo._turn_opened_at = convo._loop.time()
+
+    await convo._reply(_SilentTTS())
 
     lines = [r.message for r in caplog.records if "turn latency" in r.message]
     assert lines and "NOTHING SPOKEN" in lines[0], (
@@ -1675,3 +1706,207 @@ async def test_a_mangled_brand_name_is_repaired_before_the_model_sees_it(monkeyp
     assert "బ్రోలీలో" in turns[0].text, "the stored transcript still says Brownie"
     assert "బ్రోలీలో" in (convo.history[-1]["content"] or ""), \
         "the model was still handed a company that does not exist"
+
+
+# ── a turn that fails still says something ──────────────────────────────────
+#
+# _reply's catch-all used to log the failure and return, which is TOTAL SILENCE
+# for that turn. Confirmed on a real call (2026-08-12): the lead asked about
+# the courses, heard nothing, said "హలో", then "చెప్పండి", and only then got an
+# answer. With CONVERSATION_LLM_TIMEOUT_S at 12s that silence is twelve seconds
+# long, and it reads exactly like a dropped line. _FALLBACK_FAREWELL already
+# established the principle for the end_call case: a canned line beats nothing.
+
+
+def _failing_turn_convo():
+    call = sarvam_bridge.plivo_stream.PlivoCall(
+        _FakePlivoWS(), lead_id="l", one_way=False, protect_opening=False)
+    turns = []
+    convo = sarvam_bridge._Conversation(
+        call, lead_id="l", system_prompt="s", turns=turns)
+    return call, convo, turns
+
+
+class _CountingTTS:
+    def __init__(self):
+        self.spoken = []
+
+    async def speak(self, text):
+        self.spoken.append(text)
+        yield _FRAME, 500
+
+
+def _agent_lines(turns):
+    return [t.text for t in turns if t.role == "agent"]
+
+
+async def test_a_failed_turn_speaks_a_fallback_rather_than_silence(monkeypatch):
+    """A TurnFailed left the lead with nothing at all for the whole turn."""
+    _call, convo, turns = _failing_turn_convo()
+
+    async def boom(history):
+        raise sarvam_bridge.conversation_llm.TurnFailed("upstream 500")
+
+    monkeypatch.setattr(sarvam_bridge.conversation_llm, "turn", boom)
+
+    await convo._reply(_CountingTTS())
+
+    assert sarvam_bridge._FALLBACK_REPROMPT in _agent_lines(turns), \
+        "the lead heard nothing at all after asking a question"
+
+
+async def test_a_model_that_answers_with_nothing_still_gets_a_spoken_fallback(
+        monkeypatch):
+    """NoAnswer is raised rather than returned so nothing can speak it by
+    accident — but the lead still has to hear something."""
+    _call, convo, turns = _failing_turn_convo()
+
+    async def empty(history):
+        raise sarvam_bridge.conversation_llm.NoAnswer("no text, no tool calls")
+
+    monkeypatch.setattr(sarvam_bridge.conversation_llm, "turn", empty)
+
+    await convo._reply(_CountingTTS())
+
+    assert sarvam_bridge._FALLBACK_REPROMPT in _agent_lines(turns)
+
+
+async def test_a_barge_in_cancellation_is_never_answered_with_a_fallback(
+        monkeypatch):
+    """CancelledError means the lead interrupted. Speaking a fallback then
+    would talk over the person who just took the floor."""
+    _call, convo, turns = _failing_turn_convo()
+
+    async def cancelled(history):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(sarvam_bridge.conversation_llm, "turn", cancelled)
+    tts = _CountingTTS()
+
+    with pytest.raises(asyncio.CancelledError):
+        await convo._reply(tts)
+
+    assert not tts.spoken, "the agent talked over a lead who had interrupted"
+
+
+async def test_a_fallback_is_not_spoken_into_a_stale_generation(monkeypatch):
+    """A barge-in that lands while the model call is in flight bumps the
+    generation. The turn is over; nothing from it may still be said."""
+    _call, convo, turns = _failing_turn_convo()
+
+    async def boom_after_barge_in(history):
+        convo.generation += 1          # what on_barge_in() does
+        raise sarvam_bridge.conversation_llm.TurnFailed("upstream 500")
+
+    monkeypatch.setattr(sarvam_bridge.conversation_llm, "turn",
+                        boom_after_barge_in)
+    tts = _CountingTTS()
+
+    await convo._reply(tts)
+
+    assert not tts.spoken, "a fallback was spoken after the lead interrupted"
+
+
+async def test_repeated_failures_escalate_to_a_handoff(monkeypatch):
+    """Repeating the same 'say that again' line forever is its own failure —
+    after three dead turns the lead is told a human will follow up."""
+    _call, convo, turns = _failing_turn_convo()
+
+    async def boom(history):
+        raise sarvam_bridge.conversation_llm.TurnFailed("upstream 500")
+
+    monkeypatch.setattr(sarvam_bridge.conversation_llm, "turn", boom)
+    tts = _CountingTTS()
+
+    for _ in range(3):
+        await convo._reply(tts)
+
+    assert _agent_lines(turns) == [
+        sarvam_bridge._FALLBACK_REPROMPT,
+        sarvam_bridge._FALLBACK_REPROMPT,
+        sarvam_bridge._FALLBACK_HANDOFF,
+    ]
+
+
+async def test_a_successful_turn_resets_the_failure_count(monkeypatch):
+    """One bad turn in an otherwise healthy call must not push the next
+    failure straight to a handoff."""
+    _call, convo, turns = _failing_turn_convo()
+    outcomes = ["fail", "ok", "fail"]
+
+    async def flaky(history):
+        which = outcomes.pop(0)
+        if which == "fail":
+            raise sarvam_bridge.conversation_llm.TurnFailed("upstream 500")
+        return _reply(text="Iravai aidu vela.")
+
+    monkeypatch.setattr(sarvam_bridge.conversation_llm, "turn", flaky)
+    tts = _CountingTTS()
+
+    for _ in range(3):
+        await convo._reply(tts)
+
+    assert _agent_lines(turns)[-1] == sarvam_bridge._FALLBACK_REPROMPT, \
+        "a healthy turn in between did not clear the failure count"
+
+
+async def test_a_turn_that_already_spoke_is_not_given_a_fallback_on_top(
+        monkeypatch):
+    """A farewell, or any answer, that already reached the lead must not be
+    followed by 'sorry, say that again' because something failed afterwards."""
+    _call, convo, turns = _failing_turn_convo()
+
+    async def speaks_then_fails(history):
+        return _reply(text="ధన్యవాదాలు.", tools=[_tool("end_call")])
+
+    async def boom(reply):
+        raise RuntimeError("tool execution blew up")
+
+    monkeypatch.setattr(sarvam_bridge.conversation_llm, "turn", speaks_then_fails)
+    monkeypatch.setattr(convo, "_run_tools", boom)
+
+    await convo._reply(_CountingTTS())
+
+    lines = _agent_lines(turns)
+    assert "ధన్యవాదాలు." in lines, "the farewell should still have been spoken"
+    assert sarvam_bridge._FALLBACK_REPROMPT not in lines, \
+        "a fallback was stacked on top of audio the lead had already heard"
+
+
+async def test_the_handoff_line_is_never_repeated(monkeypatch):
+    """Once the lead has been told a human will call back, saying it again on
+    every further dead turn just teaches them it is a recording."""
+    _call, convo, turns = _failing_turn_convo()
+
+    async def boom(history):
+        raise sarvam_bridge.conversation_llm.TurnFailed("upstream 500")
+
+    monkeypatch.setattr(sarvam_bridge.conversation_llm, "turn", boom)
+
+    for _ in range(5):
+        await convo._reply(_CountingTTS())
+
+    assert _agent_lines(turns).count(sarvam_bridge._FALLBACK_HANDOFF) == 1
+    # reprompt, reprompt, handoff — then nothing further, however long the
+    # provider stays broken.
+    assert len(_agent_lines(turns)) == 3
+
+
+async def test_tool_round_exhaustion_speaks_a_fallback(monkeypatch):
+    """The model looping on tool calls used to end in a logger.warning and
+    silence — the same symptom by a different route."""
+    _call, convo, turns = _failing_turn_convo()
+
+    async def always_searching(history):
+        return _reply(tools=[_tool("search_course_material", query="fees")])
+
+    async def fake_search(query, *a, **kw):
+        return "The fee is 25,000 rupees."
+
+    monkeypatch.setattr(sarvam_bridge.conversation_llm, "turn", always_searching)
+    monkeypatch.setattr(sarvam_bridge, "search_relevant", fake_search)
+    tts = _CountingTTS()
+
+    await convo._reply(tts)
+
+    assert sarvam_bridge._FALLBACK_REPROMPT in tts.spoken

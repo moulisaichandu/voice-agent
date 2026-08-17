@@ -116,6 +116,30 @@ _GOODBYE_PHRASES = (
 # a plain canned farewell is strictly better than nothing.
 _FALLBACK_FAREWELL = "ధన్యవాదాలు, శుభదినం."
 
+# Spoken when a turn produces no answer at all — a TurnFailed, a NoAnswer, a
+# swallowed exception, or the model looping on tool calls until the round limit.
+# Every one of those used to end in a log line and TOTAL SILENCE.
+#
+# Confirmed on a real call (2026-08-12): the lead asked what courses there are,
+# heard nothing, said "హలో", then "చెప్పండి", and only then got an answer. With
+# CONVERSATION_LLM_TIMEOUT_S at 12s the silence is twelve seconds long, which on
+# a phone line is indistinguishable from a dropped call — and the same symptom
+# ("the agent stopped answering") that _FALLBACK_FAREWELL above already exists
+# to prevent at the end of a call.
+#
+# Neither line may carry a course fact, price or date: they are spoken when the
+# system does NOT know the answer, and inventing one is the failure CLAUDE.md's
+# RAG rule exists to prevent. They ask the lead to repeat, or hand off.
+_FALLBACK_REPROMPT = "క్షమించండి, మళ్ళీ ఒకసారి చెప్పగలరా?"
+_FALLBACK_HANDOFF = (
+    "క్షమించండి, ఇప్పుడు సాంకేతిక సమస్య వస్తోంది. "
+    "మా టీమ్ మిమ్మల్ని త్వరలో సంప్రదిస్తుంది."
+)
+# Consecutive dead turns before the reprompt gives way to the handoff line.
+# Asking someone to repeat themselves a third time is its own kind of broken:
+# by then the fault is clearly ours, not their diction.
+_MAX_FAILED_TURNS = 3
+
 
 def _is_lead_goodbye(text: str) -> bool:
     """Whether a transcript is an explicit request to finish the call.
@@ -285,6 +309,16 @@ class _Conversation:
         self._turn_llm_s = 0.0
         self._turn_tool_s = 0.0
         self._turn_llm_rounds = 0
+        # Consecutive turns that produced no answer — see _say_fallback. Reset
+        # by any turn that actually speaks, so one bad turn in an otherwise
+        # healthy call does not push the next one straight to a handoff.
+        self._failed_turns = 0
+        # Whether any audio from THIS turn actually reached the lead. Set in
+        # say() beside spoke_a_frame. _say_fallback reads it so a failure that
+        # lands after something was already spoken — an end_call farewell, say,
+        # followed by a tool error — cannot stack "sorry, say that again" on
+        # top of words the lead just heard.
+        self._heard_something_this_turn = False
 
     # ── measuring ────────────────────────────────────────────────────────────
 
@@ -421,6 +455,7 @@ class _Conversation:
                         # The lead's wait ends HERE, at the first frame — not
                         # when the whole answer has been sent.
                         spoke_a_frame = True
+                        self._heard_something_this_turn = True
                         self._log_turn_latency(spoke=True)
                     spoken_ms += duration_ms
                 self.ledger.add(sentence, spoken_ms)
@@ -729,7 +764,52 @@ class _Conversation:
                 self._turn_opened_at = self._loop.time()
             self.reply_task = asyncio.create_task(self._reply_when_they_stop(tts))
 
+    async def _say_fallback(self, tts: sarvam_tts.SarvamTTS,
+                            generation: int) -> None:
+        """Speak a recovery line for a turn that produced no answer.
+
+        The alternative is silence, and silence after a question is the single
+        most damaging thing this backend can do — see _FALLBACK_REPROMPT.
+
+        *generation* is the value captured when the turn began. If it has moved
+        the lead interrupted while the model was working: that turn is over, and
+        speaking into it would talk over the person who just took the floor. A
+        cancelled turn is also not counted as a failure — nothing was wrong with
+        it except that the lead had more to say.
+        """
+        if self._heard_something_this_turn:
+            # Something already reached the lead this turn; the failure came
+            # afterwards. Apologising for a turn they actually heard is worse
+            # than saying nothing more.
+            return
+        if self.generation != generation or self.call.stop.is_set():
+            return
+        if self._failed_turns >= _MAX_FAILED_TURNS:
+            # The handoff has already been spoken. Repeating it on every
+            # further dead turn is how a lead learns it is talking to a
+            # recording — and by now the fault is loudly logged for us.
+            logger.error(
+                f"[sarvam] lead={self.lead_id} another dead turn after the "
+                "handoff was already spoken — this call is not working. Check "
+                "the conversation provider."
+            )
+            return
+        self._failed_turns += 1
+        line = (_FALLBACK_HANDOFF if self._failed_turns >= _MAX_FAILED_TURNS
+                else _FALLBACK_REPROMPT)
+        try:
+            await self.say(tts, line)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - this IS the recovery path
+            # Nothing left to fall back to; log loudly rather than raise into
+            # the caller's own exception handler and lose the original failure.
+            logger.error(f"[sarvam] lead={self.lead_id} could not even speak "
+                         f"the fallback: {type(exc).__name__}: {exc}")
+
     async def _reply(self, tts: sarvam_tts.SarvamTTS) -> None:
+        generation = self.generation
+        self._heard_something_this_turn = False
         try:
             for _round in range(_MAX_TOOL_ROUNDS):
                 _llm_started = self._loop.time()
@@ -743,6 +823,7 @@ class _Conversation:
                 if not reply.tool_calls:
                     if reply.text:
                         await self.say(tts, reply.text)
+                        self._failed_turns = 0
                     return
                 # Text that arrives WITH a tool call is usually filler — "let
                 # me look that up for you". On a real call the agent
@@ -778,11 +859,13 @@ class _Conversation:
                 f"{_MAX_TOOL_ROUNDS} rounds — giving up on this turn rather "
                 "than holding the lead on a silent line."
             )
+            await self._say_fallback(tts, generation)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - one bad turn must not end the call
             logger.error(f"[sarvam] lead={self.lead_id} turn failed: "
                          f"{type(exc).__name__}: {exc}")
+            await self._say_fallback(tts, generation)
         finally:
             # Still set means say() never reached its first frame: the turn
             # ended without the lead hearing anything. Log it rather than let
