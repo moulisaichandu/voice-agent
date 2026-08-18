@@ -40,6 +40,13 @@ async def _isolate(request):
     Also clears any dialing:* locks — a leaked lock would block a later test's
     lead from dialing for DIALING_LOCK_TTL_S. (Finding that leak in the first
     place is what surfaced the real worker bug this fixture no longer masks.)
+
+    RESTORES what it deactivated. This used to run a bare
+    `update campaigns set active = false` and put nothing back, and this dev
+    database is the SAME one the running app uses — so a single integration run
+    silently switched off every live campaign an operator had activated, and
+    the readiness dashboard then reported "no active campaigns to check" with
+    nothing to say why. Isolation is still absolute; it is now also temporary.
     """
     r = redis_client.get_redis()
     keys = [worker.QUEUE_KEY, worker.PROCESSING_KEY, worker.LIVE_COUNT_KEY,
@@ -53,6 +60,11 @@ async def _isolate(request):
 
     await _clear()
     pool = await get_pool()
+    # Remember exactly who was active, so the run can be undone.
+    previously_active = [
+        r["campaign_id"] for r in
+        await pool.fetch("select campaign_id from campaigns where active")
+    ]
     await pool.execute("update campaigns set active = false")
     try:
         yield
@@ -62,6 +74,14 @@ async def _isolate(request):
         # must not remain active after a test run and block the real scheduler
         # or readiness check in a shared development database.
         await pool.execute("update campaigns set active = false where name like 'pipeline-%'")
+        # Put the operator's campaigns back exactly as they were. Scoped to the
+        # ids captured above, so a campaign created DURING the test is never
+        # activated by accident.
+        if previously_active:
+            await pool.execute(
+                "update campaigns set active = true where campaign_id = any($1::uuid[])",
+                previously_active,
+            )
 
 
 @pytest.fixture
