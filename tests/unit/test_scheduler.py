@@ -483,6 +483,7 @@ async def test_retry_sweeper_returns_failed_leads_to_the_dialling_pool(monkeypat
     monkeypatch.setattr(scheduler.worker, "reaper_sweep", noop)
     monkeypatch.setattr(scheduler.worker, "reap_stranded_calls", noop)
     monkeypatch.setattr(scheduler.worker, "reconcile_live_slots", noop)
+    monkeypatch.setattr(scheduler.worker, "reap_orphaned_queued_leads", noop)
 
     await scheduler.retry_sweeper()
 

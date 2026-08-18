@@ -504,3 +504,70 @@ async def test_lead_is_left_for_the_reaper_when_recovery_itself_fails(mocks, mon
     await worker.process_one(str(mocks.lead.lead_id))  # must not raise
 
     assert mocks.calls.get("ack", []) == []  # deliberately NOT acked
+
+
+async def test_a_never_dialled_calling_lead_is_released_rather_than_dropped(
+    mocks, monkeypatch,
+):
+    """The crashed-reservation case, and the one recovery path that did not exist.
+
+    If the process dies between mark_calling and record_dial_attempt — a window
+    spanning the whole preflight round-trip — the lead is left 'calling' with no
+    last_called_at. stale_calling_leads() cannot see it (it has no clock to
+    measure), and the reaper's requeue is silently rejected here by
+    mark_calling's WHERE status='queued' guard. The log then said "reaper
+    requeued 1 stuck lead" while the lead was acked away into no queue and no
+    processing list: permanently uncallable, recoverable only by hand.
+    """
+    released = []
+
+    async def reject(lead_id):
+        return False
+
+    async def release(lead_id):
+        released.append(lead_id)
+        return True
+
+    monkeypatch.setattr(worker.leads_db, "mark_calling", reject)
+    monkeypatch.setattr(worker.leads_db, "release_undialed_calling_lead", release)
+    monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
+
+    await worker.process_one(str(mocks.lead.lead_id))
+
+    assert released == [mocks.lead.lead_id], "the stranded lead was dropped again"
+    assert mocks.calls["record_dial_attempt"] == []   # still never dialled
+
+
+async def test_queued_leads_missing_from_redis_are_returned_to_pending(monkeypatch):
+    """CLAUDE.md says Redis is ephemeral and safe to flush. It wasn't.
+
+    campaign_tick moves a lead to 'queued' in Postgres and then relies solely on
+    a calls:queue entry to carry it forward. Nothing ever moved 'queued' back to
+    'pending', due_leads() selects only 'pending', and neither reaper inspects
+    that status — so a FLUSHALL, a recreated container, or maxmemory eviction
+    stranded every queued lead permanently.
+    """
+    class _R:
+        async def lrange(self, key, start, stop):
+            return {"calls:queue": ["still-queued"],
+                    "calls:processing": ["being-worked"]}.get(key, [])
+
+    released = []
+
+    async def queued_ids():
+        return ["still-queued", "being-worked", "orphan-a", "orphan-b"]
+
+    async def release(lead_id):
+        released.append(lead_id)
+        return True
+
+    monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _R())
+    monkeypatch.setattr(worker.leads_db, "queued_lead_ids", queued_ids)
+    monkeypatch.setattr(worker.leads_db, "release_orphaned_queued_lead", release)
+
+    n = await worker.reap_orphaned_queued_leads()
+
+    assert sorted(released) == ["orphan-a", "orphan-b"]
+    assert n == 2
+    assert "still-queued" not in released, "a lead still in the queue was reset"
+    assert "being-worked" not in released, "a lead being dialled right now was reset"

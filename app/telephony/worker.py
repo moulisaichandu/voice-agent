@@ -169,6 +169,44 @@ async def reaper_sweep(timeout_s: int) -> int:
     return n
 
 
+async def reap_orphaned_queued_leads() -> int:
+    """Return leads that are 'queued' in Postgres but present in neither Redis list.
+
+    campaign_tick reserves a lead as 'queued' and then relies solely on a
+    calls:queue entry to carry it forward. Nothing anywhere moved 'queued' back
+    to 'pending'; due_leads() selects only 'pending'; reaper_sweep inspects only
+    calls:processing and reap_stranded_calls only 'calling'. So losing the
+    Redis list — a FLUSHALL (which CLAUDE.md documents as safe), a recreated
+    container without its volume, or maxmemory eviction — stranded every queued
+    lead permanently.
+
+    Membership, not a timestamp, is the test: BLMOVE moves an id from the queue
+    to the processing list atomically, so a live lead is always in exactly one
+    of them. Anything in neither has no carrier left.
+
+    The one race is a lead between mark_queued and its lpush, which this could
+    reset to 'pending'; the lpush then still happens and the worker's own
+    mark_calling guard rejects it harmlessly, and the lead is re-enqueued on the
+    next tick. Recoverable, unlike the state this repairs.
+    """
+    r = redis_client.get_redis()
+    carried = set(await r.lrange(QUEUE_KEY, 0, -1)) | set(
+        await r.lrange(PROCESSING_KEY, 0, -1))
+    n = 0
+    for lead_id in await leads_db.queued_lead_ids():
+        if lead_id in carried:
+            continue
+        if await leads_db.release_orphaned_queued_lead(lead_id):
+            n += 1
+    if n:
+        logger.warning(
+            f"[worker] returned {n} lead(s) to 'pending' that were reserved as "
+            "'queued' but had no entry in either Redis list — the queue was "
+            "flushed or lost while they were waiting."
+        )
+    return n
+
+
 # Lower calls:live:count to a target, atomically, and never raise it. Done in
 # Lua so the read and the write cannot interleave with a worker acquiring a
 # slot between them — which would otherwise clobber a legitimate acquisition.
@@ -328,7 +366,20 @@ async def process_one(lead_id: str) -> None:
 
         # Reserve-before-act (module docstring point 2).
         if not await leads_db.mark_calling(lead.lead_id):
-            logger.info(f"[worker] lead {lead_id} already left 'queued' — skipping")
+            # Usually a benign race: another worker moved this lead on. But it
+            # is ALSO how a crashed reservation looks — a lead left 'calling'
+            # with no attempt recorded, which the reaper requeues and this
+            # guard then rejects, acking it away into no queue and no
+            # processing list. release_undialed_calling_lead can tell the two
+            # apart (see its docstring) and only ever frees the crashed one.
+            if await leads_db.release_undialed_calling_lead(lead.lead_id):
+                logger.warning(
+                    f"[worker] lead {lead_id} was stuck in 'calling' with no "
+                    "dial attempt recorded — a reservation whose process died. "
+                    "Released back to 'pending'."
+                )
+            else:
+                logger.info(f"[worker] lead {lead_id} already left 'queued' — skipping")
             return
         reserved = True
 

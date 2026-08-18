@@ -147,6 +147,10 @@ async def retry_sweeper() -> None:
     # 4. ...and any slot left behind with no lead to attribute it to, which
     #    step 3 structurally cannot see.
     await worker.reconcile_live_slots()
+    # 5. Queue recovery — leads reserved as 'queued' whose Redis entry is gone
+    #    (a flush, a recreated container, an eviction). Nothing else looks at
+    #    that status, so without this they wait forever.
+    await worker.reap_orphaned_queued_leads()
 
 
 async def dnd_refresh() -> None:

@@ -596,3 +596,36 @@ async def test_a_sheet_sync_does_not_erase_consent_captured_by_file_import(campa
     assert after.consent_at is not None
     due = await leads_db.due_leads(limit=50, campaign_id=campaign.campaign_id)
     assert after.lead_id in [x.lead_id for x in due], "lead became undialable"
+
+
+async def test_a_calling_lead_that_was_never_dialled_can_be_released(campaign):
+    """last_called_at is NULL only if record_dial_attempt never ran, and that
+    runs before placement — so such a lead cannot have a live call."""
+    lead = await leads_db.upsert_lead(
+        sheet_row=None, name="crashed", phone_e164=_uniq_phone(),
+        campaign_id=campaign.campaign_id, consent_basis="explicit",
+        consent_at=datetime.now(timezone.utc),
+    )
+    await leads_db.mark_queued(lead.lead_id)
+    await leads_db.mark_calling(lead.lead_id)          # crash lands right here
+
+    assert await leads_db.release_undialed_calling_lead(lead.lead_id) is True
+    assert (await leads_db.get_lead(lead.lead_id)).status == "pending"
+    due = await leads_db.due_leads(limit=50, campaign_id=campaign.campaign_id)
+    assert lead.lead_id in [x.lead_id for x in due], "still uncallable"
+
+
+async def test_a_lead_with_a_real_call_in_flight_is_never_released(campaign):
+    """The guard that stops this becoming a double-dial: a lead whose attempt
+    was actually placed must be left to reap_stranded_calls, not reset here."""
+    lead = await leads_db.upsert_lead(
+        sheet_row=None, name="in-flight", phone_e164=_uniq_phone(),
+        campaign_id=campaign.campaign_id, consent_basis="explicit",
+        consent_at=datetime.now(timezone.utc),
+    )
+    await leads_db.mark_queued(lead.lead_id)
+    await leads_db.mark_calling(lead.lead_id)
+    await leads_db.record_dial_attempt(lead.lead_id)   # the call went out
+
+    assert await leads_db.release_undialed_calling_lead(lead.lead_id) is False
+    assert (await leads_db.get_lead(lead.lead_id)).status == "calling"

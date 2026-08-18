@@ -197,6 +197,58 @@ async def mark_result_if_calling(lead_id: UUID, status: str) -> bool:
     return result.endswith("1")
 
 
+async def queued_lead_ids() -> list[str]:
+    """Every lead currently reserved as 'queued', as strings.
+
+    Strings because the only caller compares them against Redis list members,
+    which are strings. See worker.reap_orphaned_queued_leads.
+    """
+    pool = await get_pool()
+    rows = await pool.fetch("select lead_id from leads where status = 'queued'")
+    return [str(r["lead_id"]) for r in rows]
+
+
+async def release_orphaned_queued_lead(lead_id) -> bool:
+    """Return a 'queued' lead to 'pending' so due_leads() can select it again.
+
+    Guarded on 'queued' so this can never disturb a lead that has moved on to
+    'calling' since the caller took its snapshot.
+    """
+    pool = await get_pool()
+    result = await pool.execute(
+        "update leads set status = 'pending' "
+        "where lead_id = $1 and status = 'queued'",
+        UUID(str(lead_id)),
+    )
+    return result.endswith("1")
+
+
+async def release_undialed_calling_lead(lead_id: UUID) -> bool:
+    """Return a lead reserved for a call that was never actually placed.
+
+    The crashed-reservation case. worker.process_one moves a lead to 'calling'
+    BEFORE dialling, then runs preflight, then record_dial_attempt, then places
+    the call. A process death anywhere in that window leaves the lead 'calling'
+    with last_called_at NULL — and nothing could recover it:
+    stale_calling_leads() has no clock to measure it by, and the reaper's
+    requeue is rejected by mark_calling's `where status='queued'` guard, so the
+    lead was acked away into no queue and no processing list.
+
+    `last_called_at is null` is the safety guard, not an optimisation: that
+    column is written by record_dial_attempt, which runs BEFORE placement, so a
+    NULL there means no call can possibly be in flight. A lead whose attempt was
+    really placed stays 'calling' and is left to reap_stranded_calls, which is
+    bounded by CALL_MAX_DURATION_S and is the right owner for it.
+    """
+    pool = await get_pool()
+    result = await pool.execute(
+        "update leads set status = 'pending' "
+        "where lead_id = $1 and status = 'calling' and last_called_at is null",
+        lead_id,
+    )
+    return result.endswith("1")
+
+
 async def requeue_failed_leads(*, cooldown_s: int) -> list[UUID]:
     """Return 'failed' leads that still have attempts left to the dialling pool.
 
