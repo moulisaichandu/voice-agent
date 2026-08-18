@@ -65,8 +65,44 @@ services:
   # .env — a reachable value there wins and discovery is skipped.
   cloudflared:
     image: cloudflare/cloudflared:latest
-    # --metrics serves /quicktunnel, which is how the backend learns the URL.
-    command: tunnel --no-autoupdate --metrics 0.0.0.0:20241 --url http://backend:8000
+    environment:
+      # Set this in .env to switch from a QUICK tunnel to a NAMED one.
+      #
+      # A quick tunnel mints a brand-new random hostname on every start. That is
+      # fine for the URL this app hands Plivo, because resolve_public_url.sh
+      # asks the tunnel for its current hostname at boot — but it is NOT fine
+      # for anything configured OUTSIDE this repo against that hostname. The
+      # ElevenLabs agent's search-tool URL and its transcript webhook both live
+      # in the ElevenLabs dashboard, and both rot silently on every rotation:
+      # calls still connect, every readiness check stays green, and the agent
+      # simply cannot answer questions about the courses. Found exactly that on
+      # 2026-08-18 — the configured tool URL pointed at a tunnel dead for days.
+      #
+      # A named tunnel has a hostname YOU choose, on a domain you own, and it
+      # survives restarts and reboots. Get the token from the Cloudflare
+      # dashboard (Zero Trust -> Networks -> Tunnels -> Create a tunnel ->
+      # Docker), then add a Public Hostname routing to http://backend:8000.
+      # No cloudflared login, cert.pem or config file is needed for this route.
+      #
+      # Once it is set, also set PUBLIC_BASE_URL in .env to that hostname:
+      # resolve_public_url.sh prefers an explicit, REACHABLE PUBLIC_BASE_URL
+      # over tunnel discovery (its precedence rule 1), so nothing else changes.
+      CLOUDFLARE_TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    # One service, two modes, chosen by whether that token is set — so adopting
+    # a named tunnel is a .env edit and a restart, with no compose change and no
+    # window where the tunnel is down.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ -n "$${CLOUDFLARE_TUNNEL_TOKEN}" ]; then
+          echo "[cloudflared] NAMED tunnel: stable hostname, survives restarts" >&2
+          exec cloudflared tunnel --no-autoupdate run --token "$${CLOUDFLARE_TUNNEL_TOKEN}"
+        fi
+        echo "[cloudflared] QUICK tunnel: hostname changes on EVERY restart." >&2
+        echo "[cloudflared] Anything configured against it outside this repo" >&2
+        echo "[cloudflared] (the ElevenLabs tool URL and webhook) will rot." >&2
+        # --metrics serves /quicktunnel, which is how the backend learns the URL.
+        exec cloudflared tunnel --no-autoupdate --metrics 0.0.0.0:20241 --url http://backend:8000
     restart: unless-stopped
     depends_on: [backend]
 
