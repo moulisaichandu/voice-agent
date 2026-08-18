@@ -43,8 +43,13 @@ async def upsert_lead(
             set sheet_row = excluded.sheet_row,
                 name = excluded.name,
                 language_pref = excluded.language_pref,
-                consent_basis = excluded.consent_basis,
-                consent_at = excluded.consent_at,
+                -- coalesced, like dial_order below: sheets_sync passes NULL
+                -- for a Sheet with no consent columns, and overwriting a
+                -- consent captured by the file-import path silently makes a
+                -- dialable lead undialable. A background job must never be
+                -- able to clear a compliance field.
+                consent_basis = coalesce(excluded.consent_basis, leads.consent_basis),
+                consent_at = coalesce(excluded.consent_at, leads.consent_at),
                 dial_order = coalesce(excluded.dial_order, leads.dial_order)
         returning *
         """,
@@ -190,6 +195,42 @@ async def mark_result_if_calling(lead_id: UUID, status: str) -> bool:
         lead_id, status,
     )
     return result.endswith("1")
+
+
+async def requeue_failed_leads(*, cooldown_s: int) -> list[UUID]:
+    """Return 'failed' leads that still have attempts left to the dialling pool.
+
+    Without this, `max_attempts` is dead for exactly the calls it exists for.
+    call_routes._finalise_call writes 'failed' for any call that connected but
+    did not run its course, and due_leads() selects only 'pending' — so nothing
+    anywhere moved a lead back, and a single provider failure retired it
+    permanently at attempt 1 of 2.
+
+    Observed live 2026-08: an ElevenLabs account in `past_due` refuses the agent
+    WebSocket AFTER Plivo connects the leg, so every English/Hindi lead was
+    marked 'failed' and silently removed from the campaign for good.
+
+    *cooldown_s* keeps a provider outage from becoming a tight redial loop
+    against the same people — a lead is only eligible once that long has passed
+    since its last attempt. `attempts < c.max_attempts` is the same predicate
+    due_leads() uses, so exhausted leads stay terminal and this can never become
+    an infinite redial.
+    """
+    pool = await get_pool()
+    rows = await pool.fetch(
+        """
+        update leads l set status = 'pending'
+        from campaigns c
+        where c.campaign_id = l.campaign_id
+          and l.status = 'failed'
+          and l.attempts < c.max_attempts
+          and (l.last_called_at is null
+               or l.last_called_at < now() - ($1::int * interval '1 second'))
+        returning l.lead_id
+        """,
+        cooldown_s,
+    )
+    return [r["lead_id"] for r in rows]
 
 
 async def mark_dnd(lead_id: UUID) -> str | None:

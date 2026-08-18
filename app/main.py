@@ -37,6 +37,7 @@ from app.config import (
     SCHEDULER_ENABLED,
     WORKER_ENABLED,
 )
+from app.rag import embeddings
 from app.telephony import conversation_llm, worker
 
 setup_logging(LOG_LEVEL)
@@ -191,7 +192,15 @@ async def lifespan(app: FastAPI):
         logger.warning("[startup] WORKER_ENABLED but Redis is down — "
                        "the call worker is not starting.")
 
+    # Open the OpenAI embeddings connection now, so no lead ever pays the
+    # handshake. Fire-and-forget: it must not delay serving, and
+    # embeddings.warm() swallows its own failures — see its docstring for the
+    # live call this comes from.
+    warm_task = asyncio.create_task(embeddings.warm())
+
     yield
+
+    warm_task.cancel()
 
     if worker_task is not None:
         worker_stop_event.set()

@@ -1910,3 +1910,28 @@ async def test_tool_round_exhaustion_speaks_a_fallback(monkeypatch):
     await convo._reply(tts)
 
     assert sarvam_bridge._FALLBACK_REPROMPT in tts.spoken
+
+
+# ── goodbye detection must not fire inside an ordinary word ─────────────────
+#
+# "బై" (bye) is two codepoints and sits INSIDE common Telugu words: మొబైల్
+# (mobile) and బైక్ (bike) both contain it. A raw substring test therefore
+# hangs up on a lead who says "send it to my mobile number" — mid-sentence,
+# with the agent saying nothing, graded a clean exit, and the lead marked done
+# so they are never called back. The Latin path already avoids this with an
+# anchored regex; the phrase list did not.
+
+@pytest.mark.parametrize("text", [
+    "నా మొబైల్ నంబర్‌కి పంపండి",   # "send it to my mobile number"
+    "మొబైల్ మార్కెటింగ్ ఉందా?",      # "is there mobile marketing?"
+    "బైక్ కోర్సు ఉందా?",             # "is there a bike course?"
+])
+def test_a_telugu_word_that_merely_contains_bye_is_not_a_goodbye(text):
+    assert not sarvam_bridge._is_lead_goodbye(text), (
+        f"{text!r} hung up on a lead who was still asking questions"
+    )
+
+
+@pytest.mark.parametrize("text", ["బై", "థాంక్స్, బై.", "ఇక అంతే", "సరే, ఇక అంతే."])
+def test_a_real_telugu_goodbye_is_still_detected(text):
+    assert sarvam_bridge._is_lead_goodbye(text)

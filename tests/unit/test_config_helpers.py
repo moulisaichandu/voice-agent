@@ -156,3 +156,58 @@ def test_a_malformed_realtime_threshold_warns_and_keeps_the_default(monkeypatch,
     with caplog.at_level("WARNING"):
         assert config._float("OPENAI_REALTIME_VAD_THRESHOLD", 0.5) == 0.5
     assert "OPENAI_REALTIME_VAD_THRESHOLD" in caplog.text
+
+
+# ── a dial lock must outlive the call it guards ────────────────────────────
+#
+# The `dialing:<phone>` lock stops one number being dialled twice at once, but
+# it was a flat 60s while a call may run CALL_MAX_DURATION_S (300s) — so it
+# stopped protecting four minutes before the first call could end. A person
+# enrolled in two campaigns could be rung a second time while still talking to
+# the agent: both legs billed, and the second attempt burned against
+# max_attempts for a conversation that already happened.
+
+def test_the_dialing_lock_outlives_the_longest_possible_call():
+    from app import config
+
+    assert config.DIALING_LOCK_TTL_S >= (
+        config.CALL_RING_TIMEOUT_S + config.CALL_MAX_DURATION_S
+    ), (
+        f"lock expires after {config.DIALING_LOCK_TTL_S}s but a call can ring "
+        f"for {config.CALL_RING_TIMEOUT_S}s then run for "
+        f"{config.CALL_MAX_DURATION_S}s — the same person can be dialled twice"
+    )
+
+
+# ── a calling window that can never open must not pass silently ────────────
+#
+# `END=0` is the natural way to write midnight, but the code means [start, end)
+# on a 24-hour clock and wants 24. `9 <= hour < 0` is false at every hour of
+# every day: all dialling stops permanently while the readiness dashboard still
+# reports it can dial.
+
+def test_an_inverted_calling_window_falls_back_to_the_defaults():
+    from app import config
+
+    assert config._validated_hours(9, 0) == (
+        config._DEFAULT_HOURS_START, config._DEFAULT_HOURS_END)
+
+
+def test_an_out_of_range_calling_window_falls_back_to_the_defaults():
+    from app import config
+
+    assert config._validated_hours(-3, 99) == (
+        config._DEFAULT_HOURS_START, config._DEFAULT_HOURS_END)
+
+
+def test_a_fully_open_window_is_still_allowed():
+    """0-24 is the owner's deliberate current setting; it must keep working."""
+    from app import config
+
+    assert config._validated_hours(0, 24) == (0, 24)
+
+
+def test_an_ordinary_window_is_left_alone():
+    from app import config
+
+    assert config._validated_hours(10, 19) == (10, 19)

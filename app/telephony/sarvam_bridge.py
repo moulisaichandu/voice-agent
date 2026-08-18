@@ -107,6 +107,25 @@ _GOODBYE_PHRASES = (
     "బై",
 )
 
+# Telugu writes case endings onto the word, so "బై" (bye) is a SUBSTRING of
+# మొబైల్ (mobile) and బైక్ (bike). Matching the phrase list with a bare `in`
+# hung up on a lead saying "send it to my mobile number" — mid-sentence, agent
+# silent, graded a clean exit (sarvam_lead_goodbye is in _CLEAN_EXITS), lead
+# marked done and never called back. Phrases are matched as whole TOKENS
+# instead: the same word-boundary discipline _GOODBYE_RE already applies to the
+# Latin spellings, which is why the English path never had this bug.
+_GOODBYE_STRIP = ".,!?;:'\"()[]{}…।॥"
+
+
+def _goodbye_tokens(text: str) -> list[str]:
+    """Whitespace tokens with edge punctuation removed, so "బై." still matches."""
+    return [t for t in (w.strip(_GOODBYE_STRIP) for w in text.split()) if t]
+
+
+_GOODBYE_PHRASE_TOKENS = tuple(
+    _goodbye_tokens(phrase.casefold()) for phrase in _GOODBYE_PHRASES
+)
+
 # Spoken when the model calls end_call with no farewell text at all — not
 # suppressed (see _reply's ends_call handling), just never generated. Per
 # CLAUDE.md, measured against the live API: told to say goodbye AND call
@@ -150,8 +169,14 @@ def _is_lead_goodbye(text: str) -> bool:
     goodbye.
     """
     normalized = " ".join(text.strip().split()).casefold()
-    return bool(_GOODBYE_RE.search(normalized)) or any(
-        phrase in normalized for phrase in _GOODBYE_PHRASES
+    if _GOODBYE_RE.search(normalized):
+        return True
+    tokens = _goodbye_tokens(normalized)
+    return any(
+        tokens[i:i + len(phrase)] == phrase
+        for phrase in _GOODBYE_PHRASE_TOKENS
+        if phrase
+        for i in range(len(tokens) - len(phrase) + 1)
     )
 
 # How long to wait for the lead to finish before answering.

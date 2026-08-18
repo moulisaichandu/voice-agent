@@ -42,6 +42,7 @@ from app.config import (
     CALLING_HOURS_TZ,
     CAMPAIGN_TICK_SECONDS,
     MAX_CONCURRENT_CALLS,
+    PER_NUMBER_RETRY_COOLDOWN_S,
     PROCESSING_REAPER_TIMEOUT_S,
     RETRY_SWEEP_MINUTES,
     SHEETS_SYNC_MINUTES,
@@ -126,13 +127,18 @@ async def retry_sweeper() -> None:
       1. Crash recovery — anything still in calls:processing past
          PROCESSING_REAPER_TIMEOUT_S means the worker that popped it died
          before acking; requeue it (see worker.reaper_sweep's docstring).
-      2. Business retry — leads whose calls didn't connect (no_answer/failed,
-         under their campaign's max_attempts) are already left in a
-         non-terminal DB status by the worker; nothing further is needed here
-         beyond the reaper today, since due_leads() already re-selects them
-         on the next campaign_tick once they're back to 'pending'.
+      2. Business retry — leads left 'failed' by a call that connected but did
+         not run its course. due_leads() selects only 'pending', and nothing
+         else in the codebase moves a lead out of 'failed', so without this
+         step max_attempts is silently never honoured for exactly the calls it
+         exists for. See leads_db.requeue_failed_leads.
     """
     await worker.reaper_sweep(PROCESSING_REAPER_TIMEOUT_S)
+    requeued = await leads_db.requeue_failed_leads(
+        cooldown_s=PER_NUMBER_RETRY_COOLDOWN_S)
+    if requeued:
+        logger.info(f"[scheduler] returned {len(requeued)} failed lead(s) to "
+                    "'pending' — still under their campaign's max_attempts")
     # 3. Slot recovery — a call whose process died mid-flight never ran either
     #    teardown path, so its concurrency slot was never returned and its lead
     #    is still 'calling'. Bounded by CALL_MAX_DURATION_S plus slack, so a

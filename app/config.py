@@ -397,8 +397,39 @@ PUBLIC_BASE_URL: str | None = os.getenv("PUBLIC_BASE_URL")
 # ── COMPLIANCE (India TCCCPR) ─────────────────────────────────────────────────
 # Calling-hours window, IST. APScheduler's campaign_tick only enqueues leads
 # inside this window; anything outside is deferred to the next window.
-CALLING_HOURS_START = _int("CALLING_HOURS_START", 10)   # 10:00 IST
-CALLING_HOURS_END = _int("CALLING_HOURS_END", 19)        # 19:00 IST
+_DEFAULT_HOURS_START = 10   # 10:00 IST
+_DEFAULT_HOURS_END = 19     # 19:00 IST
+
+
+def _validated_hours(start: int, end: int) -> tuple[int, int]:
+    """Reject a window that can never open, rather than silently never dialling.
+
+    The gate is [start, end) on a 24-hour clock, so midnight as an END is 24,
+    not 0 — but `CALLING_HOURS_END=0` is the natural thing to write, and it
+    makes `start <= hour < 0` false at every hour of every day. Dialling then
+    stops completely while the readiness dashboard still reports it can dial,
+    because that check only asks whether NOW is inside the window, never
+    whether the window is satisfiable.
+
+    Same warn-and-default contract as the _int/_bool helpers above: a malformed
+    override is loud and survivable, never a silent behaviour change. A fully
+    open 0-24 window is legitimate and passes untouched.
+    """
+    if not (0 <= start < end <= 24):
+        logger.warning(
+            f"CALLING_HOURS_START={start}/CALLING_HOURS_END={end} describes a "
+            f"window that can never open (the gate is [start, end) on a 24-hour "
+            f"clock, so midnight as an end is 24, not 0). Falling back to "
+            f"{_DEFAULT_HOURS_START}-{_DEFAULT_HOURS_END}."
+        )
+        return _DEFAULT_HOURS_START, _DEFAULT_HOURS_END
+    return start, end
+
+
+CALLING_HOURS_START, CALLING_HOURS_END = _validated_hours(
+    _int("CALLING_HOURS_START", _DEFAULT_HOURS_START),
+    _int("CALLING_HOURS_END", _DEFAULT_HOURS_END),
+)
 CALLING_HOURS_TZ = os.getenv("CALLING_HOURS_TZ", "Asia/Kolkata")
 
 # ── CAMPAIGN / DIALLING ────────────────────────────────────────────────────────
@@ -408,7 +439,15 @@ CAMPAIGN_TICK_SECONDS = _int("CAMPAIGN_TICK_SECONDS", 60)
 RETRY_SWEEP_MINUTES = _int("RETRY_SWEEP_MINUTES", 15)
 TRANSCRIPT_RECONCILE_MINUTES = _int("TRANSCRIPT_RECONCILE_MINUTES", 30)
 SHEETS_SYNC_MINUTES = _int("SHEETS_SYNC_MINUTES", 10)
-DIALING_LOCK_TTL_S = _int("DIALING_LOCK_TTL_S", 60)
+# Derived, not an independent number: this lock exists to stop ONE phone number
+# being dialled twice at once, so it has to outlive the call it is guarding. At
+# a flat 60s against CALL_MAX_DURATION_S=300 it stopped protecting four minutes
+# before the first call could end — and a person enrolled in two campaigns (two
+# lead rows, which the schema explicitly allows) could be rung a second time
+# while still talking to the agent: both legs billed, and the second attempt
+# burned against max_attempts for a conversation that already happened.
+DIALING_LOCK_TTL_S = _int(
+    "DIALING_LOCK_TTL_S", CALL_RING_TIMEOUT_S + CALL_MAX_DURATION_S + 60)
 PROCESSING_REAPER_TIMEOUT_S = _int("PROCESSING_REAPER_TIMEOUT_S", 300)
 
 # ── SCHEDULER ─────────────────────────────────────────────────────────────────

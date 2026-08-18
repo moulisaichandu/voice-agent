@@ -465,3 +465,26 @@ async def test_a_configured_sheet_still_drains_normally(monkeypatch):
     await scheduler.transcript_reconcile()
 
     assert written == [ok_id]
+
+
+async def test_retry_sweeper_returns_failed_leads_to_the_dialling_pool(monkeypatch):
+    """The docstring already promised business retry "once they're back to
+    'pending'" — nothing ever put them back. This is the missing half."""
+    called = {}
+
+    async def fake_requeue(*, cooldown_s):
+        called["cooldown_s"] = cooldown_s
+        return []
+
+    async def noop(*a, **kw):
+        return None
+
+    monkeypatch.setattr(scheduler.leads_db, "requeue_failed_leads", fake_requeue)
+    monkeypatch.setattr(scheduler.worker, "reaper_sweep", noop)
+    monkeypatch.setattr(scheduler.worker, "reap_stranded_calls", noop)
+    monkeypatch.setattr(scheduler.worker, "reconcile_live_slots", noop)
+
+    await scheduler.retry_sweeper()
+
+    assert "cooldown_s" in called, "retry_sweeper never requeued failed leads"
+    assert called["cooldown_s"] == scheduler.PER_NUMBER_RETRY_COOLDOWN_S
