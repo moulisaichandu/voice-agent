@@ -862,3 +862,42 @@ async def test_malformed_tool_arguments_do_not_crash_the_call(bridged, monkeypat
     )
     # Must not raise, and the call still records a normal (if empty) outcome.
     assert outcome["status"] in ("done", "failed")
+
+
+# ── the rollback backend must bound its own course lookup ──────────────────
+#
+# TELUGU_BACKEND=openai_realtime is the documented one-line rollback, reached
+# precisely when Sarvam is misbehaving. Its RAG lookup was awaited with no
+# deadline inside the single WebSocket reader loop: search_relevant has no
+# deadline of its own (an embed retry alone is ~16s, plus a translate-and-retry
+# on a miss), and this backend has no silence watchdog — so a slow lookup is
+# unbounded dead air on a live call. The Sarvam bridge already wraps the same
+# call in RAG_VOICE_DEADLINE_S; this backend never did.
+
+async def test_a_slow_course_lookup_is_bounded_on_the_rollback_backend(monkeypatch):
+    import asyncio as _asyncio
+
+    from app.telephony import openai_bridge as ob
+
+    async def never_returns(query, *a, **kw):
+        await _asyncio.sleep(3600)
+
+    monkeypatch.setattr(ob, "search_relevant", never_returns)
+    monkeypatch.setattr(ob, "RAG_VOICE_DEADLINE_S", 0.05)
+
+    answer = await ob._lookup_course_material("fees")
+
+    assert answer == ob.NO_MATERIAL_NOTE, (
+        "a hung lookup held the lead on a silent line with no watchdog to end it"
+    )
+
+
+async def test_a_failing_course_lookup_still_returns_something_speakable(monkeypatch):
+    from app.telephony import openai_bridge as ob
+
+    async def boom(query, *a, **kw):
+        raise RuntimeError("pgvector is down")
+
+    monkeypatch.setattr(ob, "search_relevant", boom)
+
+    assert await ob._lookup_course_material("fees") == ob.NO_MATERIAL_NOTE

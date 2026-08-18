@@ -58,6 +58,12 @@ def _configured(monkeypatch, **overrides):
         "CONVERSATION_LLM_PROVIDER": "openai",
     }
     values.update(overrides)
+    # The conversation brain's key, for the same reason ELEVENLABS_API_KEY is
+    # here: preflight now refuses a two-way Sarvam campaign whose configured
+    # CONVERSATION_LLM_PROVIDER has no key, and tests/conftest.py builds a
+    # deliberately offline environment where none is set. Tests that want the
+    # missing-key path unset it themselves.
+    monkeypatch.setattr(pf.conversation_llm, "OPENAI_API_KEY", "sk-test")
     # preflight no longer reads a module-level PUBLIC_BASE_URL: it resolves the
     # live tunnel through public_url.refresh() so a hostname that rotated while
     # the process was running cannot be handed to Plivo. Tests still set it by
@@ -755,3 +761,41 @@ async def test_the_sarvam_breaker_is_not_checked_for_an_elevenlabs_backed_call(m
 
     monkeypatch.setattr(pf.sarvam_circuit_breaker, "tripped_reason", must_not_be_called)
     assert await pf.preflight("agent_1") is None
+
+
+# ── the conversation brain's key was never checked at all ───────────────────
+#
+# preflight's Sarvam branch checks SARVAM_API_KEY, the circuit breaker, and
+# that CONVERSATION_LLM_PROVIDER is not 'sarvam' — but never that the chosen
+# provider's key exists. With OPENAI_API_KEY unset, revoked or out of quota,
+# every turn raises and is answered with the spoken fallback, the call ends on
+# the silence watchdog (a clean exit), and a whole campaign of
+# non-conversations is recorded as successful calls. The two-way flag is
+# supposed to be proven by a live call; this made a broken one look proven.
+
+async def test_a_twoway_sarvam_campaign_is_refused_when_the_llm_key_is_missing(
+    monkeypatch,
+):
+    _configured(monkeypatch)
+    _telugu_backend(monkeypatch, "sarvam")
+    _set_twoway(monkeypatch, "sarvam", True)
+    monkeypatch.setattr(pf, "CONVERSATION_LLM_PROVIDER", "openai")
+    monkeypatch.setattr(pf.conversation_llm, "OPENAI_API_KEY", "")
+
+    reason = await pf.preflight("agent_1", "te", mode="twoway")
+
+    assert reason is not None
+    assert "OPENAI_API_KEY" in reason
+
+
+async def test_a_oneway_sarvam_campaign_does_not_need_the_conversation_key(
+    monkeypatch,
+):
+    """One-way never calls conversation_llm, so it must not gain a new way to
+    not dial — the same discipline the provider guard above already follows."""
+    _configured(monkeypatch)
+    _telugu_backend(monkeypatch, "sarvam")
+    monkeypatch.setattr(pf, "CONVERSATION_LLM_PROVIDER", "openai")
+    monkeypatch.setattr(pf.conversation_llm, "OPENAI_API_KEY", "")
+
+    assert await pf.preflight("agent_1", "te", mode="oneway") is None

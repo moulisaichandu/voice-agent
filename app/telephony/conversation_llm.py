@@ -243,6 +243,22 @@ async def aclose() -> None:
         _client_loop = None
 
 
+def missing_key_name() -> str | None:
+    """The env var that must be set for the configured provider, if it is not.
+
+    Exists so preflight can refuse BEFORE dialling. Without it, a missing or
+    revoked key is discovered one turn at a time on a live call: every turn
+    raises, each is answered with the spoken fallback, the call ends on the
+    silence watchdog — a clean exit — and a whole campaign of
+    non-conversations is recorded as successful calls.
+
+    Reads the module globals rather than app.config directly so a test can
+    monkeypatch them the same way every other guard here is tested.
+    """
+    _url, _model, key, key_name = _provider()
+    return None if key else key_name
+
+
 def _provider() -> tuple[str, str, str, str]:
     """(url, model, key, key_name) for the configured provider."""
     url, default_model, key_name = _PROVIDERS.get(

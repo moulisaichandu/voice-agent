@@ -46,6 +46,7 @@ transcoding — the same property the ElevenLabs path has.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -62,9 +63,10 @@ from app.config import (
     OPENAI_REALTIME_STT_MODEL,
     OPENAI_REALTIME_VAD_THRESHOLD,
     OPENAI_REALTIME_VOICE,
+    RAG_VOICE_DEADLINE_S,
 )
 from app.db.models import TranscriptTurn
-from app.rag.search import search_relevant
+from app.rag.search import NO_MATERIAL_NOTE, search_relevant
 
 # The MODULE, not just PlivoCall: everything Plivo-side is deliberately in one
 # place, and importing it this way keeps that visible (and keeps its tunables
@@ -203,6 +205,34 @@ def _session_update(*, lead_name: str | None, script: str | None,
         session["tool_choice"] = "auto"
 
     return {"type": "session.update", "session": session}
+
+
+
+async def _lookup_course_material(query: str) -> str:
+    """search_relevant, bounded — the same guard the Sarvam bridge applies.
+
+    search_relevant() has no deadline of its own (an embed alone is 8s with a
+    retry, and a miss adds a translate plus a second embed+match), and this
+    backend has NO silence watchdog: nothing here would end a call that went
+    quiet. An unbounded lookup is therefore unbounded dead air on the rollback
+    path — the one reached precisely when Sarvam is already misbehaving.
+
+    Failure degrades to a normal answer rather than escaping: the model is told
+    there is no material, which it can speak, instead of the reader task dying
+    mid-call. Mirrors sarvam_bridge._run_tools' handling for the same reason.
+    """
+    try:
+        return await asyncio.wait_for(search_relevant(query), RAG_VOICE_DEADLINE_S)
+    except asyncio.TimeoutError:
+        logger.warning(
+            f"[openai] course lookup for {query!r} did not finish inside "
+            f"{RAG_VOICE_DEADLINE_S}s — telling the model there is no material "
+            "rather than holding the lead on a silent line."
+        )
+        return NO_MATERIAL_NOTE
+    except Exception as exc:  # noqa: BLE001 - must not kill the reader task
+        logger.error(f"[openai] course lookup failed: {type(exc).__name__}: {exc}")
+        return NO_MATERIAL_NOTE
 
 
 async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
@@ -420,7 +450,8 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
                                 # relevance floor and always returns something
                                 # speakable, so the agent is never left
                                 # tool-calling with nothing to say.
-                                answer = await search_relevant(str(args.get("query") or ""))
+                                answer = await _lookup_course_material(
+                                    str(args.get("query") or ""))
                                 await oa.send(json.dumps({
                                     "type": "conversation.item.create",
                                     "item": {

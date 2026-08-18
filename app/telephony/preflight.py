@@ -230,6 +230,21 @@ async def preflight(
                 "a slow reply. Set CONVERSATION_LLM_PROVIDER=openai in .env (or "
                 "remove the line; that is already the default) and restart."
             )
+        # ...and the chosen provider must actually be usable. Checked here
+        # rather than discovered a turn at a time on a live call, where every
+        # turn fails into the spoken fallback, the call ends on the silence
+        # watchdog (a clean exit), and a campaign of non-conversations is
+        # recorded as successful calls.
+        if mode == "twoway":
+            missing = conversation_llm.missing_key_name()
+            if missing:
+                return (
+                    f"This campaign dials in '{language}' as a two-way call, "
+                    f"which is answered by CONVERSATION_LLM_PROVIDER="
+                    f"'{CONVERSATION_LLM_PROVIDER}' — but {missing} is not set. "
+                    "Every turn would fail and the lead would hear an apology "
+                    f"instead of an answer. Set {missing} in .env and restart."
+                )
         return None
     if call_backend == languages_module.OPENAI_REALTIME:
         if not OPENAI_API_KEY:

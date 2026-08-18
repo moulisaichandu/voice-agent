@@ -388,6 +388,13 @@ RAG_VOICE_DEADLINE_S = _float("RAG_VOICE_DEADLINE_S", 4.0)
 
 # ── GOOGLE SHEETS ─────────────────────────────────────────────────────────────
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "sa.json")
+# The same credential, inline, for containers. sa.json is in .dockerignore
+# (correctly — it is a secret and must never be baked into an image) and
+# nothing mounts it, so the FILE route cannot work under docker compose at all.
+# This is the route that can: paste the service-account JSON as one line in
+# .env, which is where CLAUDE.md says secrets live anyway. The file still wins
+# when it exists, so running uvicorn directly on the host is unchanged.
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 GOOGLE_SHEET_ID: str | None = os.getenv("GOOGLE_SHEET_ID")
 LEADS_WORKSHEET_NAME = os.getenv("LEADS_WORKSHEET_NAME", "Leads")
 

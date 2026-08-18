@@ -114,3 +114,52 @@ async def test_ingest_leaves_chunks_intact_if_embedding_fails(tmp_path, monkeypa
         await ingest.ingest_document(p)
 
     assert touched == [], "an embed failure must leave the existing chunks untouched"
+
+
+# ── a failed extraction must not delete the document's corpus ──────────────
+#
+# `if not chunks: clear_doc(...)` treats "the file is genuinely empty" and "text
+# extraction returned nothing" identically. Re-export a fee document as a
+# scanned PDF, or hit a pypdf version that yields "" for it, and every existing
+# chunk for that document is deleted while the console prints "0 chunk(s)" among
+# other lines. The agent then denies knowledge of those courses on every call,
+# and nothing anywhere reports it. The module already applies exactly this
+# reasoning to embed failures ("cleared first and embedded second... permanently
+# wiped the doc's corpus"); extraction deserves the same care.
+
+async def test_a_file_with_bytes_but_no_extractable_text_is_not_wiped(
+        tmp_path, monkeypatch):
+    from app.rag import ingest
+
+    doc = tmp_path / "fees.pdf"
+    doc.write_bytes(b"%PDF-1.7 scanned images, no text layer" * 20)
+    cleared = []
+
+    async def fake_clear(name):
+        cleared.append(name)
+
+    monkeypatch.setattr(ingest, "read_document", lambda p: "")
+    monkeypatch.setattr(ingest.rag_store, "clear_doc", fake_clear)
+
+    with pytest.raises(ingest.ExtractionFailed):
+        await ingest.ingest_document(doc)
+
+    assert cleared == [], "the document's chunks were deleted on a failed extract"
+
+
+async def test_a_genuinely_empty_file_still_clears_its_chunks(tmp_path, monkeypatch):
+    """A real deletion must still work — this guard must not strand old chunks."""
+    from app.rag import ingest
+
+    doc = tmp_path / "retired.md"
+    doc.write_text("", encoding="utf-8")
+    cleared = []
+
+    async def fake_clear(name):
+        cleared.append(name)
+
+    monkeypatch.setattr(ingest, "read_document", lambda p: "")
+    monkeypatch.setattr(ingest.rag_store, "clear_doc", fake_clear)
+
+    assert await ingest.ingest_document(doc) == 0
+    assert cleared == ["retired.md"]
