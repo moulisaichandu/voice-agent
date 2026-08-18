@@ -27,6 +27,7 @@ from app.config import (
     ALLOW_INSECURE_PUBLIC,
     ALLOWED_ORIGINS,
     APP_AUTH_TOKEN,
+    BUILD_ID,
     CALL_WEBHOOK_SECRET,
     CONVERSATION_LLM_PROVIDER,
     DATABASE_URL,
@@ -255,8 +256,13 @@ app.include_router(call_router)
 
 @app.get("/health", tags=["Health"])
 def health():
-    """Liveness check — used by the Dockerfile HEALTHCHECK and docker-compose."""
-    return {"status": "ok"}
+    """Liveness check — used by the Dockerfile HEALTHCHECK and docker-compose.
+
+    Carries the build id so a stale-image deploy is visible from outside the
+    container: compare this across a deploy and a value that did not change
+    means the image did not either, however much the code did.
+    """
+    return {"status": "ok", "build": BUILD_ID}
 
 
 if __name__ == "__main__":  # pragma: no cover - manual dev entrypoint

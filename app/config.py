@@ -6,6 +6,7 @@ All other modules import from here; nothing else reads os.environ directly.
 import logging
 import math
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -387,6 +388,24 @@ RAG_TRANSLATE_MODEL = os.getenv("RAG_TRANSLATE_MODEL", "gpt-4o-mini")
 RAG_VOICE_DEADLINE_S = _float("RAG_VOICE_DEADLINE_S", 4.0)
 
 # ── GOOGLE SHEETS ─────────────────────────────────────────────────────────────
+# Which build is running. Written into the image at build time by the
+# Dockerfile, so it CHANGES whenever the image is actually rebuilt and stays
+# identical when it is not. That is the whole point: `docker compose up
+# --force-recreate` silently reuses the old image while .env changes DO apply,
+# so code and config can disagree with nothing to show for it. Comparing this
+# value across a deploy is the cheapest way to prove a rebuild happened.
+# Falls back to "dev" when running uvicorn straight from a checkout.
+def _build_id() -> str:
+    stamped = Path(__file__).resolve().parent.parent / ".build-stamp"
+    try:
+        value = stamped.read_text(encoding="utf-8").strip()
+    except OSError:
+        return os.getenv("BUILD_ID", "dev")
+    return value or os.getenv("BUILD_ID", "dev")
+
+
+BUILD_ID = _build_id()
+
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "sa.json")
 # The same credential, inline, for containers. sa.json is in .dockerignore
 # (correctly — it is a secret and must never be baked into an image) and

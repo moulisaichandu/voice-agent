@@ -26,6 +26,7 @@ fire twice, per the blueprint's own "one scheduler, one instance" warning).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from datetime import datetime, timezone
@@ -221,6 +222,19 @@ _WRITEBACK_QUEUE = "sheets:writeback:queue"
 # and only removed after the write-back succeeds or is re-queued, so a crash
 # mid-drain leaves it recoverable instead of dropping the Sheet write-back.
 _WRITEBACK_PROCESSING = "sheets:writeback:processing"
+# Where an id goes when it can never succeed. write_back_lead returns False for
+# both a transient failure and the permanent "this phone has no row in the
+# Sheet", and every False used to be requeued with no counter and no ceiling.
+# File-imported and API-added leads are not in the Sheet BY DESIGN, so they
+# cycled through every sweep forever at 3-4 Sheets reads each — pushing the
+# batch over Google's per-minute quota, so genuine write-backs in the same batch
+# started failing too. Kept rather than dropped: the transcript is still in
+# Supabase, and this list is how an operator finds out which ones never landed.
+_WRITEBACK_DEAD = "sheets:writeback:dead"
+_WRITEBACK_ATTEMPTS_FMT = "sheets:writeback:attempts:{lead_id}"
+# Generous: a real Sheets outage lasting several sweeps must not evict anything.
+# At TRANSCRIPT_RECONCILE_MINUTES=30 this is a full day of trying.
+_WRITEBACK_MAX_ATTEMPTS = 48
 
 
 async def transcript_reconcile() -> None:
@@ -280,9 +294,30 @@ async def transcript_reconcile() -> None:
             success = False
         if success:
             ok += 1
+            with contextlib.suppress(Exception):
+                await r.delete(_WRITEBACK_ATTEMPTS_FMT.format(lead_id=lead_id_str))
         else:
             failed += 1
-            await r.lpush(_WRITEBACK_QUEUE, lead_id_str)  # retry on the next run
+            attempts = 0
+            with contextlib.suppress(Exception):
+                attempts = int(
+                    await r.incr(_WRITEBACK_ATTEMPTS_FMT.format(lead_id=lead_id_str)))
+            if attempts >= _WRITEBACK_MAX_ATTEMPTS:
+                # It is not coming back. Keep it somewhere an operator can find
+                # rather than retrying it against Google's quota forever.
+                await r.lpush(_WRITEBACK_DEAD, lead_id_str)
+                with contextlib.suppress(Exception):
+                    await r.delete(
+                        _WRITEBACK_ATTEMPTS_FMT.format(lead_id=lead_id_str))
+                logger.error(
+                    f"[scheduler] giving up on the Sheet write-back for lead "
+                    f"{lead_id_str} after {attempts} attempts — it is most "
+                    f"likely not in the Sheet at all (file-imported or added "
+                    f"via the API). Moved to {_WRITEBACK_DEAD}; the transcript "
+                    "itself is safe in Supabase."
+                )
+            else:
+                await r.lpush(_WRITEBACK_QUEUE, lead_id_str)  # retry next run
         # Ack: remove from the processing list now that it is either done or
         # safely back on the queue.
         await r.lrem(_WRITEBACK_PROCESSING, 1, lead_id_str)

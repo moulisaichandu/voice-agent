@@ -32,7 +32,7 @@ from app.db import calls as calls_db
 from app.db import campaigns as campaigns_db
 from app.db import leads as leads_db
 from app.db.pool import get_pool
-from app.telephony import elevenlabs_client, sarvam_circuit_breaker
+from app.telephony import elevenlabs_client, public_url, sarvam_circuit_breaker
 from app.telephony import preflight as preflight_module
 from app.telephony import worker as worker_module
 
@@ -105,6 +105,63 @@ def _check_calling_hours() -> dict:
     return {"key": "calling_hours", "status": "warning", "label": "Calling hours",
             "detail": f"Outside the {window} window — campaign_tick will not enqueue "
                       "anything until it reopens"}
+
+
+_LAST_PUBLIC_URL_KEY = "public_url:last_seen"
+
+
+async def _check_public_url_rotation() -> dict:
+    """Whether the tunnel hostname has changed since this check last ran.
+
+    Rotation is only handled in ONE direction. public_url.refresh() re-resolves
+    the hostname this app gives Plivo, so dialling keeps working and preflight
+    stays green. But the ElevenLabs agent's course-lookup tool URL and its
+    transcript webhook are configured against that same hostname in the
+    ElevenLabs DASHBOARD, and nothing here can re-point them. The resulting
+    failure is silent and specific: calls connect, every check is green, and
+    the agent simply cannot answer questions about the courses.
+
+    So this reports the rotation rather than trying to repair it. Warning, not
+    critical: dialling genuinely still works, and treating it as a hard stop
+    would ground a system that is only partly degraded. The real fix is a NAMED
+    Cloudflare tunnel, which public_url.py's own docstring already recommends.
+
+    Reports ONCE per rotation — the new value is stored, so a hostname that has
+    been seen stops warning. A read failure is reported rather than swallowed,
+    matching the breaker check's reasoning: "I could not tell" is the honest
+    answer, and silently reading as healthy is how the original problem stayed
+    invisible.
+    """
+    try:
+        current = await public_url.refresh()
+    except Exception as exc:  # noqa: BLE001 - one dead check must not take the dashboard down
+        return {"key": "public_url", "status": "warning", "label": "Public URL",
+                "detail": f"Could not resolve the tunnel: {type(exc).__name__}: {exc}"}
+    if not current:
+        return {"key": "public_url", "status": "warning", "label": "Public URL",
+                "detail": "No public URL is resolvable — Plivo cannot reach this "
+                          "app, so no call can connect."}
+    try:
+        r = redis_client.get_redis()
+        previous = await r.get(_LAST_PUBLIC_URL_KEY)
+        await r.set(_LAST_PUBLIC_URL_KEY, current)
+    except Exception as exc:  # noqa: BLE001
+        return {"key": "public_url", "status": "warning", "label": "Public URL",
+                "detail": f"Could not check for rotation: {type(exc).__name__}: {exc}"}
+    if previous and previous != current:
+        return {
+            "key": "public_url", "status": "warning", "label": "Public URL",
+            "detail": (
+                f"The tunnel rotated to {current} (was {previous}). Dialling is "
+                "unaffected — this app re-resolves it. But anything configured "
+                "against the OLD hostname is now dead, and nothing here can "
+                "update it: in the ElevenLabs dashboard, re-point the agent's "
+                "search-tool URL and the transcript webhook. A named Cloudflare "
+                "tunnel would stop this recurring."
+            ),
+        }
+    return {"key": "public_url", "status": "good", "label": "Public URL",
+            "detail": f"Stable at {current}"}
 
 
 async def _check_sarvam_circuit_breaker() -> dict:
@@ -386,7 +443,7 @@ async def _refresh_check(key: str, compute: Callable[[], Awaitable[dict]]) -> di
 # computation in _build_readiness() for the full reasoning. Module-level (not
 # inline in the set literal) so it reads as a considered, named policy rather
 # than a throwaway expression, matching _REQUIRED_FOR_DIALING's convention.
-_CAN_DIAL_IGNORED_WARNING_KEYS = {"calling_hours", "preflight"}
+_CAN_DIAL_IGNORED_WARNING_KEYS = {"calling_hours", "preflight", "public_url"}
 
 
 async def _build_readiness(*, force_refresh: bool) -> ReadinessResponse:
@@ -401,8 +458,10 @@ async def _build_readiness(*, force_refresh: bool) -> ReadinessResponse:
 
     breaker_check = await _check_sarvam_circuit_breaker()
 
+    url_check = await _check_public_url_rotation()
+
     cheap = [db_check, redis_check, worker_check, hours_check, config_check,
-             queue_check, breaker_check]
+             queue_check, breaker_check, url_check]
     for c in cheap:
         c["cached"] = False
         c["checked_at"] = now_iso

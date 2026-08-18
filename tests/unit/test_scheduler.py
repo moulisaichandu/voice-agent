@@ -228,6 +228,20 @@ class _FakeRedisQueue:
         # `items` seeds the queue.
         self._lists = {_WB_QUEUE: list(items), _WB_PROCESSING: []}
         self.lpush_calls = []  # values pushed back onto the QUEUE (re-queues)
+        self._counters = {}    # the per-id write-back attempt counters
+
+    async def incr(self, key):
+        self._counters[key] = self._counters.get(key, 0) + 1
+        return self._counters[key]
+
+    async def delete(self, key):
+        self._counters.pop(key, None)
+        self._lists.pop(key, None)
+        return 1
+
+    def listed(self, key):
+        """The contents of a list, for assertions."""
+        return self._lists.get(key, [])
 
     async def llen(self, key):
         return len(self._lists.setdefault(key, []))
@@ -489,3 +503,52 @@ async def test_retry_sweeper_returns_failed_leads_to_the_dialling_pool(monkeypat
 
     assert "cooldown_s" in called, "retry_sweeper never requeued failed leads"
     assert called["cooldown_s"] == scheduler.PER_NUMBER_RETRY_COOLDOWN_S
+
+
+async def test_a_permanently_unwritable_transcript_stops_being_retried(monkeypatch):
+    """A lead that is not in the Sheet at all can never succeed.
+
+    write_back_lead returns False both for a transient failure and for "this
+    phone has no row here", and every False was requeued with no counter, no
+    dead-letter and no drop. File-imported and API-added leads — which by design
+    are not in the Sheet — therefore cycled through every sweep forever at 3-4
+    Sheets reads each, pushing the batch over Google's per-minute quota so that
+    genuine write-backs in the same batch started failing too.
+    """
+    monkeypatch.setattr(scheduler.sheets_client, "unconfigured_reason", lambda: None)
+    doomed = str(uuid4())
+    r = _FakeRedisQueue([doomed])
+    monkeypatch.setattr(scheduler.redis_client, "get_redis", lambda: r)
+
+    async def always_fails(lead_id):
+        return False
+
+    monkeypatch.setattr(scheduler.sheets_writeback, "write_back_lead", always_fails)
+
+    for _ in range(scheduler._WRITEBACK_MAX_ATTEMPTS + 2):
+        await scheduler.transcript_reconcile()
+
+    assert r.lpush_calls.count(doomed) < scheduler._WRITEBACK_MAX_ATTEMPTS + 2, (
+        "the doomed id was requeued on every single sweep, forever"
+    )
+    assert doomed in r.listed(scheduler._WRITEBACK_DEAD), (
+        "it was dropped without a trace instead of being kept for inspection"
+    )
+
+
+async def test_a_transient_failure_is_still_retried(monkeypatch):
+    """The counter must not turn one bad sweep into a permanent drop."""
+    monkeypatch.setattr(scheduler.sheets_client, "unconfigured_reason", lambda: None)
+    flaky = str(uuid4())
+    r = _FakeRedisQueue([flaky])
+    monkeypatch.setattr(scheduler.redis_client, "get_redis", lambda: r)
+
+    async def fails_once(lead_id):
+        return False
+
+    monkeypatch.setattr(scheduler.sheets_writeback, "write_back_lead", fails_once)
+
+    await scheduler.transcript_reconcile()
+
+    assert r.lpush_calls == [flaky]
+    assert flaky not in r.listed(scheduler._WRITEBACK_DEAD)

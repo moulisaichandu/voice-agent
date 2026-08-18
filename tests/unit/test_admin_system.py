@@ -72,6 +72,15 @@ def _mock_all_healthy(monkeypatch, *, redis: _FakeRedis | None = None) -> _FakeR
 
     monkeypatch.setattr(admin_system.redis_client, "is_available", redis_ok)
 
+    # A stable tunnel. The rotation check reports a CHANGE, so "healthy" means
+    # the same hostname it saw last time — which is what a named tunnel, or an
+    # unrestarted cloudflared, actually looks like.
+    async def stable_url():
+        return "https://stable.trycloudflare.com"
+
+    r.store[admin_system._LAST_PUBLIC_URL_KEY] = "https://stable.trycloudflare.com"
+    monkeypatch.setattr(admin_system.public_url, "refresh", stable_url)
+
     async def fake_get_pool():
         return _FakePool()
 
@@ -848,3 +857,61 @@ async def test_clearing_an_untripped_breaker_is_harmless(client, monkeypatch):
 
     assert r.status_code == 200
     assert await admin_system.sarvam_circuit_breaker.tripped_reason() is None
+
+
+# ── the tunnel rotates in one direction only ────────────────────────────────
+#
+# public_url.refresh() re-resolves the hostname this app hands to Plivo, so
+# dialling keeps working and preflight stays green after a rotation. But the
+# ElevenLabs agent's course-lookup tool URL and its transcript webhook are
+# configured against that same rotating hostname in the ElevenLabs dashboard,
+# and nothing re-points or checks them. The failure is silent and specific:
+# calls connect, the dashboard is green, and the agent simply cannot answer
+# questions about the courses. The module's own docstring records 22 distinct
+# hostnames minted on this machine.
+
+async def test_a_rotated_tunnel_is_reported_rather_than_passing_silently(monkeypatch):
+    from app.admin import system as sys_mod
+
+    seen = {"stored": "https://old-hostname.trycloudflare.com"}
+
+    class _R:
+        async def get(self, key):
+            return seen["stored"]
+
+        async def set(self, key, value, **kw):
+            seen["stored"] = value
+            return True
+
+    async def resolve():
+        return "https://brand-new-hostname.trycloudflare.com"
+
+    monkeypatch.setattr(sys_mod.redis_client, "get_redis", lambda: _R())
+    monkeypatch.setattr(sys_mod.public_url, "refresh", resolve)
+
+    check = await sys_mod._check_public_url_rotation()
+
+    assert check["status"] == "warning"
+    assert "ElevenLabs" in check["detail"]
+    assert "brand-new-hostname" in check["detail"]
+    # ...and the new value is remembered, so it reports once, not forever.
+    assert seen["stored"] == "https://brand-new-hostname.trycloudflare.com"
+
+
+async def test_an_unchanged_tunnel_is_quiet(monkeypatch):
+    from app.admin import system as sys_mod
+
+    class _R:
+        async def get(self, key):
+            return "https://same-hostname.trycloudflare.com"
+
+        async def set(self, key, value, **kw):
+            return True
+
+    async def resolve():
+        return "https://same-hostname.trycloudflare.com"
+
+    monkeypatch.setattr(sys_mod.redis_client, "get_redis", lambda: _R())
+    monkeypatch.setattr(sys_mod.public_url, "refresh", resolve)
+
+    assert (await sys_mod._check_public_url_rotation())["status"] == "good"
