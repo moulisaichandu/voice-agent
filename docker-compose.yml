@@ -88,21 +88,17 @@ services:
       # resolve_public_url.sh prefers an explicit, REACHABLE PUBLIC_BASE_URL
       # over tunnel discovery (its precedence rule 1), so nothing else changes.
       CLOUDFLARE_TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
-    # One service, two modes, chosen by whether that token is set — so adopting
-    # a named tunnel is a .env edit and a restart, with no compose change and no
-    # window where the tunnel is down.
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        if [ -n "$${CLOUDFLARE_TUNNEL_TOKEN}" ]; then
-          echo "[cloudflared] NAMED tunnel: stable hostname, survives restarts" >&2
-          exec cloudflared tunnel --no-autoupdate run --token "$${CLOUDFLARE_TUNNEL_TOKEN}"
-        fi
-        echo "[cloudflared] QUICK tunnel: hostname changes on EVERY restart." >&2
-        echo "[cloudflared] Anything configured against it outside this repo" >&2
-        echo "[cloudflared] (the ElevenLabs tool URL and webhook) will rot." >&2
-        # --metrics serves /quicktunnel, which is how the backend learns the URL.
-        exec cloudflared tunnel --no-autoupdate --metrics 0.0.0.0:20241 --url http://backend:8000
+    # One service, two modes — chosen by COMPOSE INTERPOLATION, not an
+    # in-container `if`. The cloudflared image is distroless: it has no /bin/sh,
+    # so an entrypoint shell wrapper fails at startup with
+    # `stat /bin/sh: no such file or directory` and takes the tunnel down.
+    #
+    # Default (token unset) is byte-for-byte the quick-tunnel command this
+    # service has always run; --metrics serves /quicktunnel, which is how
+    # resolve_public_url.sh learns the hostname. Setting the token in .env
+    # switches to the named tunnel, which needs neither metrics nor --url
+    # because the dashboard holds the route.
+    command: ${CLOUDFLARE_TUNNEL_TOKEN:+tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}}${CLOUDFLARE_TUNNEL_TOKEN:-tunnel --no-autoupdate --metrics 0.0.0.0:20241 --url http://backend:8000}
     restart: unless-stopped
     depends_on: [backend]
 
