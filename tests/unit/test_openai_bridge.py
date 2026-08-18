@@ -901,3 +901,56 @@ async def test_a_failing_course_lookup_still_returns_something_speakable(monkeyp
     monkeypatch.setattr(ob, "search_relevant", boom)
 
     assert await ob._lookup_course_material("fees") == ob.NO_MATERIAL_NOTE
+
+
+# ── the rollback backend had no way to end a two-way call ───────────────────
+#
+# openai_bridge's two-way path ran PlivoCall.run() with only the reader tasks —
+# no silence watchdog — so nothing but the model's own end_call tool or the
+# lead hanging up ended the conversation. CLAUDE.md records that the model does
+# NOT reliably call that tool (0/3 measured), and in India a lead commonly says
+# goodbye and waits for the caller to hang up. The call then ran to
+# CALL_MAX_DURATION_S and, because max_duration is a clean exit, was recorded as
+# a SUCCESSFUL call — five minutes of billed silence per lead, graded as a win.
+# The Sarvam bridge already solved this; the rollback path never did.
+
+async def test_a_two_way_call_that_goes_quiet_ends_itself(monkeypatch):
+    import asyncio as _asyncio
+
+    from app.telephony import openai_bridge as ob
+    from app.telephony import plivo_stream
+
+    call = plivo_stream.PlivoCall(
+        _FakePlivoWS(), lead_id="l", one_way=False, protect_opening=False)
+    monkeypatch.setattr(ob, "TWOWAY_MAX_SILENT_S", 0.05)
+
+    await _asyncio.wait_for(ob._watch_for_silence(call, ob._Activity()), timeout=3)
+
+    assert call.stop.is_set()
+    assert call.exit_reason == "twoway_silence", (
+        f"ended as {call.exit_reason!r} — a quiet line must be distinguishable "
+        "from a real conversation that ran its course"
+    )
+
+
+async def test_the_silence_watchdog_waits_for_queued_audio_to_drain(monkeypatch):
+    """Audio SENT is not audio HEARD. Measuring from the send loop hangs up
+    mid-sentence on a call that is working — the same lesson the Sarvam
+    watchdog's docstring records."""
+    import asyncio as _asyncio
+
+    from app.telephony import openai_bridge as ob
+    from app.telephony import plivo_stream
+
+    call = plivo_stream.PlivoCall(
+        _FakePlivoWS(), lead_id="l", one_way=False, protect_opening=False)
+    monkeypatch.setattr(ob, "TWOWAY_MAX_SILENT_S", 0.05)
+    loop = _asyncio.get_running_loop()
+    call.play_end = loop.time() + 0.6      # still speaking to the lead
+
+    task = _asyncio.create_task(ob._watch_for_silence(call, ob._Activity()))
+    await _asyncio.sleep(0.25)
+    assert not call.stop.is_set(), "hung up while audio was still playing"
+
+    await _asyncio.wait_for(task, timeout=3)
+    assert call.stop.is_set()

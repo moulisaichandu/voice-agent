@@ -1,0 +1,25 @@
+-- Drop the ivfflat index on doc_chunks.
+--
+-- 0001_init.sql created it with `lists = 100` against an EMPTY table. ivfflat
+-- learns its centroids from the data present when the index is built, so with
+-- no rows it got untrained ones, and nothing in the ingest path ever rebuilds
+-- it. Whenever the planner chose that index, a probe examined a near-random
+-- slice of the corpus and relevant chunks were silently dropped below the
+-- caller's score threshold — a wrong answer to a customer, produced by an
+-- index, with nothing logged anywhere.
+--
+-- The corpus is 91 chunks. At that size an exact scan is both FASTER and
+-- exactly correct: there is no recall to trade away, and no approximation worth
+-- having. Removing the index removes the only path by which retrieval could
+-- silently lose a relevant chunk.
+--
+-- When the corpus grows past a few thousand chunks, add it back AFTER the data
+-- is loaded (so the centroids are trained on real vectors) and size it roughly
+-- sqrt(rows):
+--
+--   create index idx_doc_chunks_embedding on doc_chunks
+--     using ivfflat (embedding vector_cosine_ops) with (lists = <~sqrt(rows)>);
+--
+-- and rebuild it after any large re-ingest.
+
+drop index if exists idx_doc_chunks_embedding;

@@ -208,6 +208,60 @@ def _session_update(*, lead_name: str | None, script: str | None,
 
 
 
+# How long a two-way call may sit with NEITHER side speaking before it ends
+# itself. Mirrors sarvam_bridge.TWOWAY_MAX_SILENT_S, for the identical reason:
+# nothing can rely on the model calling end_call (measured 0/3 against the live
+# API, per CLAUDE.md), and in India a lead commonly says goodbye and waits for
+# the caller to hang up. Without this the call ran to CALL_MAX_DURATION_S and
+# was then recorded as SUCCESSFUL, because max_duration counts as a clean exit —
+# five minutes of billed silence per lead, graded as a win.
+#
+# Scoped to this bridge and the Sarvam one, never to app/telephony/bridge.py:
+# the ElevenLabs two-way path is in production and must not acquire a new way to
+# hang up on someone.
+TWOWAY_MAX_SILENT_S = 20.0
+_SILENCE_POLL_S = 0.25
+
+
+class _Activity:
+    """The last time either side did anything, kept HERE rather than on
+    PlivoCall: that class is the substrate all three backends share, and the
+    playback-gap design doc's non-goals are explicit about not changing it for
+    one backend's benefit."""
+
+    def __init__(self) -> None:
+        self.last = asyncio.get_event_loop().time()
+
+    def touch(self) -> None:
+        self.last = asyncio.get_event_loop().time()
+
+
+async def _watch_for_silence(call, activity: "_Activity") -> None:
+    """End a two-way call once neither side has spoken for TWOWAY_MAX_SILENT_S.
+
+    Measures SILENCE, not duration: a conversation still in progress resets the
+    clock, so this only fires on a line that has genuinely finished.
+
+    Audio that has been SENT but not yet HEARD counts as activity —
+    call.play_end is when the queued audio actually runs out, which is the same
+    accounting the one-way watchdog drains against. Measuring from the send loop
+    instead hangs up mid-sentence on a call that is working perfectly, which is
+    the lesson sarvam_bridge.watch_for_silence's docstring records.
+    """
+    loop = asyncio.get_event_loop()
+    while not call.stop.is_set():
+        await asyncio.sleep(_SILENCE_POLL_S)
+        quiet_since = max(activity.last, call.play_end)
+        if loop.time() - quiet_since >= TWOWAY_MAX_SILENT_S:
+            logger.info(
+                f"[openai] lead={call.lead_id} ending a conversation that has "
+                f"been silent for {TWOWAY_MAX_SILENT_S:.0f}s."
+            )
+            call.note_exit("twoway_silence")
+            break
+    call.stop.set()
+
+
 async def _lookup_course_material(query: str) -> str:
     """search_relevant, bounded — the same guard the Sarvam bridge applies.
 
@@ -324,7 +378,12 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
             # Never called on a one-way call: PlivoCall.read_events drops the
             # lead's media itself. Wired now so Milestone B has one less thing
             # to add to the audio path.
+            activity = _Activity()
+
             async def to_openai(payload_b64: str) -> None:
+                # The lead is on the line; the silence watchdog must not count
+                # this as a dead call.
+                activity.touch()
                 await oa.send(json.dumps({
                     "type": "input_audio_buffer.append", "audio": payload_b64,
                 }))
@@ -334,6 +393,7 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
                 nonlocal last_item_id, response_active, audio_seg_item
                 try:
                     async for raw in oa:
+                        activity.touch()
                         if call.stop.is_set():
                             break
                         try:
@@ -511,8 +571,13 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
 
             # PlivoCall.run adds the one-way watchdog itself, bounds the whole
             # call at CALL_MAX_DURATION_S, and lets queued audio drain before
-            # the line drops.
-            await call.run(call.read_events(to_openai), from_openai())
+            # the line drops. A TWO-WAY call needs the silence watchdog too —
+            # see _watch_for_silence: without it nothing here ends the call, and
+            # five minutes of billed silence is recorded as a success.
+            tasks = [call.read_events(to_openai), from_openai()]
+            if not one_way:
+                tasks.append(_watch_for_silence(call, activity))
+            await call.run(*tasks)
     except Exception as exc:
         # Swallowed for the same reason the no-key branch returns: the caller's
         # finally has to record the call, not re-raise past it.
