@@ -63,7 +63,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from app import languages, redis_client
 from app.compliance.calling_hours import within_calling_hours
@@ -480,12 +480,19 @@ async def process_one(lead_id: str) -> None:
         # if Plivo's answer callback never arrives or its form fails to parse.
         # Best-effort: a Redis blip here must not fail a call that is already
         # ringing, and the guard degrades to lead_id scope without it.
-        if result.call_uuid:
-            try:
-                await r.set(f"call:uuid:{lead_id}", result.call_uuid,
-                            ex=CALL_UUID_TTL_S)
-            except Exception:
-                logger.warning(f"[worker] could not record call uuid for {lead_id}")
+        # Falls back to a locally generated id when Plivo returns 200 with no
+        # request_uuid (plivo_client sets success=True with call_uuid=None for
+        # a body that fails to parse). Without one, the release guard degrades
+        # to lead_id scope, which cannot tell attempt 2 from attempt 1 and
+        # silently skips the second release — the slot leak this key exists to
+        # prevent. Any per-attempt-unique value does that job; it only has to
+        # be the SAME one for both teardown paths, which it is, because they
+        # both read it from here.
+        attempt_id = result.call_uuid or f"attempt-{uuid4().hex}"
+        try:
+            await r.set(f"call:uuid:{lead_id}", attempt_id, ex=CALL_UUID_TTL_S)
+        except Exception:
+            logger.warning(f"[worker] could not record call uuid for {lead_id}")
 
         # el_conversation_id is NULL here on purpose: with Plivo placing the
         # call there is no ElevenLabs conversation yet — one is created when

@@ -1935,3 +1935,138 @@ def test_a_telugu_word_that_merely_contains_bye_is_not_a_goodbye(text):
 @pytest.mark.parametrize("text", ["బై", "థాంక్స్, బై.", "ఇక అంతే", "సరే, ఇక అంతే."])
 def test_a_real_telugu_goodbye_is_still_detected(text):
     assert sarvam_bridge._is_lead_goodbye(text)
+
+
+async def test_a_cancelled_reply_also_forgets_what_the_lead_never_heard():
+    """The same repair, on the other path that kills a half-spoken answer.
+
+    truncate_to_what_was_heard was reachable only from on_barge_in. But
+    _cancel_reply is called from on_lead_said too, and it cancels say() mid-
+    utterance — so the full assistant text stayed in history and in the stored
+    transcript even though only part of it played, and the agent went on to
+    refer back to sentences the lead never received. That is precisely the
+    incoherence the ledger exists to prevent.
+    """
+    from app.db.models import TranscriptTurn
+
+    call = sarvam_bridge.plivo_stream.PlivoCall(
+        _FakePlivoWS(), lead_id="l", one_way=False, protect_opening=False)
+    turns = []
+    convo = sarvam_bridge._Conversation(
+        call, lead_id="l", system_prompt="s", turns=turns)
+
+    # An answer of two sentences, of which only the first ever played.
+    convo._agent_turn_index = 0
+    turns.append(TranscriptTurn(role="agent", text="One. Two."))
+    convo.history.append({"role": "assistant", "content": "One. Two."})
+    convo.ledger.add("One.", 1000)
+    convo.ledger.add("Two.", 1000)
+
+    async def still_speaking():
+        await asyncio.sleep(3600)
+
+    convo.reply_task = asyncio.create_task(still_speaking())
+    await asyncio.sleep(0)
+
+    await convo._cancel_reply()
+
+    claimed = " ".join(m.get("content") or "" for m in convo.history
+                       if m.get("role") == "assistant")
+    assert "Two." not in claimed, (
+        "the model was told it said a sentence the lead never heard"
+    )
+    assert "Two." not in " ".join(t.text for t in turns), (
+        "the stored transcript claims words that were never played"
+    )
+
+
+async def test_a_committed_round_is_still_not_truncated_on_cancel():
+    """_cancel_reply returns early for a committed round — it does not cancel
+    say(), so there is nothing half-spoken to repair and the turn must be left
+    exactly as it is."""
+    from app.db.models import TranscriptTurn
+
+    call = sarvam_bridge.plivo_stream.PlivoCall(
+        _FakePlivoWS(), lead_id="l", one_way=False, protect_opening=False)
+    turns = []
+    convo = sarvam_bridge._Conversation(
+        call, lead_id="l", system_prompt="s", turns=turns)
+    convo._agent_turn_index = 0
+    turns.append(TranscriptTurn(role="agent", text="One. Two."))
+    convo.history.append({"role": "assistant", "content": "One. Two."})
+    convo.ledger.add("One.", 1000)
+    convo.ledger.add("Two.", 1000)
+
+    async def in_flight():
+        await asyncio.sleep(3600)
+
+    convo.reply_task = asyncio.create_task(in_flight())
+    convo._reply_committed = True
+    await asyncio.sleep(0)
+
+    await convo._cancel_reply()
+
+    assert turns[0].text == "One. Two.", "a committed round was wrongly rewritten"
+    convo.reply_task.cancel()
+
+
+async def test_a_fragment_already_folded_into_a_later_round_is_not_answered_twice(
+        monkeypatch):
+    """The follow-up for a missed fragment must ask "is anything unanswered?".
+
+    A fragment that arrives while the model round is committed is recorded in
+    _missed_while_committed. But a tool round re-serialises the whole history,
+    so round 2 usually DOES see that fragment and answers both parts. Firing
+    the follow-up unconditionally then queried the model again with nothing new
+    and the agent spoke an extra, unsolicited turn at the lead.
+
+    _awaiting_answer already answers exactly this question, and on_lead_stopped
+    already gates on it.
+    """
+    _call, convo, turns = _failing_turn_convo()
+    replies = []
+
+    async def answered_everything(history):
+        replies.append(len(history))
+        return _reply(text="Both parts answered.")
+
+    monkeypatch.setattr(sarvam_bridge.conversation_llm, "turn", answered_everything)
+    convo._lead_speaking = False
+    convo._missed_while_committed = True   # a fragment landed mid-round
+    convo.history.append({"role": "user", "content": "and the fee?"})
+    convo._missed_at = len(convo.history)  # ...and the next round will carry it
+
+    await convo._reply_when_they_stop(_CountingTTS())
+    for _ in range(4):
+        await asyncio.sleep(0)
+
+    assert len(replies) == 1, (
+        f"the model was queried {len(replies)} times for one question — the "
+        "agent speaks an unsolicited extra turn at the lead"
+    )
+    assert convo.reply_task is None or convo.reply_task.done()
+    if convo.reply_task:
+        convo.reply_task.cancel()
+
+
+async def test_a_hung_script_render_does_not_hold_the_lead_in_silence(
+        two_way, monkeypatch):
+    """render() runs AFTER Plivo answers the leg but BEFORE PlivoCall.run(),
+    so neither the one-way watchdog nor CALL_MAX_DURATION_S bounds it — only
+    sarvam_llm's own 60s HTTP timeout. A Sarvam latency spike therefore meant a
+    real person answered the phone and heard up to a minute of complete
+    silence, on every lead in the campaign, with the credits breaker unable to
+    help because it only trips on 'credit'.
+    """
+    two_way([])
+
+    async def never_returns(script, *, language_style=None):
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(sarvam_bridge.sarvam_llm, "render", never_returns)
+    monkeypatch.setattr(sarvam_bridge, "RENDER_DEADLINE_S", 0.05)
+
+    outcome = await _run(_FakePlivoWS(), one_way=True)
+
+    assert outcome["status"] == "failed"
+    assert "render" in (outcome.get("note") or "").lower() or outcome["turns"] == 0

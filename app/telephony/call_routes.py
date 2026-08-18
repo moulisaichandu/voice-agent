@@ -138,7 +138,14 @@ async def _release_slot_once(lead_id: str, call_uuid: str | None = None) -> None
     try:
         r = redis_client.get_redis()
         recorded = await r.get(CALL_UUID_KEY_FMT.format(lead_id=lead_id))
-        token = recorded or call_uuid or lead_id
+        # NOT `recorded or call_uuid or lead_id`. That middle arm reopened
+        # exactly the divergence this docstring argues against: with no
+        # recorded value the stream (which passes no call_uuid) fell through to
+        # lead_id while the hangup fell through to Plivo's CallUUID, so one
+        # call wrote two guard keys and released two slots. Both paths now
+        # agree in the fallback, and worker.process_one always records an
+        # attempt id so the fallback is rarely reached at all.
+        token = recorded or lead_id
         first = await r.set(f"slot:released:{token}", "1", nx=True, ex=_SLOT_GUARD_TTL_S)
         if first:
             await telephony_worker.release_call_slot()

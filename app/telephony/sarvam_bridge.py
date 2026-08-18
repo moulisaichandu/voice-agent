@@ -42,6 +42,7 @@ import re
 from fastapi import WebSocket
 
 from app.config import (
+    ONEWAY_MAX_SILENT_S,
     RAG_VOICE_DEADLINE_S,
     SARVAM_API_KEY,
     SARVAM_REPLY_MAX_WAIT_S,
@@ -90,6 +91,21 @@ _SENTENCE_END = re.compile(r"(?<=[.!?।])\s+")
 # ElevenLabs two-way path is in production and must not acquire a new way to
 # hang up on someone.
 TWOWAY_MAX_SILENT_S = 20.0
+
+# How long the script render may take before the call is abandoned.
+#
+# render() runs AFTER Plivo has answered the leg but BEFORE PlivoCall.run()
+# starts, so neither the one-way watchdog nor CALL_MAX_DURATION_S can see it —
+# its only bound was sarvam_llm's own 60s HTTP timeout. A Sarvam latency spike
+# with a cold render cache (a new campaign, an edited script, or a Redis flush,
+# which CLAUDE.md documents as safe) therefore meant a real person answered the
+# phone and heard up to a minute of complete silence, on every lead in the
+# campaign. The credits breaker cannot help: it only trips on 'credit'.
+#
+# Bounded by the same figure the one-way watchdog uses for "this agent is not
+# speaking" — past that the lead has already decided the line is dead, and
+# hanging up beats billing more silence.
+RENDER_DEADLINE_S = float(ONEWAY_MAX_SILENT_S)
 
 # The lead's goodbye is a call-control signal, not a question for the model.
 # Relying on the end_call tool alone leaves the line open when the model says a
@@ -308,6 +324,10 @@ class _Conversation:
         # still gets its own follow-up reply, rather than silently reading as
         # "already answered" once it is sitting behind the assistant's turn.
         self._missed_while_committed = False
+        # Where that fragment landed in history, against what the last request
+        # to the model actually carried — see _reply_when_they_stop's gate.
+        self._missed_at = 0
+        self._last_request_len = 0
         # Wall-clock of the last thing either side did. The silence watchdog
         # measures against this rather than against call start, so a lead who
         # is mid-question is never hung up on.
@@ -672,6 +692,13 @@ class _Conversation:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
+        # That cancel may have killed say() mid-utterance, so the same repair
+        # on_barge_in performs is owed here too: without it the full answer
+        # stays in history and in the stored transcript though only part of it
+        # played, and every later turn is built on words nobody heard.
+        # Idempotent — truncate_to_what_was_heard clears _agent_turn_index on
+        # its first use, so on_barge_in's own call stays harmless.
+        self.truncate_to_what_was_heard()
         self._discard_incomplete_tool_turn()
 
     def _discard_incomplete_tool_turn(self) -> None:
@@ -743,6 +770,7 @@ class _Conversation:
             # _reply_when_they_stop answers it in a follow-up pass instead of
             # a second task racing the first.
             self._missed_while_committed = True
+            self._missed_at = len(self.history)
             return
         self.reply_task = asyncio.create_task(self._reply_when_they_stop(tts))
 
@@ -785,9 +813,22 @@ class _Conversation:
             # part to "already answered" once it lands behind an assistant
             # turn that never actually saw it.
             self._missed_while_committed = False
-            if self._turn_opened_at is None:
-                self._turn_opened_at = self._loop.time()
-            self.reply_task = asyncio.create_task(self._reply_when_they_stop(tts))
+            # ...but only if no request actually carried it. A tool round
+            # re-serialises the WHOLE history, so round 2 of a tool turn
+            # usually DID include the fragment and answered both parts; firing
+            # regardless queried the model again with nothing new and the agent
+            # spoke an extra, unsolicited turn at the lead.
+            #
+            # _awaiting_answer() cannot answer this: say() appends the
+            # assistant message ON TOP of the fragment, so it reports
+            # "answered" even for a round that never saw it. Comparing the last
+            # request's history length against where the fragment landed is the
+            # question actually being asked.
+            if self._last_request_len < self._missed_at:
+                if self._turn_opened_at is None:
+                    self._turn_opened_at = self._loop.time()
+                self.reply_task = asyncio.create_task(
+                    self._reply_when_they_stop(tts))
 
     async def _say_fallback(self, tts: sarvam_tts.SarvamTTS,
                             generation: int) -> None:
@@ -839,6 +880,10 @@ class _Conversation:
             for _round in range(_MAX_TOOL_ROUNDS):
                 _llm_started = self._loop.time()
                 self._reply_committed = True
+                # What this request actually carries, for the missed-fragment
+                # follow-up: a fragment appended after this point cannot have
+                # been seen by it.
+                self._last_request_len = len(self.history)
                 try:
                     reply = await conversation_llm.turn(self.history)
                 finally:
@@ -1089,9 +1134,23 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
             # lead heard on 2026-07-27: a call with no AI disclosure at all.
             script = sarvam_prompts.DEFAULT_TWOWAY_SCRIPT
 
-        body = await sarvam_llm.render(
-            script, language_style=variables.get("language_style"),
-        )
+        try:
+            body = await asyncio.wait_for(
+                sarvam_llm.render(
+                    script, language_style=variables.get("language_style"),
+                ),
+                RENDER_DEADLINE_S,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                f"[sarvam] lead={lead_id} script render did not finish inside "
+                f"{RENDER_DEADLINE_S:.0f}s — abandoning the call rather than "
+                "holding an answered lead in silence. Check Sarvam's status; "
+                "the render cache is per campaign, so the next lead pays this "
+                "again until it succeeds once."
+            )
+            outcome["note"] = "sarvam_render_timeout"
+            return outcome
         if not body.strip():
             # Checked on the BODY, not on the composed line. compose_spoken()
             # prepends a name greeting, so a lead called "Mouli" turned an empty
