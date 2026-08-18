@@ -32,7 +32,7 @@ from app.db import calls as calls_db
 from app.db import campaigns as campaigns_db
 from app.db import leads as leads_db
 from app.db.pool import get_pool
-from app.telephony import elevenlabs_client
+from app.telephony import elevenlabs_client, public_url, sarvam_circuit_breaker
 from app.telephony import preflight as preflight_module
 from app.telephony import worker as worker_module
 
@@ -105,6 +105,91 @@ def _check_calling_hours() -> dict:
     return {"key": "calling_hours", "status": "warning", "label": "Calling hours",
             "detail": f"Outside the {window} window — campaign_tick will not enqueue "
                       "anything until it reopens"}
+
+
+_LAST_PUBLIC_URL_KEY = "public_url:last_seen"
+
+
+async def _check_public_url_rotation() -> dict:
+    """Whether the tunnel hostname has changed since this check last ran.
+
+    Rotation is only handled in ONE direction. public_url.refresh() re-resolves
+    the hostname this app gives Plivo, so dialling keeps working and preflight
+    stays green. But the ElevenLabs agent's course-lookup tool URL and its
+    transcript webhook are configured against that same hostname in the
+    ElevenLabs DASHBOARD, and nothing here can re-point them. The resulting
+    failure is silent and specific: calls connect, every check is green, and
+    the agent simply cannot answer questions about the courses.
+
+    So this reports the rotation rather than trying to repair it. Warning, not
+    critical: dialling genuinely still works, and treating it as a hard stop
+    would ground a system that is only partly degraded. The real fix is a NAMED
+    Cloudflare tunnel, which public_url.py's own docstring already recommends.
+
+    Reports ONCE per rotation — the new value is stored, so a hostname that has
+    been seen stops warning. A read failure is reported rather than swallowed,
+    matching the breaker check's reasoning: "I could not tell" is the honest
+    answer, and silently reading as healthy is how the original problem stayed
+    invisible.
+    """
+    try:
+        current = await public_url.refresh()
+    except Exception as exc:  # noqa: BLE001 - one dead check must not take the dashboard down
+        return {"key": "public_url", "status": "warning", "label": "Public URL",
+                "detail": f"Could not resolve the tunnel: {type(exc).__name__}: {exc}"}
+    if not current:
+        return {"key": "public_url", "status": "warning", "label": "Public URL",
+                "detail": "No public URL is resolvable — Plivo cannot reach this "
+                          "app, so no call can connect."}
+    try:
+        r = redis_client.get_redis()
+        previous = await r.get(_LAST_PUBLIC_URL_KEY)
+        await r.set(_LAST_PUBLIC_URL_KEY, current)
+    except Exception as exc:  # noqa: BLE001
+        return {"key": "public_url", "status": "warning", "label": "Public URL",
+                "detail": f"Could not check for rotation: {type(exc).__name__}: {exc}"}
+    if previous and previous != current:
+        return {
+            "key": "public_url", "status": "warning", "label": "Public URL",
+            "detail": (
+                f"The tunnel rotated to {current} (was {previous}). Dialling is "
+                "unaffected — this app re-resolves it. But anything configured "
+                "against the OLD hostname is now dead, and nothing here can "
+                "update it: in the ElevenLabs dashboard, re-point the agent's "
+                "search-tool URL and the transcript webhook. A named Cloudflare "
+                "tunnel would stop this recurring."
+            ),
+        }
+    return {"key": "public_url", "status": "good", "label": "Public URL",
+            "detail": f"Stable at {current}"}
+
+
+async def _check_sarvam_circuit_breaker() -> dict:
+    """Whether a Sarvam credits failure has paused dialling on that backend.
+
+    Cheap by design — one Redis read, unlike billing's real API round-trip —
+    so unlike that check this needs no caching of its own.
+
+    A read failure reports critical rather than "not tripped". This endpoint
+    exists to answer "can this system dial right now, and if not why", and
+    "I could not tell" is the honest answer to that; silently reading as
+    healthy is how the original problem stayed invisible until a real call
+    failed.
+    """
+    try:
+        reason = await sarvam_circuit_breaker.tripped_reason()
+    except Exception as exc:  # noqa: BLE001 - one dead check must not take the dashboard down
+        return {"key": "sarvam_circuit_breaker", "status": "critical",
+                "label": "Sarvam circuit breaker",
+                "detail": f"Could not check: {type(exc).__name__}: {exc}"}
+    if reason:
+        return {"key": "sarvam_circuit_breaker", "status": "critical",
+                "label": "Sarvam circuit breaker",
+                "detail": f"Tripped: {reason}. Check credits at "
+                          "dashboard.sarvam.ai/usage, then clear it: POST "
+                          "/admin/system/sarvam-circuit-breaker/clear."}
+    return {"key": "sarvam_circuit_breaker", "status": "good",
+            "label": "Sarvam circuit breaker", "detail": "Not tripped"}
 
 
 _REQUIRED_FOR_DIALING = [
@@ -285,17 +370,21 @@ async def _compute_preflight() -> dict:
     return {"key": "preflight", "status": "warning", "label": "Preflight", "detail": detail}
 
 
-_GOOD_SUBSCRIPTION_STATUSES = {"active", "trialing"}
+async def _compute_billing(*, force_refresh: bool = False) -> dict:
+    """Format the shared account status into a ReadinessCheck.
 
-
-async def _compute_billing() -> dict:
+    The fetching and caching moved to elevenlabs_client.cached_subscription_status
+    so preflight.py can share this exact cache entry — see that function. This
+    is now only the presentation half; the dashboard output is unchanged.
+    """
     try:
-        sub = await asyncio.to_thread(elevenlabs_client.subscription_status)
+        sub = await elevenlabs_client.cached_subscription_status(
+            force_refresh=force_refresh)
     except Exception as exc:
         return {"key": "billing", "status": "critical", "label": "ElevenLabs billing",
                 "detail": f"Could not check: {type(exc).__name__}: {exc}"}
     status = sub["status"]
-    if status in _GOOD_SUBSCRIPTION_STATUSES:
+    if status in elevenlabs_client.GOOD_SUBSCRIPTION_STATUSES:
         usage = ""
         if sub.get("character_limit"):
             usage = f" ({sub['character_count']}/{sub['character_limit']} characters used)"
@@ -314,9 +403,23 @@ async def _cached_check(key: str, compute: Callable[[], Awaitable[dict]]) -> dic
     except Exception:
         raw = None
     if raw:
-        result = json.loads(raw)
-        result["cached"] = True
-        return result
+        try:
+            result = json.loads(raw)
+        except (TypeError, ValueError):
+            # A partial write or stale schema must not turn the dashboard
+            # into a 500. Treat corrupted cache data as a cache miss.
+            logger.warning("Ignoring malformed readiness cache for %s", key)
+        else:
+            if isinstance(result, dict):
+                try:
+                    ReadinessCheck(**{**result, "cached": True})
+                except Exception:
+                    logger.warning("Ignoring invalid readiness cache for %s", key)
+                else:
+                    result["cached"] = True
+                    return result
+            else:
+                logger.warning("Ignoring non-object readiness cache for %s", key)
     return await _refresh_check(key, compute)
 
 
@@ -340,7 +443,7 @@ async def _refresh_check(key: str, compute: Callable[[], Awaitable[dict]]) -> di
 # computation in _build_readiness() for the full reasoning. Module-level (not
 # inline in the set literal) so it reads as a considered, named policy rather
 # than a throwaway expression, matching _REQUIRED_FOR_DIALING's convention.
-_CAN_DIAL_IGNORED_WARNING_KEYS = {"calling_hours", "preflight"}
+_CAN_DIAL_IGNORED_WARNING_KEYS = {"calling_hours", "preflight", "public_url"}
 
 
 async def _build_readiness(*, force_refresh: bool) -> ReadinessResponse:
@@ -353,14 +456,20 @@ async def _build_readiness(*, force_refresh: bool) -> ReadinessResponse:
     config_check = _check_config()
     queue_check = await _check_queue_depth(worker_ok=worker_check["status"] == "good")
 
-    cheap = [db_check, redis_check, worker_check, hours_check, config_check, queue_check]
+    breaker_check = await _check_sarvam_circuit_breaker()
+
+    url_check = await _check_public_url_rotation()
+
+    cheap = [db_check, redis_check, worker_check, hours_check, config_check,
+             queue_check, breaker_check, url_check]
     for c in cheap:
         c["cached"] = False
         c["checked_at"] = now_iso
 
     if force_refresh:
         preflight_check = await _refresh_check("preflight", _compute_preflight)
-        billing_check = await _refresh_check("billing", _compute_billing)
+        billing_check = await _refresh_check(
+            "billing", lambda: _compute_billing(force_refresh=True))
     else:
         preflight_check = await _cached_check("preflight", _compute_preflight)
         billing_check = await _cached_check("billing", _compute_billing)
@@ -418,6 +527,22 @@ async def refresh_readiness() -> ReadinessResponse:
     """Bypasses the 60s cache on the two expensive checks — for "I just fixed
     it, tell me right now" rather than waiting out the TTL."""
     return await _build_readiness(force_refresh=True)
+
+
+@router.post("/system/sarvam-circuit-breaker/clear")
+async def clear_sarvam_circuit_breaker() -> dict:
+    """Manual-only recovery, and the ONLY way out of a tripped breaker.
+
+    Sarvam publishes no way to confirm credits have been topped up, so a human
+    saying "this is fixed now" is the only reliable signal — an auto-expiring
+    timer would either resume into the same failure or stay paused long after
+    the account recovered. Mirrors PATCH /admin/campaigns/{id}
+    {"active": false}, the manual stopgap this replaces.
+
+    Clearing an untripped breaker is a no-op, so clicking it twice is safe.
+    """
+    await sarvam_circuit_breaker.clear()
+    return {"cleared": True}
 
 
 # ── Stats ──────────────────────────────────────────────────────────────────
@@ -516,7 +641,20 @@ async def sheets_status() -> SheetsStatusResponse:
         raw = None
     if not raw:
         return SheetsStatusResponse(configured=configured)
-    data = json.loads(raw)
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring malformed Sheets sync status cache")
+        return SheetsStatusResponse(
+            configured=configured,
+            last_error="Cached Sheets status is malformed; waiting for the next sync",
+        )
+    if not isinstance(data, dict):
+        logger.warning("Ignoring non-object Sheets sync status cache")
+        return SheetsStatusResponse(
+            configured=configured,
+            last_error="Cached Sheets status is malformed; waiting for the next sync",
+        )
     return SheetsStatusResponse(
         configured=configured,
         last_sync_at=data.get("at"),

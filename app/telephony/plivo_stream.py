@@ -40,8 +40,8 @@ from app.config import (
     ONEWAY_MAX_SILENT_S,
     ONEWAY_SILENCE_TAIL_S,
     PLIVO_GREETING_GRACE_MS,
-    PUBLIC_BASE_URL,
 )
+from app.telephony import public_url
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +69,20 @@ _ONEWAY_POLL_S = 0.25
 # built-in "End Call" tool, so openai_bridge.py gives the model its own
 # end_call function and grades the resulting exit the same way — a
 # conversation the model chose to end cleanly, not a dropped call.
+# sarvam_end_call is the same story again on the third backend: sarvam_bridge.py
+# gives the model an end_call tool and grades the resulting exit as a
+# conversation the agent chose to end, not a dropped call. Without it every
+# Telugu conversation that finished properly would be stored 'failed', mark its
+# lead failed, and burn a retry on someone who already said goodbye.
+# sarvam_lead_goodbye is Sarvam's deterministic transcript path: an explicit
+# goodbye ends the call even when the model omits its end_call tool.
+# twoway_silence is sarvam_bridge's own watchdog: a conversation where neither
+# side has spoken for TWOWAY_MAX_SILENT_S has finished, whether or not the model
+# remembered to call its end_call tool (measured against the live API, it
+# mostly does not). A conversation that ran its course is not a failed call.
 _CLEAN_EXITS = ("plivo_stop", "plivo_disconnect", "max_duration", "oneway_complete",
-                "elevenlabs_closed:1000", "openai_end_call")
+                "elevenlabs_closed:1000", "openai_end_call", "sarvam_end_call",
+                "sarvam_lead_goodbye", "twoway_silence")
 
 
 def answer_xml(lead_id: str) -> str:
@@ -81,7 +93,11 @@ def answer_xml(lead_id: str) -> str:
     treats the (empty) rest of the XML document as the whole call and hangs up
     the moment the stream is established.
     """
-    base = (PUBLIC_BASE_URL or "").rstrip("/")
+    # public_url.base(), not the import-time PUBLIC_BASE_URL: a quick tunnel
+    # mints a new hostname whenever cloudflared restarts, and a stream URL
+    # pointing at the old one connects to nothing — the call is answered and
+    # then silent. See app/telephony/public_url.py.
+    base = public_url.base().rstrip("/")
     wss = base.replace("https://", "wss://").replace("http://", "ws://")
     url = (f"{wss}/calls/stream?token={quote(CALL_WEBHOOK_SECRET or '')}"
            f"&lead={quote(lead_id)}")
@@ -103,7 +119,8 @@ class PlivoCall:
     for the outbound one, and `run` to supervise the whole thing.
     """
 
-    def __init__(self, ws: WebSocket, *, lead_id: str, one_way: bool = False) -> None:
+    def __init__(self, ws: WebSocket, *, lead_id: str, one_way: bool = False,
+                 protect_opening: bool = False) -> None:
         self.ws = ws
         self.lead_id = lead_id
         self.one_way = one_way
@@ -144,16 +161,22 @@ class PlivoCall:
         # an acknowledgement, not an interruption. Cancelling the greeting on it
         # made the agent restart from the top. Barge-in is live after this.
         self.grace_until: float = 0.0
-        # The FIRST agent response carries the legally-required AI disclosure.
-        # Barge-in is refused entirely until the bridge marks that response
-        # delivered (on its response.done), so a lead's reflexive "Hello?"
-        # cannot cut the disclosure off mid-sentence — which on a live call
-        # fragmented the transcript and fired a false [compliance] alert.
-        # OpenAI Realtime streams audio at ~speaking pace, so response.done for
-        # the opening arrives ≈ when its audio has played out, making this a
-        # sound "the disclosure has been heard" signal. Only consulted by
+        # OPT-IN opening-disclosure protection (protect_opening). When enabled,
+        # barge-in is refused until the bridge marks the opening response
+        # delivered (mark_opening_delivered), so a lead's reflexive "Hello?"
+        # cannot cut the legally-required disclosure off mid-sentence — which on
+        # a live OpenAI call fragmented the transcript and fired a false
+        # [compliance] alert. OpenAI Realtime streams audio at ~speaking pace, so
+        # response.done for the opening arrives ≈ when its audio has played out,
+        # making it a sound "the disclosure has been heard" signal.
+        #
+        # It is OPT-IN, not default-on: only a backend that ALSO calls
+        # mark_opening_delivered() may enable it, or interrupt() would return
+        # False forever and barge-in would be permanently dead. The ElevenLabs
+        # bridge does not signal it and so does not opt in (its disclosure is
+        # protected only by the greeting-grace window). Only consulted by
         # interrupt(), which a one-way call never reaches.
-        self._opening_pending: bool = True
+        self._opening_pending: bool = protect_opening
         # Whether ANY agent audio has arrived yet. Tracked separately from
         # play_end because that starts at 0.0, which the one-way watchdog
         # cannot tell apart from "the message already finished playing" — it

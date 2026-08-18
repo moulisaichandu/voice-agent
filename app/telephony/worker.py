@@ -63,7 +63,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from app import languages, redis_client
 from app.compliance.calling_hours import within_calling_hours
@@ -169,6 +169,131 @@ async def reaper_sweep(timeout_s: int) -> int:
     return n
 
 
+async def reap_orphaned_queued_leads() -> int:
+    """Return leads that are 'queued' in Postgres but present in neither Redis list.
+
+    campaign_tick reserves a lead as 'queued' and then relies solely on a
+    calls:queue entry to carry it forward. Nothing anywhere moved 'queued' back
+    to 'pending'; due_leads() selects only 'pending'; reaper_sweep inspects only
+    calls:processing and reap_stranded_calls only 'calling'. So losing the
+    Redis list — a FLUSHALL (which CLAUDE.md documents as safe), a recreated
+    container without its volume, or maxmemory eviction — stranded every queued
+    lead permanently.
+
+    Membership, not a timestamp, is the test: BLMOVE moves an id from the queue
+    to the processing list atomically, so a live lead is always in exactly one
+    of them. Anything in neither has no carrier left.
+
+    The one race is a lead between mark_queued and its lpush, which this could
+    reset to 'pending'; the lpush then still happens and the worker's own
+    mark_calling guard rejects it harmlessly, and the lead is re-enqueued on the
+    next tick. Recoverable, unlike the state this repairs.
+    """
+    r = redis_client.get_redis()
+    carried = set(await r.lrange(QUEUE_KEY, 0, -1)) | set(
+        await r.lrange(PROCESSING_KEY, 0, -1))
+    n = 0
+    for lead_id in await leads_db.queued_lead_ids():
+        if lead_id in carried:
+            continue
+        if await leads_db.release_orphaned_queued_lead(lead_id):
+            n += 1
+    if n:
+        logger.warning(
+            f"[worker] returned {n} lead(s) to 'pending' that were reserved as "
+            "'queued' but had no entry in either Redis list — the queue was "
+            "flushed or lost while they were waiting."
+        )
+    return n
+
+
+# Lower calls:live:count to a target, atomically, and never raise it. Done in
+# Lua so the read and the write cannot interleave with a worker acquiring a
+# slot between them — which would otherwise clobber a legitimate acquisition.
+_RECONCILE_SLOTS_LUA = """
+local cur = tonumber(redis.call('GET', KEYS[1]) or '0')
+local target = tonumber(ARGV[1])
+if cur > target then
+  redis.call('SET', KEYS[1], target)
+  return cur - target
+end
+return 0
+"""
+
+
+async def reconcile_live_slots() -> int:
+    """Bring calls:live:count back down to the number of calls that exist.
+
+    The companion to reap_stranded_calls, which recovers a slot by resolving
+    the lead still holding it. That cannot help when the lead was already
+    resolved by another path and only the counter was left behind: the slot is
+    then orphaned, attributable to nothing, and permanent. Observed live
+    immediately after shipping the reaper — 0 leads calling, 0 stale,
+    calls:live:count = 1.
+
+    Only ever LOWERS. Raising it would invent occupancy and throttle dialling
+    for a reason that does not exist, which is a worse failure than the one
+    this is fixing and reached by a job meant to be a safety net.
+
+    The DB count is read before the Lua runs, so a call starting in that window
+    could see the counter lowered by one more than it should be. That is
+    bounded, self-correcting on the next release, and vastly preferable to
+    capacity that is lost forever — the failure _release_slot_once's docstring
+    records reaching 4 of 10 slots in production.
+    """
+    live = await leads_db.count_calling_leads()
+    r = redis_client.get_redis()
+    recovered = int(await r.eval(_RECONCILE_SLOTS_LUA, 1, LIVE_COUNT_KEY, live) or 0)
+    if recovered:
+        logger.warning(
+            f"[worker] recovered {recovered} orphaned concurrency slot(s): "
+            f"calls:live:count claimed more calls than the {live} actually in "
+            "flight. Left alone, each one permanently reduces how many leads "
+            "can be dialled at once."
+        )
+    return recovered
+
+
+async def reap_stranded_calls(older_than_s: int) -> int:
+    """Return the concurrency slots of calls whose process died mid-call.
+
+    _release_slot_once keys its dedupe guard per ATTEMPT, which fixed slots
+    leaking across RETRIES. It cannot fix this: if the process itself dies
+    mid-call, neither /calls/stream's finally nor /calls/hangup ever runs, so
+    the slot is never returned at all. calls:live:count has no TTL and nothing
+    else resets it, so every crashed call costs a permanent slot — the failure
+    _release_slot_once's docstring records being found in production with 4 of
+    10 already gone, recoverable only by a manual DEL.
+
+    Idempotent by construction, with no extra bookkeeping: the slot is released
+    only when mark_result_if_calling actually transitions the lead, and that is
+    guarded on the lead still being 'calling'. A second sweep over the same
+    lead transitions nothing and therefore releases nothing, so repeated runs
+    can never decrement the counter into over-admission.
+
+    'failed' is the honest outcome — the call really did fail — and it lets the
+    ordinary retry path pick the lead up again, which is what should happen to
+    someone whose call was cut short by a deploy.
+    """
+    stranded = await leads_db.stale_calling_leads(older_than_s)
+    reaped = 0
+    for lead_id in stranded:
+        try:
+            if await leads_db.mark_result_if_calling(lead_id, "failed"):
+                await release_call_slot()
+                reaped += 1
+        except Exception as exc:  # noqa: BLE001 - one bad row must not stop the sweep
+            logger.error(f"[worker] could not reap stranded call for lead "
+                         f"{lead_id}: {type(exc).__name__}: {exc}")
+    if reaped:
+        logger.warning(
+            f"[worker] reaped {reaped} call(s) stranded by a process that died "
+            "mid-call: their concurrency slots are back and their leads are "
+            "eligible for retry."
+        )
+    return reaped
+
+
 async def _reserve_next(timeout_s: int = 2) -> str | None:
     r = redis_client.get_redis()
     return await r.blmove(QUEUE_KEY, PROCESSING_KEY, timeout=timeout_s, src="RIGHT", dest="LEFT")
@@ -204,10 +329,15 @@ async def process_one(lead_id: str) -> None:
 
         if lead.campaign_id is None:
             logger.warning(f"[worker] lead {lead_id} has no campaign — skipping")
+            await leads_db.mark_result(lead.lead_id, "pending")
             return
         campaign = await campaigns_db.get_campaign(lead.campaign_id)
         if campaign is None or not campaign.active:
-            logger.warning(f"[worker] lead {lead_id}: campaign missing/inactive — skipping")
+            logger.warning(
+                f"[worker] lead {lead_id}: campaign missing/inactive — returning "
+                "to pending rather than stranding it in queued"
+            )
+            await leads_db.mark_result(lead.lead_id, "pending")
             return
 
         # Calling hours, re-checked HERE and not only in campaign_tick.
@@ -236,7 +366,20 @@ async def process_one(lead_id: str) -> None:
 
         # Reserve-before-act (module docstring point 2).
         if not await leads_db.mark_calling(lead.lead_id):
-            logger.info(f"[worker] lead {lead_id} already left 'queued' — skipping")
+            # Usually a benign race: another worker moved this lead on. But it
+            # is ALSO how a crashed reservation looks — a lead left 'calling'
+            # with no attempt recorded, which the reaper requeues and this
+            # guard then rejects, acking it away into no queue and no
+            # processing list. release_undialed_calling_lead can tell the two
+            # apart (see its docstring) and only ever frees the crashed one.
+            if await leads_db.release_undialed_calling_lead(lead.lead_id):
+                logger.warning(
+                    f"[worker] lead {lead_id} was stuck in 'calling' with no "
+                    "dial attempt recorded — a reservation whose process died. "
+                    "Released back to 'pending'."
+                )
+            else:
+                logger.info(f"[worker] lead {lead_id} already left 'queued' — skipping")
             return
         reserved = True
 
@@ -337,12 +480,19 @@ async def process_one(lead_id: str) -> None:
         # if Plivo's answer callback never arrives or its form fails to parse.
         # Best-effort: a Redis blip here must not fail a call that is already
         # ringing, and the guard degrades to lead_id scope without it.
-        if result.call_uuid:
-            try:
-                await r.set(f"call:uuid:{lead_id}", result.call_uuid,
-                            ex=CALL_UUID_TTL_S)
-            except Exception:
-                logger.warning(f"[worker] could not record call uuid for {lead_id}")
+        # Falls back to a locally generated id when Plivo returns 200 with no
+        # request_uuid (plivo_client sets success=True with call_uuid=None for
+        # a body that fails to parse). Without one, the release guard degrades
+        # to lead_id scope, which cannot tell attempt 2 from attempt 1 and
+        # silently skips the second release — the slot leak this key exists to
+        # prevent. Any per-attempt-unique value does that job; it only has to
+        # be the SAME one for both teardown paths, which it is, because they
+        # both read it from here.
+        attempt_id = result.call_uuid or f"attempt-{uuid4().hex}"
+        try:
+            await r.set(f"call:uuid:{lead_id}", attempt_id, ex=CALL_UUID_TTL_S)
+        except Exception:
+            logger.warning(f"[worker] could not record call uuid for {lead_id}")
 
         # el_conversation_id is NULL here on purpose: with Plivo placing the
         # call there is no ElevenLabs conversation yet — one is created when

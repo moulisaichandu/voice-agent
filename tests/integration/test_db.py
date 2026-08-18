@@ -22,6 +22,45 @@ def _uniq_phone() -> str:
     return "+91" + uuid.uuid4().hex[:10]
 
 
+@pytest.fixture(autouse=True)
+async def _deactivate_campaigns_this_test_creates():
+    """Leave no active campaign behind.
+
+    create_campaign() defaults to active=true, and this module makes one (often
+    several) per test against a database that is ALSO the running app's. Nothing
+    here switched them off, so they accumulated: 258 of them, and the readiness
+    dashboard reported "All 32 active campaign(s) are blocked" for agent ids
+    that only ever existed in a test.
+
+    That went unnoticed because test_pipeline.py's isolation fixture ran a bare
+    `update campaigns set active = false` and was silently cleaning up after
+    this module as a side effect. Fixing that one to restore what it deactivated
+    (correctly — it was switching off the operator's live campaigns) removed the
+    accidental cleanup and left this visible.
+
+    Scoped by ID, not by name: matching 'test-%' would also catch a real
+    campaign an operator happened to name that way.
+    """
+    from app.db.pool import get_pool
+
+    pool = await get_pool()
+    before = {
+        r["campaign_id"] for r in
+        await pool.fetch("select campaign_id from campaigns")
+    }
+    try:
+        yield
+    finally:
+        after = await pool.fetch("select campaign_id from campaigns where active")
+        created = [r["campaign_id"] for r in after if r["campaign_id"] not in before]
+        if created:
+            await pool.execute(
+                "update campaigns set active = false "
+                "where campaign_id = any($1::uuid[])",
+                created,
+            )
+
+
 @pytest.fixture
 async def campaign():
     return await campaigns_db.create_campaign(
@@ -494,3 +533,138 @@ async def test_leads_without_a_dial_order_sort_after_those_with_one(campaign):
 
     due = await leads_db.due_leads(limit=10, campaign_id=campaign.campaign_id)
     assert [lead.phone_e164 for lead in due] == ["+919700004002", "+919700004001"]
+
+
+
+# ── a failed call must not retire the lead ──────────────────────────────────
+#
+# _finalise_call writes 'failed' for any call that connected but did not run
+# its course, and due_leads() selects only 'pending', so max_attempts was never
+# honoured for exactly the calls it exists for. Observed live: an ElevenLabs
+# account in past_due failed every EN/HI call at attempt 1 of 2, retiring each
+# lead permanently.
+
+async def test_a_failed_lead_under_max_attempts_is_returned_to_pending(campaign):
+    lead = await leads_db.upsert_lead(
+        sheet_row=None, name="retry-me", phone_e164=_uniq_phone(),
+        campaign_id=campaign.campaign_id, consent_basis="explicit",
+        consent_at=datetime.now(timezone.utc),
+    )
+    await leads_db.record_dial_attempt(lead.lead_id)   # attempts = 1 of 2
+    await leads_db.mark_result(lead.lead_id, "failed")
+
+    moved = await leads_db.requeue_failed_leads(cooldown_s=0)
+
+    assert lead.lead_id in moved
+    again = await leads_db.get_lead(lead.lead_id)
+    assert again.status == "pending"
+    due = await leads_db.due_leads(limit=50, campaign_id=campaign.campaign_id)
+    assert lead.lead_id in [x.lead_id for x in due], "still not dialable"
+
+
+async def test_a_failed_lead_at_max_attempts_stays_failed(campaign):
+    """Exhausted is terminal — this must not become an infinite redial loop."""
+    lead = await leads_db.upsert_lead(
+        sheet_row=None, name="exhausted", phone_e164=_uniq_phone(),
+        campaign_id=campaign.campaign_id, consent_basis="explicit",
+        consent_at=datetime.now(timezone.utc),
+    )
+    for _ in range(campaign.max_attempts):
+        await leads_db.record_dial_attempt(lead.lead_id)
+    await leads_db.mark_result(lead.lead_id, "failed")
+
+    moved = await leads_db.requeue_failed_leads(cooldown_s=0)
+
+    assert lead.lead_id not in moved
+    assert (await leads_db.get_lead(lead.lead_id)).status == "failed"
+
+
+async def test_the_cooldown_holds_a_just_failed_lead_back(campaign):
+    """Without a cooldown a provider outage becomes a tight redial loop against
+    the same numbers."""
+    lead = await leads_db.upsert_lead(
+        sheet_row=None, name="too-soon", phone_e164=_uniq_phone(),
+        campaign_id=campaign.campaign_id, consent_basis="explicit",
+        consent_at=datetime.now(timezone.utc),
+    )
+    await leads_db.record_dial_attempt(lead.lead_id)   # last_called_at = now
+    await leads_db.mark_result(lead.lead_id, "failed")
+
+    moved = await leads_db.requeue_failed_leads(cooldown_s=3600)
+
+    assert lead.lead_id not in moved
+    assert (await leads_db.get_lead(lead.lead_id)).status == "failed"
+
+
+async def test_a_done_lead_is_never_resurrected(campaign):
+    lead = await leads_db.upsert_lead(
+        sheet_row=None, name="finished", phone_e164=_uniq_phone(),
+        campaign_id=campaign.campaign_id, consent_basis="explicit",
+        consent_at=datetime.now(timezone.utc),
+    )
+    await leads_db.record_dial_attempt(lead.lead_id)
+    await leads_db.mark_result(lead.lead_id, "done")
+
+    moved = await leads_db.requeue_failed_leads(cooldown_s=0)
+
+    assert lead.lead_id not in moved
+    assert (await leads_db.get_lead(lead.lead_id)).status == "done"
+
+
+async def test_a_sheet_sync_does_not_erase_consent_captured_by_file_import(campaign):
+    """sheets_sync passes consent_basis=None for a Sheet that has no consent
+    column. The upsert overwrote the column unconditionally, so a lead imported
+    with operator-affirmed consent silently became undialable — a compliance
+    field cleared by a background job."""
+    phone = _uniq_phone()
+    granted = datetime.now(timezone.utc)
+    await leads_db.upsert_lead(
+        sheet_row=None, name="from-file", phone_e164=phone,
+        campaign_id=campaign.campaign_id,
+        consent_basis="explicit", consent_at=granted,
+    )
+
+    # the Sheet knows this phone but carries no consent columns
+    after = await leads_db.upsert_lead(
+        sheet_row=7, name="from-sheet", phone_e164=phone,
+        campaign_id=campaign.campaign_id,
+        consent_basis=None, consent_at=None,
+    )
+
+    assert after.consent_basis == "explicit", "sheet sync erased the consent"
+    assert after.consent_at is not None
+    due = await leads_db.due_leads(limit=50, campaign_id=campaign.campaign_id)
+    assert after.lead_id in [x.lead_id for x in due], "lead became undialable"
+
+
+async def test_a_calling_lead_that_was_never_dialled_can_be_released(campaign):
+    """last_called_at is NULL only if record_dial_attempt never ran, and that
+    runs before placement — so such a lead cannot have a live call."""
+    lead = await leads_db.upsert_lead(
+        sheet_row=None, name="crashed", phone_e164=_uniq_phone(),
+        campaign_id=campaign.campaign_id, consent_basis="explicit",
+        consent_at=datetime.now(timezone.utc),
+    )
+    await leads_db.mark_queued(lead.lead_id)
+    await leads_db.mark_calling(lead.lead_id)          # crash lands right here
+
+    assert await leads_db.release_undialed_calling_lead(lead.lead_id) is True
+    assert (await leads_db.get_lead(lead.lead_id)).status == "pending"
+    due = await leads_db.due_leads(limit=50, campaign_id=campaign.campaign_id)
+    assert lead.lead_id in [x.lead_id for x in due], "still uncallable"
+
+
+async def test_a_lead_with_a_real_call_in_flight_is_never_released(campaign):
+    """The guard that stops this becoming a double-dial: a lead whose attempt
+    was actually placed must be left to reap_stranded_calls, not reset here."""
+    lead = await leads_db.upsert_lead(
+        sheet_row=None, name="in-flight", phone_e164=_uniq_phone(),
+        campaign_id=campaign.campaign_id, consent_basis="explicit",
+        consent_at=datetime.now(timezone.utc),
+    )
+    await leads_db.mark_queued(lead.lead_id)
+    await leads_db.mark_calling(lead.lead_id)
+    await leads_db.record_dial_attempt(lead.lead_id)   # the call went out
+
+    assert await leads_db.release_undialed_calling_lead(lead.lead_id) is False
+    assert (await leads_db.get_lead(lead.lead_id)).status == "calling"

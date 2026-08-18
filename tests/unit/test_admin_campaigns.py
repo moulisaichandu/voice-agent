@@ -7,6 +7,8 @@ bypassed (create_campaign's own ValueError still surfaces as a 422).
 from datetime import datetime, timezone
 from uuid import uuid4
 
+from fastapi import BackgroundTasks
+
 from app.admin import campaigns as admin_campaigns
 
 
@@ -438,7 +440,8 @@ def test_check_language_support_skips_elevenlabs_entirely_for_a_non_elevenlabs_b
 # ── two-way requires a backend that can hold a conversation ─────────────────
 #
 # openai_bridge (the Telugu/Tinglish backend) fully implements two-way
-# conversation, but OPENAI_TWOWAY_ENABLED gates real use on a human having
+# conversation, but each backend's own *_TWOWAY_ENABLED flag gates real use
+# on a human having
 # confirmed it on a live call first — the same discipline CLAUDE.md already
 # applies to AI disclosure and to mode never being inferred. With the flag
 # off (the default), routing a two-way campaign there is refused HERE, at
@@ -453,7 +456,7 @@ def test_create_campaign_rejects_twoway_telugu_with_a_next_step(client, monkeypa
 
     monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", boom)
     monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID", "agent_1")
-    monkeypatch.setattr(admin_campaigns.app_config, "OPENAI_TWOWAY_ENABLED", False)
+    monkeypatch.setattr(admin_campaigns.languages_module, "SARVAM_TWOWAY_ENABLED", False)
 
     r = client.post("/admin/campaigns", json={
         "name": "Telugu Twoway", "mode": "twoway", "language": "te",
@@ -467,7 +470,7 @@ def test_create_campaign_rejects_twoway_telugu_with_a_next_step(client, monkeypa
 
 
 def test_create_campaign_allows_twoway_telugu_once_the_flag_is_enabled(client, monkeypatch):
-    """The flip side: OPENAI_TWOWAY_ENABLED=true is the operator's own
+    """The flip side: the backend's two-way flag is the operator's own
     confirmation that a live call has been judged and the guard should stand
     aside — proves the flag genuinely gates the check rather than the check
     being unconditional with the flag as dead code."""
@@ -479,7 +482,7 @@ def test_create_campaign_allows_twoway_telugu_once_the_flag_is_enabled(client, m
 
     monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
     monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID", "agent_1")
-    monkeypatch.setattr(admin_campaigns.app_config, "OPENAI_TWOWAY_ENABLED", True)
+    monkeypatch.setattr(admin_campaigns.languages_module, "SARVAM_TWOWAY_ENABLED", True)
 
     r = client.post("/admin/campaigns", json={
         "name": "Telugu Twoway", "mode": "twoway", "language": "te",
@@ -490,7 +493,7 @@ def test_create_campaign_allows_twoway_telugu_once_the_flag_is_enabled(client, m
 
 def test_create_campaign_rejects_twoway_tinglish_too(client, monkeypatch):
     """Tinglish shares Telugu's backend — same flag-gated limitation. Pins
-    OPENAI_TWOWAY_ENABLED explicitly rather than relying on its default,
+    the flag explicitly rather than relying on its default,
     since a real deployment's .env (loaded via load_dotenv()) can set it
     either way independent of what this test means to check."""
     async def boom(**kwargs):
@@ -498,7 +501,7 @@ def test_create_campaign_rejects_twoway_tinglish_too(client, monkeypatch):
 
     monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", boom)
     monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID", "agent_1")
-    monkeypatch.setattr(admin_campaigns.app_config, "OPENAI_TWOWAY_ENABLED", False)
+    monkeypatch.setattr(admin_campaigns.languages_module, "SARVAM_TWOWAY_ENABLED", False)
 
     r = client.post("/admin/campaigns", json={
         "name": "Tinglish Twoway", "mode": "twoway", "language": "tinglish",
@@ -548,3 +551,197 @@ def test_create_campaign_still_allows_twoway_auto(client, monkeypatch):
 
     r = client.post("/admin/campaigns", json={"name": "Auto Twoway", "mode": "twoway"})
     assert r.status_code == 201
+
+
+# ── which voice backend a campaign will actually run on ──────────────────────
+#
+# The dashboard used to compute this client-side from the language token. That
+# stopped being able to tell the truth when TELUGU_BACKEND made the mapping an
+# operator decision: a browser cannot see .env, so a rolled-back deployment
+# would have shown every Telugu campaign running on a backend it no longer
+# used. It is now computed where the answer actually lives.
+
+def test_a_campaign_reports_the_backend_that_will_carry_it(client, monkeypatch):
+    async def fake_active():
+        return [_campaign(language="te"), _campaign(language="en")]
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "list_active_campaigns", fake_active)
+
+    rows = client.get("/admin/campaigns").json()
+    assert [r["voice_backend"] for r in rows] == ["Sarvam", "ElevenLabs"]
+
+
+def test_the_reported_backend_follows_the_rollback_switch(client, monkeypatch):
+    """The whole reason this moved server-side. With TELUGU_BACKEND rolled
+    back, a Telugu campaign really is running on OpenAI Realtime, and an
+    operator diagnosing a bad call needs the dashboard to say so."""
+    async def fake_active():
+        return [_campaign(language="te")]
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "list_active_campaigns", fake_active)
+    monkeypatch.setattr(admin_campaigns.languages_module, "TELUGU_BACKEND",
+                        admin_campaigns.languages_module.OPENAI_REALTIME)
+
+    rows = client.get("/admin/campaigns").json()
+    assert rows[0]["voice_backend"] == "OpenAI Realtime"
+
+
+# ── pre-rendering the Telugu, so no lead waits for it ────────────────────────
+#
+# Measured against the live API on 2026-07-27: rendering a script on
+# sarvam-105b takes 14-22s. The result is cached per campaign, so only the
+# FIRST call of a campaign pays it — but that lead answers the phone and hears
+# up to twenty-two seconds of silence, which is a hang-up. ONEWAY_MAX_SILENT_S
+# is 30s so the watchdog would not even kill it; it would be recorded as a
+# delivered call.
+#
+# So the render is warmed when the campaign is created, off the request path.
+
+async def test_creating_a_telugu_campaign_returns_before_the_optional_warmup(
+    monkeypatch,
+):
+    """A slow Sarvam render must not make a saved campaign look failed."""
+    warmed = {}
+
+    async def fake_create(**kwargs):
+        return _campaign(mode="oneway", language="te", script=kwargs["script"])
+
+    async def fake_render(script, *, language_style=None):
+        warmed["script"] = script
+        return "rendered"
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
+    monkeypatch.setattr(admin_campaigns.sarvam_llm, "render", fake_render)
+    tasks = BackgroundTasks()
+    script = "This is an automated AI call. Our course starts Monday."
+
+    campaign = await admin_campaigns.create_campaign(
+        admin_campaigns.CampaignCreate(
+            name="Telugu", mode="oneway", language="te", agent_id="agent_1",
+            script=script,
+        ),
+        tasks,
+    )
+
+    assert campaign.name == "Demo"
+    assert warmed == {}, "the route must return before Sarvam is contacted"
+    await tasks()
+    assert warmed["script"] == script
+
+
+def test_creating_a_telugu_campaign_warms_the_render(client, monkeypatch):
+    warmed = {}
+
+    async def fake_create(**kwargs):
+        return _campaign(mode="oneway", language="te", script=kwargs["script"])
+
+    async def fake_render(script, *, language_style=None):
+        warmed["script"] = script
+        warmed["style"] = language_style
+        return "ఇది కృత్రిమ మేధ ద్వారా చేసే ఆటోమేటెడ్ కాల్."
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
+    monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_ONEWAY_AGENT_ID",
+                        "agent_1")
+    monkeypatch.setattr(admin_campaigns.sarvam_llm, "render", fake_render)
+
+    script = "This is an automated AI call. Our course starts Monday."
+    r = client.post("/admin/campaigns", json={
+        "name": "Telugu", "mode": "oneway", "language": "te", "script": script,
+    })
+
+    assert r.status_code == 201
+    assert warmed["script"] == script
+
+
+def test_warming_never_blocks_or_breaks_campaign_creation(client, monkeypatch):
+    """The render is a nicety; the campaign is the thing the operator asked
+    for. A Sarvam outage at creation time must not lose them their campaign —
+    the dial path renders on demand anyway, it is only slower."""
+    async def fake_create(**kwargs):
+        return _campaign(mode="oneway", language="te", script=kwargs["script"])
+
+    async def boom(script, *, language_style=None):
+        raise RuntimeError("sarvam is down")
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
+    monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_ONEWAY_AGENT_ID",
+                        "agent_1")
+    monkeypatch.setattr(admin_campaigns.sarvam_llm, "render", boom)
+
+    r = client.post("/admin/campaigns", json={
+        "name": "Telugu", "mode": "oneway", "language": "te",
+        "script": "This is an automated AI call. Our course starts Monday.",
+    })
+    assert r.status_code == 201
+
+
+def test_an_english_campaign_does_not_call_sarvam_at_all(client, monkeypatch):
+    """English runs on ElevenLabs, which renders nothing. Warming it would pay
+    Sarvam to translate a script no Sarvam call will ever speak."""
+    async def fake_create(**kwargs):
+        return _campaign(mode="oneway", language="en", script=kwargs["script"])
+
+    async def boom(script, *, language_style=None):
+        raise AssertionError("must not render for an ElevenLabs-backed campaign")
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
+    monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_ONEWAY_AGENT_ID",
+                        "agent_1")
+    monkeypatch.setattr(admin_campaigns.sarvam_llm, "render", boom)
+
+    r = client.post("/admin/campaigns", json={
+        "name": "English", "mode": "oneway", "language": "en",
+        "script": "This is an automated AI call. Our course starts Monday.",
+    })
+    assert r.status_code == 201
+
+
+def test_a_campaign_with_no_script_warms_nothing(client, monkeypatch):
+    """Two-way campaigns need no script, and there is nothing to render."""
+    async def fake_create(**kwargs):
+        return _campaign(mode="twoway", language="te", script=None)
+
+    async def boom(script, *, language_style=None):
+        raise AssertionError("nothing to render")
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
+    monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID",
+                        "agent_1")
+    monkeypatch.setattr(admin_campaigns.languages_module, "SARVAM_TWOWAY_ENABLED",
+                        True)
+    monkeypatch.setattr(admin_campaigns.sarvam_llm, "render", boom)
+
+    r = client.post("/admin/campaigns", json={
+        "name": "Telugu twoway", "mode": "twoway", "language": "te",
+    })
+    assert r.status_code == 201
+
+
+def test_a_scriptless_two_way_campaign_warms_its_default_opening(client, monkeypatch):
+    """A two-way campaign needs no script, and the bridge falls back to
+    DEFAULT_TWOWAY_SCRIPT. Warming only campaign.script therefore warmed
+    nothing at all for the commonest two-way case, and the first lead after a
+    Redis flush would answer to ~20s of silence while it rendered."""
+    warmed = {}
+
+    async def fake_create(**kwargs):
+        return _campaign(mode="twoway", language="te", script=None)
+
+    async def fake_render(script, *, language_style=None):
+        warmed["script"] = script
+        return "ఇది కృత్రిమ మేధ ద్వారా చేసే ఆటోమేటెడ్ కాల్."
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
+    monkeypatch.setattr(admin_campaigns.app_config, "ELEVENLABS_TWOWAY_AGENT_ID",
+                        "agent_1")
+    monkeypatch.setattr(admin_campaigns.languages_module, "SARVAM_TWOWAY_ENABLED",
+                        True)
+    monkeypatch.setattr(admin_campaigns.sarvam_llm, "render", fake_render)
+
+    r = client.post("/admin/campaigns", json={
+        "name": "Telugu twoway", "mode": "twoway", "language": "te",
+    })
+
+    assert r.status_code == 201
+    assert warmed.get("script") == admin_campaigns.sarvam_prompts.DEFAULT_TWOWAY_SCRIPT

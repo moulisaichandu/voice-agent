@@ -19,3 +19,19 @@ Thumbs.db
 
 # Superpowers scratch (SDD ledger, task briefs, review packages)
 .superpowers/
+
+# Voice samples written by scripts/compare_telugu_voices.py and
+# scripts/smoke_sarvam_oneway.py — local listening artefacts, not source.
+voice-samples/
+.build-stamp
+
+# Generated voice comparison output — same reason voice-samples/ above is
+# ignored: rendered .wav files, regenerable with scripts/compare_telugu_voices.py,
+# and 600K of binary that would live in history forever.
+.telugu-voice-samples/
+
+# Leftover pytest tmp_path directories from ad-hoc runs. Disposable by
+# definition; the trailing patterns catch the variants that keep appearing.
+.pytest-audit/
+.pytest-audit*/
+pytest-*/

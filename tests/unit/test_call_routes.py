@@ -134,16 +134,29 @@ async def test_the_recorded_uuid_beats_an_explicitly_passed_one(redis, released)
     assert "slot:released:plivo-call-uuid" not in redis.store
 
 
-async def test_an_explicit_call_uuid_is_used_when_nothing_was_recorded(redis, released):
-    """The argument is still the fallback — better than degrading straight to
-    lead_id scope, which can't tell one attempt from the next."""
+async def test_the_caller_argument_no_longer_changes_the_token(redis, released):
+    """Per-attempt scoping now comes from the RECORDED id, not the argument.
+
+    This test used to assert the opposite — that a passed call_uuid was
+    preferred over lead_id when nothing was recorded, on the reasoning that it
+    scopes better per attempt. It does, but only for the caller that has one:
+    /calls/stream passes none. So the two teardown paths resolved different
+    tokens for the same call and released the slot twice, over-admitting past
+    MAX_CONCURRENT_CALLS permanently — the exact failure this guard exists to
+    prevent, reintroduced by the arm meant to improve it.
+
+    worker.process_one now records an attempt id unconditionally (falling back
+    to a generated one when Plivo returns no request_uuid), so per-attempt
+    scoping is preserved where it can actually be relied on, and the fallback
+    is one both paths reach identically.
+    """
     lead_id = str(uuid4())
 
     await call_routes._release_slot_once(lead_id, call_uuid="plivo-call-uuid")
-    await call_routes._release_slot_once(lead_id, call_uuid="plivo-call-uuid")
+    await call_routes._release_slot_once(lead_id)
 
-    assert released == [1]
-    assert "slot:released:plivo-call-uuid" in redis.store
+    assert released == [1], "the two teardown paths released the slot twice"
+    assert f"slot:released:{lead_id}" in redis.store
 
 
 async def test_slot_release_falls_back_to_lead_id_with_no_attempt_id(redis, released):
@@ -503,12 +516,34 @@ def test_build_call_language_sends_nothing_for_auto():
 # never learns which one ran. See app/languages.py's backend_for() for which
 # languages route where.
 
-def test_backend_bridge_picks_openai_for_telugu():
-    assert call_routes._backend_bridge("te") is call_routes.openai_bridge.bridge
+def test_backend_bridge_picks_sarvam_for_telugu():
+    assert call_routes._backend_bridge("te") is call_routes.sarvam_bridge.bridge
 
 
-def test_backend_bridge_picks_openai_for_tinglish():
-    assert call_routes._backend_bridge("tinglish") is call_routes.openai_bridge.bridge
+def test_backend_bridge_picks_sarvam_for_tinglish():
+    assert call_routes._backend_bridge("tinglish") is call_routes.sarvam_bridge.bridge
+
+
+@pytest.mark.parametrize("token", ["te", "tinglish"])
+def test_backend_bridge_follows_the_telugu_rollback_switch(monkeypatch, token):
+    """The rollback has to reach the dial path, not just the language table.
+    A switch that changed what preflight validated but not which bridge ran
+    would be worse than no switch at all."""
+    monkeypatch.setattr(call_routes.languages, "TELUGU_BACKEND",
+                        call_routes.languages.OPENAI_REALTIME)
+    assert call_routes._backend_bridge(token) is call_routes.openai_bridge.bridge
+
+
+def test_every_backend_a_language_can_route_to_has_a_bridge():
+    """_backend_bridge falls back to the ElevenLabs bridge for anything it does
+    not recognise, which is right for a hand-built token and WRONG for a real
+    backend somebody forgot to wire — ElevenLabs cannot speak Telugu, so that
+    fallback would dial a lead into a wall. This catches the omission here
+    instead of on a live call."""
+    for backend in (call_routes.languages.ELEVENLABS,
+                    call_routes.languages.OPENAI_REALTIME,
+                    call_routes.languages.SARVAM):
+        assert backend in call_routes._BRIDGE_BY_BACKEND
 
 
 @pytest.mark.parametrize("token", ["auto", "en", "hi", "hinglish"])
@@ -587,4 +622,49 @@ async def test_a_failed_disclosure_check_still_records_the_call_and_queues_write
     assert any(
         record.levelname == "ERROR" and str(lead.lead_id) in record.message
         for record in caplog.records
+    )
+
+
+# ── one call must release exactly one slot ──────────────────────────────────
+#
+# _release_slot_once resolved its dedupe token as `recorded or call_uuid or
+# lead_id`. When the recorded value is missing — Plivo returned 200 with a body
+# that carried no request_uuid, or the best-effort Redis write blipped — the
+# stream path (which passes no call_uuid) fell through to lead_id while the
+# hangup path fell through to Plivo's CallUUID. Two different guard keys, two
+# decrements of calls:live:count for one call, permanently over-admitting past
+# MAX_CONCURRENT_CALLS. The docstring already argued the principle: whichever
+# id wins matters far less than both paths choosing the SAME one.
+
+async def test_stream_and_hangup_release_one_slot_when_no_attempt_id_was_recorded(
+        monkeypatch):
+    from app.telephony import call_routes as cr
+
+    store: dict[str, str] = {}
+    releases = []
+
+    class _R:
+        async def get(self, key):
+            return store.get(key)
+
+        async def set(self, key, value, nx=False, ex=None):
+            if nx and key in store:
+                return False
+            store[key] = value
+            return True
+
+    async def fake_release():
+        releases.append(1)
+
+    monkeypatch.setattr(cr.redis_client, "get_redis", lambda: _R())
+    monkeypatch.setattr(cr.telephony_worker, "release_call_slot", fake_release)
+
+    # the stream's finally, which knows only the lead
+    await cr._release_slot_once("lead-1")
+    # then Plivo's hangup post, which carries its own CallUUID
+    await cr._release_slot_once("lead-1", call_uuid="plivo-call-uuid-abc")
+
+    assert len(releases) == 1, (
+        f"one call released {len(releases)} slots — calls:live:count now "
+        "over-admits permanently"
     )

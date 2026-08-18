@@ -13,13 +13,14 @@ import logging
 from typing import Literal
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel, Field
 
 from app import config as app_config
 from app import languages as languages_module
 from app.db import campaigns as campaigns_db
 from app.db.models import Campaign, CampaignLanguage
+from app.telephony import sarvam_llm, sarvam_prompts
 from app.telephony.elevenlabs_client import agent_language_support
 
 router = APIRouter()
@@ -83,16 +84,20 @@ def _check_twoway_capable(mode: str, language: str) -> None:
     """Refuse a two-way campaign whose language routes to a backend that
     hasn't been PROVEN on a live call yet.
 
-    app/telephony/openai_bridge.py (the te/tinglish backend — see
-    app/languages.py's backend_for()) fully implements two-way conversation
-    — turn detection, RAG, barge-in truncation. What it does not yet have is
-    a human having placed a real call and confirmed it behaves correctly;
-    that is OPENAI_TWOWAY_ENABLED's job (see app/config.py). Routing a
-    two-way campaign to an unverified conversational path risks the exact
-    "campaigns.mode silently produces calls leads couldn't respond to"
-    failure CLAUDE.md documents from the sibling project, which is why mode
-    is admin-set and never inferred — the same caution applies to a backend
-    that has never been heard on a real line.
+    The te/tinglish backends (see app/languages.py's backend_for()) are at
+    different stages: openai_bridge.py implements two-way fully — turn
+    detection, RAG, barge-in truncation — and sarvam_bridge.py does not
+    implement it at all yet. Neither has what matters most, which is a human
+    having placed a real call and confirmed it behaves correctly. That is what
+    each backend's own two-way flag records; languages_module.twoway_enabled()
+    owns which flag belongs to which backend, so this function and
+    app/telephony/preflight.py cannot drift apart about it.
+
+    Routing a two-way campaign to an unverified conversational path risks the
+    exact "campaigns.mode silently produces calls leads couldn't respond to"
+    failure CLAUDE.md documents from the sibling project, which is why mode is
+    admin-set and never inferred — the same caution applies to a backend that
+    has never been heard on a real line.
 
     Checked at CREATION, where the operator can still choose 'oneway' or a
     different language — not at dial time, when the only options left are
@@ -104,17 +109,17 @@ def _check_twoway_capable(mode: str, language: str) -> None:
     """
     if mode != "twoway":
         return
-    if (languages_module.backend_for(language) != languages_module.ELEVENLABS
-            and not app_config.OPENAI_TWOWAY_ENABLED):
+    backend = languages_module.backend_for(language)
+    if not languages_module.twoway_enabled(backend):
         raise HTTPException(
             status_code=422,
             detail=(
                 f"Two-way calling for {languages_module.display(language)} "
-                "is built but not yet enabled — a live call has to confirm "
-                "it before real campaigns use it (OPENAI_TWOWAY_ENABLED in "
-                ".env). One-way calling IS available for this language today "
-                "(mode='oneway'), or choose a different language for a "
-                "two-way campaign."
+                f"is not yet enabled on its voice backend "
+                f"({languages_module.backend_display(backend)}) — a live call "
+                "has to confirm it before real campaigns use it. One-way "
+                "calling IS available for this language today (mode='oneway'), "
+                "or choose a different language for a two-way campaign."
             ),
         )
 
@@ -221,21 +226,68 @@ async def list_campaigns(include_inactive: bool = False) -> list[Campaign]:
 
 
 @router.post("/campaigns", response_model=Campaign, status_code=201)
-async def create_campaign(body: CampaignCreate) -> Campaign:
+async def create_campaign(
+    body: CampaignCreate, background_tasks: BackgroundTasks,
+) -> Campaign:
     _check_twoway_capable(body.mode, body.language)
     agent_id = _resolve_agent_id(body.mode, body.agent_id)
     await _check_language_support(agent_id, body.language)
     try:
-        return await campaigns_db.create_campaign(
+        campaign = await campaigns_db.create_campaign(
             name=body.name, mode=body.mode, agent_id=agent_id,
             script=body.script, max_attempts=body.max_attempts,
             language=body.language,
         )
+        # Sarvam rendering is an optional cache warm-up and can take long
+        # enough for the console proxy to time out. Respond as soon as the
+        # campaign is durable; Starlette runs this task after sending the 201.
+        background_tasks.add_task(_warm_rendered_script, campaign)
+        return campaign
     except ValueError as exc:
         # The oneway-needs-a-script and AI-disclosure checks in
         # create_campaign() raise ValueError — surfaced as a 422 the frontend
         # can show inline, not a 500.
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+async def _warm_rendered_script(campaign: Campaign) -> None:
+    """Render this campaign's script into Telugu now, so no lead waits for it.
+
+    Rendering measured 14-22s against the live API — Sarvam's chat models are
+    reasoning models and cannot be told to hurry. The result is cached per
+    campaign, so only the FIRST call of a campaign would pay it, but that lead
+    answers the phone and hears up to twenty-two seconds of silence. They hang
+    up, and because ONEWAY_MAX_SILENT_S is 30s the watchdog never even notices:
+    it is recorded as a delivered call.
+
+    Deliberately best-effort. The campaign is what the operator asked for; the
+    warm cache is a nicety. A Sarvam outage at creation time must not cost them
+    the campaign, because the dial path still renders on demand — just slowly.
+    """
+    script = (campaign.script or "").strip()
+    if not script:
+        if campaign.mode != "twoway":
+            return
+        # A two-way campaign needs no script and the bridge falls back to
+        # DEFAULT_TWOWAY_SCRIPT, so warming only campaign.script warmed nothing
+        # at all for the commonest two-way case.
+        script = sarvam_prompts.DEFAULT_TWOWAY_SCRIPT
+    if languages_module.backend_for(campaign.language) != languages_module.SARVAM:
+        # ElevenLabs renders nothing and OpenAI Realtime renders as it speaks.
+        # Warming either would pay Sarvam to translate a script no Sarvam call
+        # will ever read.
+        return
+    try:
+        await sarvam_llm.render(
+            script, language_style=languages_module.style(campaign.language),
+        )
+    except Exception as exc:  # noqa: BLE001 - never lose a campaign over a cache
+        logger.warning(
+            f"[sarvam-llm] could not pre-render campaign {campaign.campaign_id}'s "
+            f"script ({type(exc).__name__}: {exc}). The campaign is created; the "
+            "first call will render on demand and its lead may hear a long "
+            "pause before the agent speaks."
+        )
 
 
 @router.patch("/campaigns/{campaign_id}", response_model=Campaign)

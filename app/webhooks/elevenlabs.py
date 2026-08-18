@@ -127,10 +127,13 @@ async def _handle_call_initiation_failure(data: dict) -> None:
 
 @router.post("/webhooks/elevenlabs")
 async def elevenlabs_webhook(request: Request) -> dict:
-    raw_body = (await request.body()).decode("utf-8")
     sig_header = request.headers.get("ElevenLabs-Signature", "")
 
     try:
+        # Decode INSIDE the guard: a non-UTF-8 body raises UnicodeDecodeError (a
+        # ValueError subclass), which must be a clean 401 like any other
+        # unverifiable request — not an unauthenticated 500 with a stack trace.
+        raw_body = (await request.body()).decode("utf-8")
         event = construct_webhook_event(raw_body, sig_header, ELEVENLABS_WEBHOOK_SECRET or "")
     except (BadRequestError, ValueError) as exc:
         # Deliberately generic 401 body — don't echo back WHY verification

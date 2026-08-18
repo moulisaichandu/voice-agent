@@ -6,6 +6,7 @@ All other modules import from here; nothing else reads os.environ directly.
 import logging
 import math
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -84,6 +85,30 @@ def _list(name: str, default: tuple[str, ...] = ()) -> list[str]:
     return [p.strip() for p in raw.split(",") if p.strip()]
 
 
+def _choice(name: str, default: str, allowed: tuple[str, ...]) -> str:
+    """One of a fixed set of values, case- and whitespace-insensitive.
+
+    The enum member of the helper family. Same contract as the rest: an
+    unrecognised override warns and falls back rather than crashing at import.
+
+    Case folding is not cosmetic here. These values are hand-edited in .env and
+    then compared with `==` deep inside dispatch tables; 'Sarvam' silently
+    meaning something different from 'sarvam' would route live calls to a
+    backend nobody chose, and the only symptom would be the wrong voice
+    answering a real lead.
+    """
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    cleaned = raw.strip().lower()
+    if cleaned in allowed:
+        return cleaned
+    logger.warning(
+        f"{name}={raw!r} is not one of {allowed} — using default {default!r}."
+    )
+    return default
+
+
 # ── DATABASE ──────────────────────────────────────────────────────────────────
 # Supabase Postgres IS Postgres — this is a plain connection string. Point it at
 # the local docker-compose pgvector container for dev/test, or the real Supabase
@@ -112,6 +137,13 @@ PLIVO_FROM_NUMBER: str | None = os.getenv("PLIVO_FROM_NUMBER")
 # PUBLIC_BASE_URL is set and this is empty, those routes are open to anyone who
 # finds the URL — app/main.py's startup check refuses to boot in that state.
 CALL_WEBHOOK_SECRET: str | None = os.getenv("CALL_WEBHOOK_SECRET")
+# Where to ask for the CURRENT quick-tunnel hostname, set by docker-compose to
+# cloudflared's own metrics port. Quick tunnels mint a new random hostname on
+# every start, so PUBLIC_BASE_URL above is only correct until cloudflared next
+# restarts — see app/telephony/public_url.py, which re-resolves from here.
+# Blank in production, where PUBLIC_BASE_URL is a real domain and there is no
+# cloudflared service to ask.
+TUNNEL_DISCOVERY_URL = os.getenv("TUNNEL_DISCOVERY_URL", "")
 
 # Guards POST /rag/search, the two-way agent's live tool. Same shape as
 # CALL_WEBHOOK_SECRET and for the same reason: ElevenLabs calls that endpoint
@@ -160,6 +192,23 @@ ELEVENLABS_WEBHOOK_SECRET: str | None = os.getenv("ELEVENLABS_WEBHOOK_SECRET")
 # Set once an agent exists in the ElevenLabs dashboard / is created via API.
 ELEVENLABS_ONEWAY_AGENT_ID: str | None = os.getenv("ELEVENLABS_ONEWAY_AGENT_ID")
 ELEVENLABS_TWOWAY_AGENT_ID: str | None = os.getenv("ELEVENLABS_TWOWAY_AGENT_ID")
+# Force ONE voice on every ElevenLabs-backed call (en/hi/hinglish AND auto),
+# overriding whatever voice each agent is configured with — including a
+# per-language preset, which pins a voice for one language and is the usual
+# reason a dashboard voice change appears not to take effect.
+#
+# Blank/unset means send no voice at all: the call frame is then byte-identical
+# to what it was before this existed (see app/telephony/bridge.py).
+#
+# SETTING THIS REQUIRES a one-time dashboard step on EVERY agent id in use
+# (both ELEVENLABS_{ONEWAY,TWOWAY}_AGENT_ID): Security -> Overrides -> enable
+# Voice ID. ElevenLabs REJECTS the whole conversation if an override arrives for
+# a field that isn't enabled, so preflight refuses to dial an agent that doesn't
+# allow it rather than letting every call fail on answer.
+#
+# Stripped and blank-normalised, unlike the plain getenv reads above: a trailing
+# space in .env would be sent as a voice id of "abc123 " and fail every call.
+ELEVENLABS_VOICE_ID: str | None = (os.getenv("ELEVENLABS_VOICE_ID") or "").strip() or None
 # Only used if ElevenLabs ever places calls itself (its own SIP-trunk number).
 # The live path does NOT use it: Plivo places the call and app/telephony/
 # bridge.py bridges the audio, so no number is registered inside ElevenLabs.
@@ -199,6 +248,106 @@ OPENAI_REALTIME_NOISE_REDUCTION = os.getenv("OPENAI_REALTIME_NOISE_REDUCTION", "
 # never affected by this flag.
 OPENAI_TWOWAY_ENABLED = _bool("OPENAI_TWOWAY_ENABLED", False)
 
+# ── SARVAM (the Telugu voice backend) ────────────────────────────────────────
+# Sarvam is an Indian-language speech vendor whose TTS voices are recorded by
+# professional Indian voice artists and whose STT is trained on Indian
+# telephony audio. It exists here to fix the one thing the OpenAI Realtime
+# backend could not: every Realtime voice is English-first, and there is no
+# Telugu-native voice at any price.
+#
+# Unlike the other two backends, Sarvam has NO speech-to-speech API. STT, LLM
+# and TTS are three separate services and the turn-taking between them is
+# ours, which is also why two-way Telugu becomes possible here at all.
+SARVAM_API_KEY: str | None = os.getenv("SARVAM_API_KEY")
+SARVAM_TTS_MODEL = os.getenv("SARVAM_TTS_MODEL", "bulbul:v3")
+# The voice. Unlike OPENAI_REALTIME_VOICE this is not optional — Sarvam's TTS
+# rejects a config frame with no speaker. 'priya' is Sarvam's documented
+# default for te-IN; judge it on a real 8 kHz call before dialling a list, and
+# change it here rather than in code.
+SARVAM_TTS_SPEAKER = os.getenv("SARVAM_TTS_SPEAKER", "priya")
+# 0.5-2.0 on bulbul:v3. Below 1.0 is slower. Telephony audio is already hard to
+# follow; err slow rather than fast.
+SARVAM_TTS_PACE = _float("SARVAM_TTS_PACE", 1.0)
+# saaras:v3 is the telephony-tuned model. saarika is NOT — it is trained on
+# clean audio and degrades on 8 kHz call quality.
+SARVAM_STT_MODEL = os.getenv("SARVAM_STT_MODEL", "saaras:v3")
+# Same reasoning as OPENAI_REALTIME_STT_LANGUAGE above, and the same observed
+# failure: on 8 kHz audio, auto-detection mis-hears Telugu as Croatian/Urdu,
+# the lead is transcribed as nonsense, and the agent answers the nonsense.
+# Sarvam wants a BCP-47 code (te-IN), not the bare ISO code.
+SARVAM_STT_LANGUAGE = os.getenv("SARVAM_STT_LANGUAGE", "te-IN")
+# Renders an English campaign script into spoken Telugu. Sarvam's own model,
+# because it is Indic-tuned and the output quality showed on the first live
+# test — and because this runs ONCE per campaign, off the call path (see
+# CONVERSATION_LLM_PROVIDER for why that distinction matters).
+SARVAM_LLM_MODEL = os.getenv("SARVAM_LLM_MODEL", "sarvam-105b")
+# Sarvam's own VAD decides when the lead has started/stopped speaking, which is
+# what drives barge-in. Higher sensitivity catches quieter speech at the cost of
+# treating background noise as a turn.
+SARVAM_VAD_HIGH_SENSITIVITY = _bool("SARVAM_VAD_HIGH_SENSITIVITY", False)
+# The exact twin of OPENAI_TWOWAY_ENABLED, for the same reason and with the
+# same discipline: two-way does not go live on code review alone.
+SARVAM_TWOWAY_ENABLED = _bool("SARVAM_TWOWAY_ENABLED", False)
+
+# THE ROLLBACK SWITCH. Which backend carries Telugu and Tinglish.
+#
+# This is the one knob that makes replacing a live voice backend a reversible
+# decision: if Sarvam's Telugu turns out worse than OpenAI's on a real call,
+# set this to 'openai_realtime' and restart. No deploy, no code change, no
+# migration — app/telephony/openai_bridge.py and its tests are all still here.
+#
+# It applies to BOTH Telugu tokens at once, deliberately. 'te' and 'tinglish'
+# share the ISO code 'te', and app/languages.py's backend_for_iso() resolves an
+# ISO code by finding a token that matches it — so if the two tokens could ever
+# disagree about their backend, preflight would check one backend's
+# prerequisites for a call the other was about to place.
+TELUGU_BACKEND = _choice("TELUGU_BACKEND", "sarvam", ("sarvam", "openai_realtime"))
+
+# ── the two-way conversation brain ───────────────────────────────────────────
+# Separate from SARVAM_LLM_MODEL above because the two jobs have opposite
+# constraints. Rendering a script happens once per campaign and is cached, so
+# it can afford to be slow and should be the best Indic model available.
+# Answering a lead mid-call happens every turn, with a real person waiting in
+# silence, so it has to be FAST.
+#
+# Sarvam's chat models cannot do the second job. Measured against the live API
+# 2026-07-27: both sarvam-105b and sarvam-30b are REASONING models that spend
+# 400-2000 completion tokens thinking before answering, and it cannot be turned
+# off (reasoning_effort takes only low/medium/high; thinking.type=disabled and
+# chat_template_kwargs.enable_thinking=False are accepted and ignored; capping
+# max_tokens truncates inside the reasoning and returns no answer at all). A
+# realistic conversational turn measured 21.8 seconds. A lead asking "how much
+# are the fees?" would sit in silence for twenty-two seconds.
+#
+# So the conversation runs on an ordinary, fast chat model. Both providers speak
+# the same OpenAI-compatible protocol, so this is a URL and a key, not a second
+# integration. Set to 'sarvam' to keep everything in one vendor if their latency
+# ever changes.
+CONVERSATION_LLM_PROVIDER = _choice(
+    "CONVERSATION_LLM_PROVIDER", "openai", ("openai", "sarvam"))
+# Blank picks the provider's default (gpt-4o-mini / sarvam-105b) rather than
+# forcing an operator switching providers to remember to change two variables.
+CONVERSATION_LLM_MODEL = os.getenv("CONVERSATION_LLM_MODEL", "")
+# A turn the lead is waiting through. Far shorter than the render timeout on
+# purpose: past this the answer is no longer worth having, because the lead has
+# already decided the line is dead.
+CONVERSATION_LLM_TIMEOUT_S = _float("CONVERSATION_LLM_TIMEOUT_S", 12.0)
+
+# How long to wait, after the lead's speech settles, before answering. Short —
+# it exists to absorb Sarvam's transcript and END_SPEECH signal arriving in
+# either order for the same utterance, not to detect end-of-speech itself
+# (that's END_SPEECH; see app/telephony/sarvam_stt.py). Tunable because it is
+# a straight trade: too low risks answering mid-sentence on a lead who pauses
+# briefly, too high adds dead air to every single turn.
+SARVAM_REPLY_SETTLE_S = _float("SARVAM_REPLY_SETTLE_S", 0.25)
+
+# Ceiling on the same wait if END_SPEECH never arrives for an utterance —
+# preserves the previous fixed-debounce behaviour as a FALLBACK rather than a
+# floor, so a turn can never be slower than it was before this became
+# signal-driven. See app/telephony/sarvam_bridge.py's _reply_when_they_stop for
+# why a burst of short utterances still collapses into one reply either way.
+SARVAM_REPLY_MAX_WAIT_S = _float("SARVAM_REPLY_MAX_WAIT_S", 0.7)
+
 # ── EMBEDDINGS (OpenAI text-embedding-3-small) ────────────────────────────────
 # A separate credential from ElevenLabs — text-embedding-3-small is an OpenAI
 # model. RAG ingestion/search cannot run for real without this; code + tests run
@@ -226,8 +375,45 @@ RAG_TOP_K = _int("RAG_TOP_K", 4)
 RAG_TRANSLATE_ON_MISS = _bool("RAG_TRANSLATE_ON_MISS", True)
 RAG_TRANSLATE_MODEL = os.getenv("RAG_TRANSLATE_MODEL", "gpt-4o-mini")
 
+# The live Sarvam voice call's own deadline on ONE search_relevant() lookup.
+# That function has no deadline of its own — an 8s embed timeout with one SDK
+# retry is ~16s, and a miss adds a translate call (6s, also retried once,
+# ~12s) plus a SECOND embed+match — and it is also POST /rag/search, the
+# ElevenLabs agent's live tool, so it cannot be given one internally without
+# changing a path that is already in production. Bounded here instead, on the
+# voice call site only (app/telephony/sarvam_bridge.py). The two-way silence
+# watchdog will NOT save the lead from a slow lookup — a reply already in
+# flight counts as activity — so without this a lead who asks a course
+# question can sit in total silence for the better part of a minute.
+RAG_VOICE_DEADLINE_S = _float("RAG_VOICE_DEADLINE_S", 4.0)
+
 # ── GOOGLE SHEETS ─────────────────────────────────────────────────────────────
+# Which build is running. Written into the image at build time by the
+# Dockerfile, so it CHANGES whenever the image is actually rebuilt and stays
+# identical when it is not. That is the whole point: `docker compose up
+# --force-recreate` silently reuses the old image while .env changes DO apply,
+# so code and config can disagree with nothing to show for it. Comparing this
+# value across a deploy is the cheapest way to prove a rebuild happened.
+# Falls back to "dev" when running uvicorn straight from a checkout.
+def _build_id() -> str:
+    stamped = Path(__file__).resolve().parent.parent / ".build-stamp"
+    try:
+        value = stamped.read_text(encoding="utf-8").strip()
+    except OSError:
+        return os.getenv("BUILD_ID", "dev")
+    return value or os.getenv("BUILD_ID", "dev")
+
+
+BUILD_ID = _build_id()
+
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "sa.json")
+# The same credential, inline, for containers. sa.json is in .dockerignore
+# (correctly — it is a secret and must never be baked into an image) and
+# nothing mounts it, so the FILE route cannot work under docker compose at all.
+# This is the route that can: paste the service-account JSON as one line in
+# .env, which is where CLAUDE.md says secrets live anyway. The file still wins
+# when it exists, so running uvicorn directly on the host is unchanged.
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 GOOGLE_SHEET_ID: str | None = os.getenv("GOOGLE_SHEET_ID")
 LEADS_WORKSHEET_NAME = os.getenv("LEADS_WORKSHEET_NAME", "Leads")
 
@@ -237,8 +423,39 @@ PUBLIC_BASE_URL: str | None = os.getenv("PUBLIC_BASE_URL")
 # ── COMPLIANCE (India TCCCPR) ─────────────────────────────────────────────────
 # Calling-hours window, IST. APScheduler's campaign_tick only enqueues leads
 # inside this window; anything outside is deferred to the next window.
-CALLING_HOURS_START = _int("CALLING_HOURS_START", 10)   # 10:00 IST
-CALLING_HOURS_END = _int("CALLING_HOURS_END", 19)        # 19:00 IST
+_DEFAULT_HOURS_START = 10   # 10:00 IST
+_DEFAULT_HOURS_END = 19     # 19:00 IST
+
+
+def _validated_hours(start: int, end: int) -> tuple[int, int]:
+    """Reject a window that can never open, rather than silently never dialling.
+
+    The gate is [start, end) on a 24-hour clock, so midnight as an END is 24,
+    not 0 — but `CALLING_HOURS_END=0` is the natural thing to write, and it
+    makes `start <= hour < 0` false at every hour of every day. Dialling then
+    stops completely while the readiness dashboard still reports it can dial,
+    because that check only asks whether NOW is inside the window, never
+    whether the window is satisfiable.
+
+    Same warn-and-default contract as the _int/_bool helpers above: a malformed
+    override is loud and survivable, never a silent behaviour change. A fully
+    open 0-24 window is legitimate and passes untouched.
+    """
+    if not (0 <= start < end <= 24):
+        logger.warning(
+            f"CALLING_HOURS_START={start}/CALLING_HOURS_END={end} describes a "
+            f"window that can never open (the gate is [start, end) on a 24-hour "
+            f"clock, so midnight as an end is 24, not 0). Falling back to "
+            f"{_DEFAULT_HOURS_START}-{_DEFAULT_HOURS_END}."
+        )
+        return _DEFAULT_HOURS_START, _DEFAULT_HOURS_END
+    return start, end
+
+
+CALLING_HOURS_START, CALLING_HOURS_END = _validated_hours(
+    _int("CALLING_HOURS_START", _DEFAULT_HOURS_START),
+    _int("CALLING_HOURS_END", _DEFAULT_HOURS_END),
+)
 CALLING_HOURS_TZ = os.getenv("CALLING_HOURS_TZ", "Asia/Kolkata")
 
 # ── CAMPAIGN / DIALLING ────────────────────────────────────────────────────────
@@ -248,7 +465,15 @@ CAMPAIGN_TICK_SECONDS = _int("CAMPAIGN_TICK_SECONDS", 60)
 RETRY_SWEEP_MINUTES = _int("RETRY_SWEEP_MINUTES", 15)
 TRANSCRIPT_RECONCILE_MINUTES = _int("TRANSCRIPT_RECONCILE_MINUTES", 30)
 SHEETS_SYNC_MINUTES = _int("SHEETS_SYNC_MINUTES", 10)
-DIALING_LOCK_TTL_S = _int("DIALING_LOCK_TTL_S", 60)
+# Derived, not an independent number: this lock exists to stop ONE phone number
+# being dialled twice at once, so it has to outlive the call it is guarding. At
+# a flat 60s against CALL_MAX_DURATION_S=300 it stopped protecting four minutes
+# before the first call could end — and a person enrolled in two campaigns (two
+# lead rows, which the schema explicitly allows) could be rung a second time
+# while still talking to the agent: both legs billed, and the second attempt
+# burned against max_attempts for a conversation that already happened.
+DIALING_LOCK_TTL_S = _int(
+    "DIALING_LOCK_TTL_S", CALL_RING_TIMEOUT_S + CALL_MAX_DURATION_S + 60)
 PROCESSING_REAPER_TIMEOUT_S = _int("PROCESSING_REAPER_TIMEOUT_S", 300)
 
 # ── SCHEDULER ─────────────────────────────────────────────────────────────────

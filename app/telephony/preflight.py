@@ -25,15 +25,23 @@ import httpx
 from app import languages as languages_module
 from app.config import (
     CALL_WEBHOOK_SECRET,
+    CONVERSATION_LLM_PROVIDER,
+    CONVERSATION_LLM_TIMEOUT_S,
     ELEVENLABS_API_KEY,
+    ELEVENLABS_VOICE_ID,
     OPENAI_API_KEY,
-    OPENAI_TWOWAY_ENABLED,
     PLIVO_AUTH_ID,
     PLIVO_AUTH_TOKEN,
     PLIVO_FROM_NUMBER,
-    PUBLIC_BASE_URL,
+    SARVAM_API_KEY,
 )
-from app.telephony.elevenlabs_client import agent_exists, agent_language_support
+from app.telephony import conversation_llm, public_url, sarvam_circuit_breaker
+from app.telephony.elevenlabs_client import (
+    GOOD_SUBSCRIPTION_STATUSES,
+    agent_exists,
+    agent_language_support,
+    cached_subscription_status,
+)
 
 _HEALTH_CHECK_TIMEOUT_S = 10.0
 
@@ -72,13 +80,19 @@ async def preflight(
     # languages.backend_for_iso), so a two-way 'auto' campaign — every
     # campaign created before this feature existed — can never trip this.
     twoway_backend = languages_module.backend_for_iso(language)
-    if (mode == "twoway" and twoway_backend != languages_module.ELEVENLABS
-            and not OPENAI_TWOWAY_ENABLED):
+    if mode == "twoway" and not languages_module.twoway_enabled(twoway_backend):
+        # The flag and the backend's NAME both come from languages_module
+        # rather than being written here. This message used to hardcode
+        # "OpenAI Realtime" and read OPENAI_TWOWAY_ENABLED directly, which
+        # silently became wrong the moment Telugu moved to Sarvam: an operator
+        # would be told to check a backend their campaign does not use.
+        display = languages_module.backend_display(twoway_backend)
+        flag = f"{twoway_backend.split('_')[0].upper()}_TWOWAY_ENABLED"
         return (
             f"This campaign is 'twoway' in '{language}'. That backend "
-            "(OpenAI Realtime) supports two-way calling, but OPENAI_TWOWAY_ENABLED "
-            "is not set — a live call needs to confirm it works before real "
-            "campaigns use it. One-way calling IS available for "
+            f"({display}) has not been confirmed for two-way calling — "
+            f"{flag} is not set, and a live call needs to confirm it works "
+            "before real campaigns use it. One-way calling IS available for "
             f"'{language}' today. Change this campaign's "
             "mode to 'oneway', or choose a different language for a two-way "
             "campaign."
@@ -99,20 +113,28 @@ async def preflight(
         return ("No agent_id is set for this campaign. Set campaigns.agent_id to a "
                 "real ElevenLabs agent id.")
 
-    if not PUBLIC_BASE_URL:
+    # Re-resolve the tunnel FIRST. This runs once per campaign_tick batch,
+    # immediately before any dialling, which is the one moment being current
+    # actually matters: a quick tunnel mints a new hostname whenever cloudflared
+    # restarts, and nothing else re-resolves for the life of the process. A
+    # stale hostname here means every lead's phone rings and the call drops on
+    # answer, with nothing in our logs. See app/telephony/public_url.py.
+    base_url = await public_url.refresh()
+
+    if not base_url:
         return ("PUBLIC_BASE_URL is not set, so Plivo has no way to reach this "
                 "server. Every call would ring and then drop the instant it was "
                 "answered. Set it to the public HTTPS URL of this backend.")
 
     # Round-trip the real answer URL rather than /health: this validates the
     # webhook token and the XML too, which /health cannot.
-    url = (f"{PUBLIC_BASE_URL.rstrip('/')}/calls/answer"
+    url = (f"{base_url.rstrip('/')}/calls/answer"
            f"?token={CALL_WEBHOOK_SECRET or ''}&lead=preflight")
     try:
         async with httpx.AsyncClient(timeout=_HEALTH_CHECK_TIMEOUT_S) as client:
             resp = await client.post(url)
     except httpx.RequestError as exc:
-        return (f"PUBLIC_BASE_URL ({PUBLIC_BASE_URL}) is unreachable "
+        return (f"PUBLIC_BASE_URL ({base_url}) is unreachable "
                 f"({type(exc).__name__}). Plivo could not fetch the answer URL, so "
                 "every call would ring and drop on answer. Is the tunnel running?")
 
@@ -126,11 +148,11 @@ async def preflight(
                 if resp.status_code in (404, 502, 503, 504) else "")
         return (f"The answer URL returned HTTP {resp.status_code} instead of 200."
                 f"{hint} Plivo needs a 200 with <Stream> XML, so calls would drop "
-                f"on answer. URL: {PUBLIC_BASE_URL}/calls/answer")
+                f"on answer. URL: {base_url}/calls/answer")
     if "<Stream" not in resp.text:
         return ("The answer URL returned 200 but no <Stream> XML — something other "
                 "than this app is answering on that URL (a tunnel error page, or "
-                f"another service?). URL: {PUBLIC_BASE_URL}/calls/answer")
+                f"another service?). URL: {base_url}/calls/answer")
 
     # Cheapest last: this is the only check that costs an ElevenLabs API call.
     #
@@ -149,39 +171,151 @@ async def preflight(
         return (f"Could not verify the agent with ElevenLabs ({type(exc).__name__}: "
                 f"{exc}). Not dialling while the platform's state is unknown.")
 
-    # Language, last: only reached when the chain is otherwise sound, and only
-    # when a language was actually requested. An 'auto' campaign overrides
-    # nothing and so cannot fail here — it must not gain a new way to not dial.
-    if language:
-        # Which questions are worth asking depends entirely on which backend
-        # will actually carry this call. An OpenAI-backed language has no
-        # ElevenLabs agent, no language preset and no override switch —
-        # running the ElevenLabs checks below against it would refuse the
-        # campaign for a reason unrelated to whether it can dial. See
-        # app/languages.py's backend_for_iso() for why this needs the ISO
-        # lookup rather than backend_for()'s token lookup.
-        if languages_module.backend_for_iso(language) == languages_module.OPENAI_REALTIME:
-            if not OPENAI_API_KEY:
-                return (
-                    f"This campaign dials in '{language}', which runs on the "
-                    "OpenAI Realtime backend, but OPENAI_API_KEY is not set. "
-                    "Set it in .env — it is the same key the RAG embedder uses."
-                )
-            return None
-
-        try:
-            support = await asyncio.to_thread(agent_language_support, agent_id)
-        except Exception as exc:
-            # Deliberately NOT a refusal. This check is an extra guard over a
-            # correctly-configured agent; an SDK or API change must not become
-            # a dial-stopping outage when the call would have worked fine.
-            # Every check above still applies.
-            logger.warning(
-                f"[preflight] could not read agent {agent_id}'s language support "
-                f"({type(exc).__name__}: {exc}) — dialling anyway"
+    # The agent's own configuration, last: only reached when the chain is
+    # otherwise sound. Both the language and the forced voice are answered by
+    # ONE read of the agent, so they share it.
+    #
+    # Which questions are worth asking depends entirely on which backend will
+    # actually carry this call. An OpenAI-backed language has no ElevenLabs
+    # agent, no language preset and no override switch — running the ElevenLabs
+    # checks below against it would refuse the campaign for a reason unrelated
+    # to whether it can dial, and a forced ElevenLabs voice is irrelevant to a
+    # call openai_bridge.py carries. See app/languages.py's backend_for_iso()
+    # for why this needs the ISO lookup rather than backend_for()'s token
+    # lookup. Checked OUTSIDE the `if language:` below because a forced voice
+    # must not drag an OpenAI-backed call into the ElevenLabs branch;
+    # backend_for_iso(None) is ELEVENLABS, so an 'auto' campaign never enters.
+    call_backend = languages_module.backend_for_iso(language)
+    if call_backend == languages_module.SARVAM:
+        if not SARVAM_API_KEY:
+            return (
+                f"This campaign dials in '{language}', which runs on the "
+                "Sarvam backend, but SARVAM_API_KEY is not set. Get one from "
+                "https://dashboard.sarvam.ai and set it in .env. To fall back "
+                "to the previous backend instead, set "
+                "TELUGU_BACKEND=openai_realtime."
             )
-            return None
+        # Sarvam publishes no balance/credits endpoint, so this is the only
+        # way the account's state is knowable before dialling: a previous call
+        # already failed with it and tripped the breaker. Checked after the
+        # key (can we talk to Sarvam at all) and before the campaign-config
+        # guard below (is this campaign set up sanely).
+        breaker_reason = await sarvam_circuit_breaker.tripped_reason()
+        if breaker_reason:
+            return (
+                f"Sarvam reported {breaker_reason!r} on a recent call, and "
+                "dialling on this backend has been paused rather than risk "
+                "repeating it on every other lead. Check credits at "
+                "dashboard.sarvam.ai/usage, top up if needed, then clear it: "
+                "POST /admin/system/sarvam-circuit-breaker/clear."
+            )
+        # A two-way call on this backend is answered by conversation_llm.turn(),
+        # not by Sarvam's own chat models — see conversation_llm.py's docstring.
+        # Sarvam's are reasoning models measured at 21.8s on a real turn and
+        # cannot be told to stop reasoning, so pointing CONVERSATION_LLM_PROVIDER
+        # at 'sarvam' does not make the agent slow, it makes it silent: most
+        # turns exceed CONVERSATION_LLM_TIMEOUT_S, raise TurnFailed, and are
+        # swallowed by sarvam_bridge._reply's catch-all — the lead hears
+        # nothing, and the call is still graded a clean exit. Same discipline
+        # as the twoway-flag gate above: a config combination that is known not
+        # to work must refuse to dial, not degrade into a silent call.
+        if mode == "twoway" and CONVERSATION_LLM_PROVIDER == conversation_llm.SARVAM:
+            return (
+                f"This campaign dials in '{language}' as a two-way call. "
+                "CONVERSATION_LLM_PROVIDER is set to 'sarvam', but Sarvam's "
+                "chat models are reasoning models measured at 21.8s on a real "
+                f"conversational turn, against a "
+                f"{CONVERSATION_LLM_TIMEOUT_S:.0f}s CONVERSATION_LLM_TIMEOUT_S — "
+                "most turns would time out and the lead would hear silence, not "
+                "a slow reply. Set CONVERSATION_LLM_PROVIDER=openai in .env (or "
+                "remove the line; that is already the default) and restart."
+            )
+        # ...and the chosen provider must actually be usable. Checked here
+        # rather than discovered a turn at a time on a live call, where every
+        # turn fails into the spoken fallback, the call ends on the silence
+        # watchdog (a clean exit), and a campaign of non-conversations is
+        # recorded as successful calls.
+        if mode == "twoway":
+            missing = conversation_llm.missing_key_name()
+            if missing:
+                return (
+                    f"This campaign dials in '{language}' as a two-way call, "
+                    f"which is answered by CONVERSATION_LLM_PROVIDER="
+                    f"'{CONVERSATION_LLM_PROVIDER}' — but {missing} is not set. "
+                    "Every turn would fail and the lead would hear an apology "
+                    f"instead of an answer. Set {missing} in .env and restart."
+                )
+        return None
+    if call_backend == languages_module.OPENAI_REALTIME:
+        if not OPENAI_API_KEY:
+            return (
+                f"This campaign dials in '{language}', which runs on the "
+                "OpenAI Realtime backend, but OPENAI_API_KEY is not set. "
+                "Set it in .env — it is the same key the RAG embedder uses."
+            )
+        return None
 
+    # ElevenLabs billing applies to every call this backend carries, whatever
+    # the language or voice override — so this runs BEFORE the
+    # 'auto'-with-no-override early return just below. Placing it after would
+    # skip billing for exactly the commonest campaign shape there is, which is
+    # the one most likely to be dialling when an invoice goes unpaid.
+    #
+    # Fails closed, like agent_exists() above: a check that cannot answer is
+    # not evidence the account is fine.
+    try:
+        sub = await cached_subscription_status()
+    except Exception as exc:
+        return (f"Could not check ElevenLabs' billing status "
+                f"({type(exc).__name__}: {exc}). Not dialling while the "
+                "account's state is unknown.")
+    if sub["status"] not in GOOD_SUBSCRIPTION_STATUSES:
+        return (
+            f"ElevenLabs account status is {sub['status']!r} — no conversation "
+            "can run until this is resolved at elevenlabs.io (almost always a "
+            "payment issue). The agent WebSocket refuses the handshake in this "
+            "state, so every call would ring, connect, and go silent."
+        )
+
+    # Nothing overridden -> nothing to validate, and NO API call. This is what
+    # keeps an 'auto' campaign with no forced voice byte-identical to what it
+    # was before the voice override existed: bridge.py sends no
+    # conversation_config_override key at all, so ElevenLabs has nothing to
+    # reject, and such a campaign must not gain a new way to not dial.
+    if not language and not ELEVENLABS_VOICE_ID:
+        return None
+
+    try:
+        support = await asyncio.to_thread(agent_language_support, agent_id)
+    except Exception as exc:
+        # Deliberately NOT a refusal. These checks are an extra guard over a
+        # correctly-configured agent; an SDK or API change must not become
+        # a dial-stopping outage when the call would have worked fine.
+        # Every check above still applies.
+        logger.warning(
+            f"[preflight] could not read agent {agent_id}'s configuration "
+            f"({type(exc).__name__}: {exc}) — dialling anyway"
+        )
+        return None
+
+    # The voice first: once ELEVENLABS_VOICE_ID is set it is sent on EVERY
+    # ElevenLabs-backed call, including 'auto', so an agent that doesn't allow
+    # it fails 100% of its calls — a strictly larger blast radius than any
+    # language gate below. .get(), not a subscript: preflight never raising is
+    # a hard contract (worker.py would abort mid-reservation), and only the
+    # to_thread call above is inside the try.
+    if ELEVENLABS_VOICE_ID and not support.get("voice_override_allowed", False):
+        return (
+            f"ELEVENLABS_VOICE_ID is set ({ELEVENLABS_VOICE_ID}), so every call "
+            f"sends a voice override, but agent {agent_id} does not allow it. "
+            "ElevenLabs rejects an override for a field that isn't enabled, so "
+            "every call would fail on answer. Open that agent's Security tab and "
+            "enable the 'voice_id' override (Overrides -> TTS -> Voice ID), or "
+            "clear ELEVENLABS_VOICE_ID in .env to use the agent's own voice. "
+            "Run scripts/check_agent_language_support.py to see both agents."
+        )
+
+    if language:
         if not support["override_allowed"]:
             return (
                 f"This campaign dials in '{language}', but agent {agent_id} does "

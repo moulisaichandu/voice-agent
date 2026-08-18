@@ -190,6 +190,21 @@ def test_a_malformed_timestamp_is_a_401_not_a_500(app_client, monkeypatch):
     assert "invalid signature" in r.text.lower()
 
 
+def test_a_non_utf8_body_is_a_401_not_a_500(app_client):
+    """REGRESSION: the body was UTF-8 decoded OUTSIDE the signature try/except,
+    so a non-UTF-8 body from an unauthenticated caller raised UnicodeDecodeError
+    (a ValueError subclass) -> 500 + stack trace — the exact unauthenticated-500
+    the ValueError->401 hardening was meant to prevent. The decode fails before
+    verification, so no signature is needed to trigger it."""
+    r = app_client.post(
+        "/webhooks/elevenlabs",
+        content=b"\xff\xfe\xfa",
+        headers={"ElevenLabs-Signature": "t=1,v0=deadbeef"},
+    )
+    assert r.status_code == 401
+    assert "invalid signature" in r.text.lower()
+
+
 def test_valid_signature_dispatches_and_returns_200(app_client, monkeypatch):
     monkeypatch.setattr(
         wh, "construct_webhook_event",

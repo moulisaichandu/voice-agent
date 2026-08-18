@@ -6,7 +6,9 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, computed_field
+
+from app import languages
 
 CampaignMode = Literal["oneway", "twoway"]
 # The six tokens in app/languages.py and in 0003's CHECK constraint. Kept as a
@@ -33,6 +35,24 @@ class Campaign(BaseModel):
     max_attempts: int = 2
     active: bool = True
     created_at: datetime
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def voice_backend(self) -> str:
+        """Which voice backend will actually carry this campaign's calls.
+
+        Derived, never stored: app/languages.py owns the mapping and it depends
+        on TELUGU_BACKEND, so a stored column would go stale the moment the
+        rollback switch was used.
+
+        Computed here rather than in the dashboard because the dashboard cannot
+        see .env. It used to mirror the table in TypeScript, which was fine
+        while the mapping was a constant and became a lie as soon as it became
+        an operator decision — a rolled-back deployment would have shown every
+        Telugu campaign running on a backend it no longer used, to exactly the
+        person trying to work out why a call sounded wrong.
+        """
+        return languages.backend_display(languages.backend_for(self.language))
 
 
 class Lead(BaseModel):

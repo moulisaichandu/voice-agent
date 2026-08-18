@@ -171,3 +171,224 @@ def test_get_client_refuses_without_api_key(monkeypatch):
     monkeypatch.setattr(ec, "_client", None)
     with pytest.raises(RuntimeError, match="ELEVENLABS_API_KEY"):
         ec.get_client()
+
+
+# ── agent_language_support: what the agent can speak, and in which voice ──────
+# Nested shapes verified against elevenlabs==2.58.0:
+#   conversation_config.tts.{model_id,voice_id}
+#   conversation_config.language_presets[iso].overrides.tts.voice_id
+#   platform_settings.overrides.conversation_config_override.{agent.language,
+#                                                             tts.voice_id}
+# The last one is the Security-tab ALLOWLIST (booleans), not the payload.
+
+
+def _configured_agent(*, language="en", voice_id="voice_base",
+                      tts_model="eleven_flash_v2", language_presets=None,
+                      language_override=False, voice_override=False):
+    return SimpleNamespace(
+        conversation_config=SimpleNamespace(
+            agent=SimpleNamespace(language=language),
+            tts=SimpleNamespace(model_id=tts_model, voice_id=voice_id),
+            language_presets=language_presets or {},
+        ),
+        platform_settings=SimpleNamespace(
+            overrides=SimpleNamespace(
+                conversation_config_override=SimpleNamespace(
+                    agent=SimpleNamespace(language=language_override),
+                    tts=SimpleNamespace(voice_id=voice_override),
+                ),
+            ),
+        ),
+    )
+
+
+class _FakeConfiguredAgents:
+    def __init__(self, agent):
+        self._agent = agent
+
+    def get(self, agent_id):
+        return self._agent
+
+
+def test_agent_language_support_reports_the_configured_voice_and_override(monkeypatch):
+    """The voice fields are what let preflight refuse a dial before ElevenLabs
+    rejects the conversation, and what lets the operator see whether their
+    dashboard change actually landed."""
+    agent = _configured_agent(voice_id="voice_base", language_override=True,
+                              voice_override=True)
+    monkeypatch.setattr(ec, "get_client",
+                        lambda: _fake_client(agents=_FakeConfiguredAgents(agent)))
+
+    support = ec.agent_language_support("agent_1")
+
+    assert support["voice_id"] == "voice_base"
+    assert support["voice_override_allowed"] is True
+    # The pre-existing keys must be untouched — preflight and campaigns.py read them.
+    assert support["override_allowed"] is True
+    assert support["languages"] == {"en"}
+    assert support["tts_model"] == "eleven_flash_v2"
+
+
+def test_agent_language_support_degrades_to_unknown_when_the_shape_is_missing(monkeypatch):
+    """The SDK response shape is not a contract we control. A missing
+    intermediate must degrade to "I don't know" rather than raise inside
+    preflight — which never raises by design (worker.py would abort a
+    reservation). This is the property the new voice check depends on."""
+    monkeypatch.setattr(ec, "get_client", lambda: _fake_client(agents=_FakeAgents()))
+
+    support = ec.agent_language_support("agent_1")  # bare SimpleNamespace(agent_id=...)
+
+    assert support["voice_id"] is None
+    assert support["voice_override_allowed"] is False
+    assert support["preset_voice_ids"] == {}
+
+
+def test_agent_language_support_reports_a_per_language_preset_voice(monkeypatch):
+    """A per-language preset PINS a voice for that language, so changing the
+    agent's base voice in the dashboard cannot affect it — the most likely
+    reason a voice change appears not to take effect for one language."""
+    presets = {"hi": SimpleNamespace(
+        overrides=SimpleNamespace(tts=SimpleNamespace(voice_id="voice_preset")))}
+    agent = _configured_agent(voice_id="voice_base", language_presets=presets)
+    monkeypatch.setattr(ec, "get_client",
+                        lambda: _fake_client(agents=_FakeConfiguredAgents(agent)))
+
+    support = ec.agent_language_support("agent_1")
+
+    assert support["preset_voice_ids"] == {"hi": "voice_preset"}
+    assert support["voice_id"] == "voice_base"   # the base voice is unchanged
+    assert "hi" in support["languages"]          # presets still count as languages
+
+
+# ── cached_subscription_status: the shared 60s cache ─────────────────────────
+# Shared by app/admin/system.py's readiness dashboard and
+# app/telephony/preflight.py's dial-time gate — this is the function both
+# call, so a dashboard poll and a preflight check within the same 60s window
+# cost exactly one real ElevenLabs API call between them, not two.
+
+
+class _FakeRedis:
+    def __init__(self, store: dict | None = None):
+        self.store: dict[str, str] = store or {}
+        self.set_calls: list[tuple] = []
+
+    async def get(self, key):
+        return self.store.get(key)
+
+    async def set(self, key, value, ex=None):
+        self.store[key] = value
+        self.set_calls.append((key, value, ex))
+        return True
+
+
+class _BrokenRedis(_FakeRedis):
+    async def get(self, key):
+        raise ConnectionError("redis is down")
+
+    async def set(self, key, value, ex=None):
+        raise ConnectionError("redis is down")
+
+
+async def test_cached_subscription_status_caches_across_calls(monkeypatch):
+    calls = {"n": 0}
+
+    def counted():
+        calls["n"] += 1
+        return {"status": "active", "character_count": 1, "character_limit": 2}
+
+    monkeypatch.setattr(ec, "subscription_status", counted)
+    # ONE shared instance: a lambda building a fresh _FakeRedis per call would
+    # make the cache unable to persist, and this test unable to fail.
+    redis = _FakeRedis()
+    monkeypatch.setattr(ec.redis_client, "get_redis", lambda: redis)
+
+    first = await ec.cached_subscription_status()
+    second = await ec.cached_subscription_status()
+
+    assert calls["n"] == 1
+    assert first == second == {"status": "active", "character_count": 1,
+                               "character_limit": 2}
+
+
+async def test_cached_subscription_status_force_refresh_bypasses_the_cache(monkeypatch):
+    """POST /admin/readiness/refresh means "I just paid the invoice, tell me
+    now" — waiting out a 60s TTL there is the one case where the cache is
+    exactly wrong."""
+    calls = {"n": 0}
+
+    def counted():
+        calls["n"] += 1
+        return {"status": "active", "character_count": calls["n"], "character_limit": 2}
+
+    monkeypatch.setattr(ec, "subscription_status", counted)
+    # Shared instance, so the first call genuinely warms the cache. With a
+    # fresh fake per call this would pass whether or not force_refresh works.
+    redis = _FakeRedis()
+    monkeypatch.setattr(ec.redis_client, "get_redis", lambda: redis)
+
+    await ec.cached_subscription_status()
+    await ec.cached_subscription_status()          # served from cache
+    await ec.cached_subscription_status(force_refresh=True)
+
+    assert calls["n"] == 2, "cached call hit the API, or force_refresh did not"
+
+
+async def test_cached_subscription_status_survives_a_malformed_cache_entry(monkeypatch):
+    def fresh():
+        return {"status": "active", "character_count": 1, "character_limit": 2}
+
+    monkeypatch.setattr(ec, "subscription_status", fresh)
+    redis = _FakeRedis({ec._SUBSCRIPTION_CACHE_KEY: "not-json"})
+    monkeypatch.setattr(ec.redis_client, "get_redis", lambda: redis)
+
+    result = await ec.cached_subscription_status()
+
+    assert result == {"status": "active", "character_count": 1, "character_limit": 2}
+
+
+async def test_a_redis_outage_still_answers_from_the_live_api(monkeypatch):
+    """Redis is the ephemeral speed layer, never a dependency that can take
+    the answer away. If the cache is unreachable this must still report the
+    account's real state — preflight is about to refuse or allow a dial on
+    the strength of it."""
+    def fresh():
+        return {"status": "active", "character_count": 1, "character_limit": 2}
+
+    monkeypatch.setattr(ec, "subscription_status", fresh)
+    broken = _BrokenRedis()
+    monkeypatch.setattr(ec.redis_client, "get_redis", lambda: broken)
+
+    assert await ec.cached_subscription_status() == {
+        "status": "active", "character_count": 1, "character_limit": 2}
+
+
+async def test_the_cache_entry_expires(monkeypatch):
+    """A TTL, unlike the circuit breaker's deliberate lack of one. Billing can
+    recover on its own the moment an invoice is paid, so a stale 'past_due'
+    must not outlive the fix and keep refusing healthy dials."""
+    monkeypatch.setattr(
+        ec, "subscription_status",
+        lambda: {"status": "active", "character_count": 1, "character_limit": 2})
+    redis = _FakeRedis()
+    monkeypatch.setattr(ec.redis_client, "get_redis", lambda: redis)
+
+    await ec.cached_subscription_status()
+
+    assert redis.set_calls, "the result should have been cached"
+    assert redis.set_calls[0][2] == ec._SUBSCRIPTION_CACHE_TTL_S
+
+
+async def test_an_api_failure_propagates_rather_than_being_cached(monkeypatch):
+    """The caller decides what an unreachable ElevenLabs means — preflight
+    refuses to dial, the dashboard shows 'Could not check'. Swallowing it into
+    a cached fake-healthy value would let a dead account dial."""
+    def boom():
+        raise RuntimeError("elevenlabs unreachable")
+
+    monkeypatch.setattr(ec, "subscription_status", boom)
+    redis = _FakeRedis()
+    monkeypatch.setattr(ec.redis_client, "get_redis", lambda: redis)
+
+    with pytest.raises(RuntimeError):
+        await ec.cached_subscription_status()
+    assert redis.store == {}, "a failure must not be cached as a result"

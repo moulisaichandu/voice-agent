@@ -21,9 +21,18 @@ class _FakeRedis:
     async def get(self, key):
         return self.store.get(key)
 
-    async def set(self, key, value, ex=None):
+    async def set(self, key, value, ex=None, nx=False):
+        # nx is not decoration: sarvam_circuit_breaker.trip() relies on
+        # set-if-not-exists for its first-trip-wins semantics, so a fake that
+        # ignored it would let a later, vaguer reason overwrite the original
+        # and the test would never notice.
+        if nx and key in self.store:
+            return None
         self.store[key] = value
         return True
+
+    async def delete(self, key):
+        return 1 if self.store.pop(key, None) is not None else 0
 
     async def llen(self, key):
         return 0
@@ -62,6 +71,15 @@ def _mock_all_healthy(monkeypatch, *, redis: _FakeRedis | None = None) -> _FakeR
         return True
 
     monkeypatch.setattr(admin_system.redis_client, "is_available", redis_ok)
+
+    # A stable tunnel. The rotation check reports a CHANGE, so "healthy" means
+    # the same hostname it saw last time — which is what a named tunnel, or an
+    # unrestarted cloudflared, actually looks like.
+    async def stable_url():
+        return "https://stable.trycloudflare.com"
+
+    r.store[admin_system._LAST_PUBLIC_URL_KEY] = "https://stable.trycloudflare.com"
+    monkeypatch.setattr(admin_system.public_url, "refresh", stable_url)
 
     async def fake_get_pool():
         return _FakePool()
@@ -590,6 +608,18 @@ def test_readiness_cache_survives_a_redis_hiccup_on_write(client, monkeypatch):
     assert preflight_check["status"] == "good"
 
 
+def test_readiness_recomputes_malformed_cached_check(client, monkeypatch):
+    redis = _FakeRedis({"readiness:preflight": "not-json"})
+    _mock_all_healthy(monkeypatch, redis=redis)
+
+    r = client.get("/admin/readiness")
+
+    assert r.status_code == 200
+    preflight_check = next(c for c in r.json()["checks"] if c["key"] == "preflight")
+    assert preflight_check["status"] == "good"
+    assert preflight_check["cached"] is False
+
+
 # ── stats ────────────────────────────────────────────────────────────────────
 
 def test_stats_combines_lead_status_counts_and_calls_today(client, monkeypatch):
@@ -694,3 +724,194 @@ def test_sheets_status_handles_no_sync_having_run_yet(client, monkeypatch):
     body = r.json()
     assert body["configured"] is True
     assert body["last_sync_at"] is None
+
+
+def test_sheets_status_does_not_500_on_malformed_cache(client, monkeypatch):
+    monkeypatch.setattr(admin_system.app_config, "GOOGLE_SHEET_ID", "sheet-123")
+    redis = _FakeRedis({admin_system.scheduler_module.SHEETS_LAST_SYNC_KEY: "not-json"})
+    monkeypatch.setattr(admin_system.redis_client, "get_redis", lambda: redis)
+
+    r = client.get("/admin/sheets-status")
+
+    assert r.status_code == 200
+    assert "malformed" in r.json()["last_error"]
+
+
+async def test_billing_check_reuses_a_cache_warmed_by_elevenlabs_client_directly(
+    client, monkeypatch
+):
+    """THE property the whole move exists to guarantee: preflight.py and the
+    readiness dashboard must not each pay for their own ElevenLabs round-trip
+    inside the same cache window. Before the move they could not share one —
+    the caching lived in admin/system.py, where preflight cannot reach it."""
+    redis = _FakeRedis()
+    _mock_all_healthy(monkeypatch, redis=redis)
+    calls = {"n": 0}
+
+    def counted():
+        calls["n"] += 1
+        return {"status": "active", "character_count": 1, "character_limit": 2}
+
+    monkeypatch.setattr(admin_system.elevenlabs_client, "subscription_status", counted)
+
+    # Simulates preflight.py having warmed the cache moments earlier.
+    await admin_system.elevenlabs_client.cached_subscription_status()
+    assert calls["n"] == 1
+
+    r = client.get("/admin/readiness")
+
+    assert calls["n"] == 1, "the readiness dashboard must reuse the warm cache"
+    billing_check = next(c for c in r.json()["checks"] if c["key"] == "billing")
+    assert billing_check["status"] == "good"
+
+
+# ── readiness: the Sarvam circuit breaker ────────────────────────────────────
+#
+# Tonight's whole problem was that this state was invisible until a real call
+# failed. The dashboard is where "can this system dial right now, and if not
+# why" is supposed to be answerable.
+
+async def test_readiness_can_dial_false_when_sarvam_circuit_breaker_is_tripped(
+    client, monkeypatch
+):
+    """The reactive half of the design: a call that already failed with
+    Sarvam's "insufficient credits" signal must stop every later Sarvam-backed
+    dial until an admin clears it."""
+    redis = _FakeRedis()
+    redis.store[admin_system.worker_module.HEARTBEAT_KEY] = "2026-01-01T00:00:00+00:00"
+    _mock_all_healthy(monkeypatch, redis=redis)
+    await admin_system.sarvam_circuit_breaker.trip("Insufficient credits")
+
+    r = client.get("/admin/readiness")
+
+    body = r.json()
+    assert body["can_dial"] is False
+    check = next(c for c in body["checks"] if c["key"] == "sarvam_circuit_breaker")
+    assert check["status"] == "critical"
+    assert "Insufficient credits" in check["detail"]
+
+
+async def test_the_tripped_check_says_how_to_clear_it(client, monkeypatch):
+    """Manual-clear-only means the dashboard has to carry the way out, or an
+    operator is shown a red light with no switch."""
+    redis = _FakeRedis()
+    redis.store[admin_system.worker_module.HEARTBEAT_KEY] = "2026-01-01T00:00:00+00:00"
+    _mock_all_healthy(monkeypatch, redis=redis)
+    await admin_system.sarvam_circuit_breaker.trip("Insufficient credits")
+
+    r = client.get("/admin/readiness")
+
+    check = next(c for c in r.json()["checks"] if c["key"] == "sarvam_circuit_breaker")
+    assert "sarvam-circuit-breaker/clear" in check["detail"]
+    assert "dashboard.sarvam.ai" in check["detail"]
+
+
+async def test_readiness_sarvam_circuit_breaker_good_when_not_tripped(
+    client, monkeypatch
+):
+    _mock_all_healthy(monkeypatch)
+
+    r = client.get("/admin/readiness")
+
+    check = next(c for c in r.json()["checks"] if c["key"] == "sarvam_circuit_breaker")
+    assert check["status"] == "good"
+
+
+async def test_an_unreadable_breaker_is_reported_not_swallowed(client, monkeypatch):
+    """A Redis failure must not take down the whole dashboard, and must not
+    quietly read as "not tripped" either — the dashboard exists to answer this
+    question, so "I could not tell" is the honest answer."""
+    _mock_all_healthy(monkeypatch)
+
+    async def boom():
+        raise ConnectionError("redis is down")
+
+    monkeypatch.setattr(admin_system.sarvam_circuit_breaker, "tripped_reason", boom)
+
+    r = client.get("/admin/readiness")
+
+    assert r.status_code == 200
+    check = next(c for c in r.json()["checks"] if c["key"] == "sarvam_circuit_breaker")
+    assert check["status"] == "critical"
+    assert "Could not check" in check["detail"]
+
+
+async def test_clear_sarvam_circuit_breaker_endpoint_clears_it(client, monkeypatch):
+    redis = _FakeRedis()
+    monkeypatch.setattr(admin_system.redis_client, "get_redis", lambda: redis)
+    await admin_system.sarvam_circuit_breaker.trip("Insufficient credits")
+
+    r = client.post("/admin/system/sarvam-circuit-breaker/clear")
+
+    assert r.status_code == 200
+    assert await admin_system.sarvam_circuit_breaker.tripped_reason() is None
+
+
+async def test_clearing_an_untripped_breaker_is_harmless(client, monkeypatch):
+    """An operator who clicks it twice, or clears one that recovered on its
+    own, must not get an error back."""
+    redis = _FakeRedis()
+    monkeypatch.setattr(admin_system.redis_client, "get_redis", lambda: redis)
+
+    r = client.post("/admin/system/sarvam-circuit-breaker/clear")
+
+    assert r.status_code == 200
+    assert await admin_system.sarvam_circuit_breaker.tripped_reason() is None
+
+
+# ── the tunnel rotates in one direction only ────────────────────────────────
+#
+# public_url.refresh() re-resolves the hostname this app hands to Plivo, so
+# dialling keeps working and preflight stays green after a rotation. But the
+# ElevenLabs agent's course-lookup tool URL and its transcript webhook are
+# configured against that same rotating hostname in the ElevenLabs dashboard,
+# and nothing re-points or checks them. The failure is silent and specific:
+# calls connect, the dashboard is green, and the agent simply cannot answer
+# questions about the courses. The module's own docstring records 22 distinct
+# hostnames minted on this machine.
+
+async def test_a_rotated_tunnel_is_reported_rather_than_passing_silently(monkeypatch):
+    from app.admin import system as sys_mod
+
+    seen = {"stored": "https://old-hostname.trycloudflare.com"}
+
+    class _R:
+        async def get(self, key):
+            return seen["stored"]
+
+        async def set(self, key, value, **kw):
+            seen["stored"] = value
+            return True
+
+    async def resolve():
+        return "https://brand-new-hostname.trycloudflare.com"
+
+    monkeypatch.setattr(sys_mod.redis_client, "get_redis", lambda: _R())
+    monkeypatch.setattr(sys_mod.public_url, "refresh", resolve)
+
+    check = await sys_mod._check_public_url_rotation()
+
+    assert check["status"] == "warning"
+    assert "ElevenLabs" in check["detail"]
+    assert "brand-new-hostname" in check["detail"]
+    # ...and the new value is remembered, so it reports once, not forever.
+    assert seen["stored"] == "https://brand-new-hostname.trycloudflare.com"
+
+
+async def test_an_unchanged_tunnel_is_quiet(monkeypatch):
+    from app.admin import system as sys_mod
+
+    class _R:
+        async def get(self, key):
+            return "https://same-hostname.trycloudflare.com"
+
+        async def set(self, key, value, **kw):
+            return True
+
+    async def resolve():
+        return "https://same-hostname.trycloudflare.com"
+
+    monkeypatch.setattr(sys_mod.redis_client, "get_redis", lambda: _R())
+    monkeypatch.setattr(sys_mod.public_url, "refresh", resolve)
+
+    assert (await sys_mod._check_public_url_rotation())["status"] == "good"

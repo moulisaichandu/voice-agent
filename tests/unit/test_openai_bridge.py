@@ -154,6 +154,30 @@ async def test_the_session_pins_mulaw_both_directions(bridged):
     assert audio["output"]["format"]["type"] == "audio/pcmu"
 
 
+def test_the_configured_voice_is_applied_to_the_session(monkeypatch):
+    """OPENAI_REALTIME_VOICE selects the Telugu voice (e.g. 'marin'). It reaches
+    the model only through the session's output config, so this pins that wiring
+    — a call whose config silently dropped the voice would fall back to the API
+    default with no error."""
+    monkeypatch.setattr(openai_bridge, "OPENAI_REALTIME_VOICE", "marin")
+    for one_way in (True, False):
+        output = openai_bridge._session_update(
+            lead_name=None, script=None, language_style=None, one_way=one_way,
+        )["session"]["audio"]["output"]
+        assert output["voice"] == "marin"
+
+
+def test_a_blank_voice_omits_the_key_and_uses_the_api_default(monkeypatch):
+    """Blank means "let the API pick" (config.py's documented default). The
+    session must then omit `voice` entirely rather than send an empty string,
+    which the API would reject."""
+    monkeypatch.setattr(openai_bridge, "OPENAI_REALTIME_VOICE", "")
+    output = openai_bridge._session_update(
+        lead_name=None, script=None, language_style=None, one_way=True,
+    )["session"]["audio"]["output"]
+    assert "voice" not in output
+
+
 async def test_the_script_is_given_as_content_not_words_to_recite(bridged):
     """A script written in English must be CONVEYED in Telugu, not read out in
     English. The sibling hit exactly this: leads got an English call from a
@@ -838,3 +862,95 @@ async def test_malformed_tool_arguments_do_not_crash_the_call(bridged, monkeypat
     )
     # Must not raise, and the call still records a normal (if empty) outcome.
     assert outcome["status"] in ("done", "failed")
+
+
+# ── the rollback backend must bound its own course lookup ──────────────────
+#
+# TELUGU_BACKEND=openai_realtime is the documented one-line rollback, reached
+# precisely when Sarvam is misbehaving. Its RAG lookup was awaited with no
+# deadline inside the single WebSocket reader loop: search_relevant has no
+# deadline of its own (an embed retry alone is ~16s, plus a translate-and-retry
+# on a miss), and this backend has no silence watchdog — so a slow lookup is
+# unbounded dead air on a live call. The Sarvam bridge already wraps the same
+# call in RAG_VOICE_DEADLINE_S; this backend never did.
+
+async def test_a_slow_course_lookup_is_bounded_on_the_rollback_backend(monkeypatch):
+    import asyncio as _asyncio
+
+    from app.telephony import openai_bridge as ob
+
+    async def never_returns(query, *a, **kw):
+        await _asyncio.sleep(3600)
+
+    monkeypatch.setattr(ob, "search_relevant", never_returns)
+    monkeypatch.setattr(ob, "RAG_VOICE_DEADLINE_S", 0.05)
+
+    answer = await ob._lookup_course_material("fees")
+
+    assert answer == ob.NO_MATERIAL_NOTE, (
+        "a hung lookup held the lead on a silent line with no watchdog to end it"
+    )
+
+
+async def test_a_failing_course_lookup_still_returns_something_speakable(monkeypatch):
+    from app.telephony import openai_bridge as ob
+
+    async def boom(query, *a, **kw):
+        raise RuntimeError("pgvector is down")
+
+    monkeypatch.setattr(ob, "search_relevant", boom)
+
+    assert await ob._lookup_course_material("fees") == ob.NO_MATERIAL_NOTE
+
+
+# ── the rollback backend had no way to end a two-way call ───────────────────
+#
+# openai_bridge's two-way path ran PlivoCall.run() with only the reader tasks —
+# no silence watchdog — so nothing but the model's own end_call tool or the
+# lead hanging up ended the conversation. CLAUDE.md records that the model does
+# NOT reliably call that tool (0/3 measured), and in India a lead commonly says
+# goodbye and waits for the caller to hang up. The call then ran to
+# CALL_MAX_DURATION_S and, because max_duration is a clean exit, was recorded as
+# a SUCCESSFUL call — five minutes of billed silence per lead, graded as a win.
+# The Sarvam bridge already solved this; the rollback path never did.
+
+async def test_a_two_way_call_that_goes_quiet_ends_itself(monkeypatch):
+    import asyncio as _asyncio
+
+    from app.telephony import openai_bridge as ob
+    from app.telephony import plivo_stream
+
+    call = plivo_stream.PlivoCall(
+        _FakePlivoWS(), lead_id="l", one_way=False, protect_opening=False)
+    monkeypatch.setattr(ob, "TWOWAY_MAX_SILENT_S", 0.05)
+
+    await _asyncio.wait_for(ob._watch_for_silence(call, ob._Activity()), timeout=3)
+
+    assert call.stop.is_set()
+    assert call.exit_reason == "twoway_silence", (
+        f"ended as {call.exit_reason!r} — a quiet line must be distinguishable "
+        "from a real conversation that ran its course"
+    )
+
+
+async def test_the_silence_watchdog_waits_for_queued_audio_to_drain(monkeypatch):
+    """Audio SENT is not audio HEARD. Measuring from the send loop hangs up
+    mid-sentence on a call that is working — the same lesson the Sarvam
+    watchdog's docstring records."""
+    import asyncio as _asyncio
+
+    from app.telephony import openai_bridge as ob
+    from app.telephony import plivo_stream
+
+    call = plivo_stream.PlivoCall(
+        _FakePlivoWS(), lead_id="l", one_way=False, protect_opening=False)
+    monkeypatch.setattr(ob, "TWOWAY_MAX_SILENT_S", 0.05)
+    loop = _asyncio.get_running_loop()
+    call.play_end = loop.time() + 0.6      # still speaking to the lead
+
+    task = _asyncio.create_task(ob._watch_for_silence(call, ob._Activity()))
+    await _asyncio.sleep(0.25)
+    assert not call.stop.is_set(), "hung up while audio was still playing"
+
+    await _asyncio.wait_for(task, timeout=3)
+    assert call.stop.is_set()

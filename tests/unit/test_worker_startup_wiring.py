@@ -80,3 +80,40 @@ async def test_worker_does_not_start_when_redis_is_down(monkeypatch):
         await asyncio.sleep(0)
 
     assert calls["entered"] == 0
+
+
+async def test_the_embeddings_connection_is_warmed_at_startup(monkeypatch):
+    """The first embed of a container's life measured 3.56s against 0.23-0.51s
+    warm, and on 2026-08-17 it landed mid-call: two course lookups blew
+    RAG_VOICE_DEADLINE_S and the lead was told there was no material about the
+    courses this business sells. Startup is the right place to pay that."""
+    monkeypatch.setattr(app_main, "WORKER_ENABLED", False)
+    monkeypatch.setattr(app_main, "SCHEDULER_ENABLED", False)
+    monkeypatch.setattr(app_main.redis_client, "is_available", _redis_up)
+
+    warmed = {"n": 0}
+
+    async def fake_warm():
+        warmed["n"] += 1
+
+    monkeypatch.setattr(app_main.embeddings, "warm", fake_warm)
+
+    async with app_main.lifespan(app_main.app):
+        await asyncio.sleep(0)  # let the background task run
+        assert warmed["n"] == 1
+
+
+async def test_a_cold_openai_does_not_stop_the_app_booting(monkeypatch):
+    """The warm-up is an optimisation. If it raises, the app must still serve —
+    RAG simply pays the handshake on its first real query, as it does today."""
+    monkeypatch.setattr(app_main, "WORKER_ENABLED", False)
+    monkeypatch.setattr(app_main, "SCHEDULER_ENABLED", False)
+    monkeypatch.setattr(app_main.redis_client, "is_available", _redis_up)
+
+    async def boom():
+        raise RuntimeError("openai unreachable")
+
+    monkeypatch.setattr(app_main.embeddings, "warm", boom)
+
+    async with app_main.lifespan(app_main.app):
+        await asyncio.sleep(0)

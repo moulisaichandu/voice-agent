@@ -6,8 +6,8 @@ campaign (`campaigns.language`), which also decides the voice backend.
 Two modes: one-way (info + hangup), two-way (voice RAG over course docs).
 Transcripts written back to Google Sheets (source of truth: Supabase).
 
-Two-way currently works on the ElevenLabs backend only — Telugu and Tinglish
-are one-way for now.
+Two-way is live on ElevenLabs. On Sarvam it is BUILT but gated off
+(`SARVAM_TWOWAY_ENABLED`) until a human has judged it on a real call.
 
 Sibling project: `../ai-voice-agent/` runs a SEPARATE, working OpenAI-Realtime +
 Plivo voice agent for the same business. **Do not modify that repo from here.**
@@ -25,26 +25,56 @@ provisioned on our account) · Supabase (Postgres+pgvector, accessed via raw
 SQL/asyncpg — NOT supabase-py for CRUD) · Redis · APScheduler · Docker.
 Async everywhere.
 
-### TWO voice backends — which one runs is derived from the language
+### THREE voice backends — which one runs is derived from the language
 - **ElevenLabs Agents** (hosted LLM, no separate LLM key) — English, Hindi,
   Hinglish, and `auto`. `app/telephony/bridge.py`.
+- **Sarvam** (`SARVAM_API_KEY`) — **Telugu and Tinglish**, one-way live and
+  two-way built-but-gated. `app/telephony/sarvam_bridge.py`. NOT a
+  speech-to-speech API: STT (`saaras:v3`), TTS (`bulbul:v3`) and an LLM are
+  three separate services and **the turn-taking between them is ours**. That is
+  why two-way is possible here at all, and why the barge-in handling is this
+  backend's most delicate code — see `SpokenLedger`.
+  - **Two jobs, two models, deliberately.** `sarvam_llm.render()` turns the
+    English script into Telugu on `sarvam-105b` — once per campaign, warmed at
+    campaign creation, so it can be slow and Indic-tuned. `conversation_llm`
+    answers the lead mid-call and defaults to **OpenAI**, because Sarvam's chat
+    models are reasoning models: a real conversational turn measured **21.8s**
+    and the reasoning cannot be disabled (`reasoning_effort` takes only
+    low/medium/high; `thinking.type=disabled` is accepted and ignored; capping
+    `max_tokens` truncates inside the reasoning and returns no answer).
+    The same turn on OpenAI measures ~1.5s.
 - **OpenAI Realtime** (`gpt-realtime-2.1`, uses the existing `OPENAI_API_KEY`) —
-  **Telugu and Tinglish only**, and **one-way only** so far.
-  `app/telephony/openai_bridge.py`.
+  the PREVIOUS Telugu backend, kept working and kept tested as a rollback.
+  `app/telephony/openai_bridge.py`. Reached only when
+  `TELUGU_BACKEND=openai_realtime`.
 
-Why two: the ElevenLabs Agents platform **does not offer Telugu at all**. Not a
-plan tier, not a model setting — its API enumerates the agent languages it
-accepts and `te` is not among them (Hindi and Tamil are). Verified against the
-live API 2026-07-22; the list is recorded in `app/languages.py`'s
-`ELEVENLABS_AGENT_LANGUAGES`. Telugu is this business's primary market
-language, so a second backend was unavoidable. **Do not try to "fix" Telugu by
-reconfiguring ElevenLabs — it cannot be done, and preflight will tell you so.**
+Why not ElevenLabs for Telugu: the ElevenLabs Agents platform **does not offer
+Telugu at all**. Not a plan tier, not a model setting — its API enumerates the
+agent languages it accepts and `te` is not among them (Hindi and Tamil are).
+Verified against the live API 2026-07-22; the list is recorded in
+`app/languages.py`'s `ELEVENLABS_AGENT_LANGUAGES`. Telugu is this business's
+primary market language, so a second backend was unavoidable. **Do not try to
+"fix" Telugu by reconfiguring ElevenLabs — it cannot be done, and preflight
+will tell you so.**
 
-Both backends drive the same `PlivoCall` (`app/telephony/plivo_stream.py`) and
+Why Sarvam rather than OpenAI Realtime: every Realtime voice is English-first —
+there is no Telugu-native voice to choose, at any price, and no code change
+fixes that. Sarvam's TTS voices are recorded by Indian voice artists and its
+STT is trained on Indian telephony audio. `TELUGU_BACKEND` in `.env` switches
+Telugu and Tinglish between the two backends together (never separately — see
+`app/languages.py`'s `_TELUGU_TOKENS` for why splitting them breaks preflight),
+so a bad live call is reverted with one line and a restart.
+
+All three backends drive the same `PlivoCall` (`app/telephony/plivo_stream.py`) and
 populate the identical `outcome` contract, so everything downstream — call
 recording, Sheets write-back, slot release, retry accounting — is
-backend-agnostic and must stay that way. Both legs are mu-law 8 kHz
-(`ulaw_8000` / `audio/pcmu`), so audio is a passthrough with no transcoding.
+backend-agnostic and must stay that way. Outbound is mu-law 8 kHz on every
+backend (`ulaw_8000` / `audio/pcmu` / Sarvam's `mulaw`+`8000`), so agent audio
+is always a passthrough with no transcoding. **One exception, inbound:**
+Sarvam's STT does not accept mu-law at all (only WAV/PCM), so a two-way Sarvam
+call decodes the lead's audio µ-law→PCM16 in `app/telephony/ulaw.py`. That is
+the only transcoding anywhere in the project. It is pure-Python on purpose —
+`audioop` was removed in Python 3.13, which this venv already runs.
 
 ## Hard rules
 - India telecom compliance is mandatory: 140-series caller ID, dial-time DND
@@ -92,20 +122,58 @@ backend-agnostic and must stay that way. Both legs are mu-law 8 kHz
   derived from it (`app/languages.py`'s `backend_for`). Never choose a backend
   per call, and never infer one from a model. The backend is fully determined
   before a call is placed, exactly as `mode` is.
-- Two-way is NOT yet available on the OpenAI backend, so a two-way Telugu or
-  Tinglish campaign is refused twice: at campaign creation, and again in
-  preflight (which also catches campaigns that predate the guard). Do not
-  remove either without implementing two-way first — such a call connects,
-  never speaks, never listens, sits in silence for the full
-  `CALL_MAX_DURATION_S` of billed airtime, and is then recorded as a
-  SUCCESSFUL zero-turn call, because `max_duration` counts as a clean exit.
-- On the OpenAI backend a script may be written in English and rendered into
-  Telugu by the model, so `has_ai_disclosure()`'s creation-time check on
+- Two-way Telugu/Tinglish is refused three times while its flag is off: at
+  campaign creation, in preflight (which also catches campaigns that predate
+  the guard), and in `sarvam_bridge.bridge()` itself. Do not remove any of them
+  — an unproven two-way call connects, never speaks, never listens, sits in
+  silence for the full `CALL_MAX_DURATION_S` of billed airtime, and is then
+  recorded as a SUCCESSFUL zero-turn call, because `max_duration` counts as a
+  clean exit. Each backend has its OWN flag (`SARVAM_TWOWAY_ENABLED`,
+  `OPENAI_TWOWAY_ENABLED`), resolved through `languages.twoway_enabled()`;
+  enabling one must never enable the other, because each needs its own live
+  call to prove it.
+- **`term_repair` rewrites the lead's words, so it stays deliberately timid.**
+  Sarvam's STT has no custom vocabulary or phrase hints, so it cannot be told
+  the brand exists — it returned "డిజిటల్ బ్రౌనీ" and "డిజిటల్ బ్రానీ" on a
+  live call and the agent refused a customer asking about its own courses,
+  because the garbled name goes into the RAG query too. `app/telephony/
+  term_repair.py` fixes it in `on_lead_said`, before anything reads the text.
+  The anchor rule is the load-bearing part: of the four words within edit
+  distance 2 of "బ్రోలీ" across every recorded utterance, two are the brand
+  and two are "briefly" and "bro", so a weak match is only trusted when
+  "డిజిటల్" precedes it. Adding a term is a licence to put words in a lead's
+  mouth — replay `TERMS` over the stored transcripts before adding one, and
+  keep the false-positive count at zero.
+- **Barge-in on Sarvam is the one thing no other backend needs.** ElevenLabs
+  and OpenAI own their own conversation history, and OpenAI is told what the
+  lead actually heard via `conversation.item.truncate`. On Sarvam the history
+  is OURS, so when a lead interrupts, `SpokenLedger` truncates the agent's last
+  turn down to the sentences that finished playing, in both the LLM history and
+  the stored transcript. Remove it and every later turn is built on words
+  nobody heard, and the agent starts referring back to things it never said.
+  A partly-played sentence is DROPPED, not kept — under-claiming makes the
+  agent repeat itself, over-claiming makes it incoherent.
+- **Nothing relies on the model calling `end_call`.** Measured against the live
+  API: instructed to say goodbye and end the call, it says the goodbye and does
+  not call the tool — 0/3, even when told to do it in that exact turn; the best
+  prompt variant reached 2/3 and only by weakening the rule that stops the
+  synthesiser reading preambles aloud. `sarvam_bridge`'s `watch_for_silence`
+  ends the call when neither side has spoken for `TWOWAY_MAX_SILENT_S`, the
+  same shape as `PlivoCall.oneway_watchdog`. It is scoped to this bridge on
+  purpose — the ElevenLabs two-way path is in production and must not acquire a
+  new way to hang up on someone.
+- On both Telugu backends a script may be written in English and rendered into
+  Telugu by a model, so `has_ai_disclosure()`'s creation-time check on
   `campaigns.script` does NOT guarantee what the lead actually hears.
   `app/telephony/call_routes.py` therefore re-checks the FIRST SPOKEN agent
-  turn after every call and logs `[compliance]` at ERROR when it fails. That
-  check is the only thing keeping the disclosure rule real on that path —
-  don't remove it, and treat any `[compliance]` line as a stop-dialling event.
+  turn after every call and logs `[compliance]` at ERROR when it fails. Don't
+  remove it, and treat any `[compliance]` ERROR as a stop-dialling event.
+  - On Sarvam there is also a PREVENTIVE half: `sarvam_llm.render()` holds the
+    exact Telugu as a string before anything is spoken, so it checks the
+    disclosure itself and prepends a standard one (logging `[compliance]` at
+    WARNING) rather than only reporting the failure afterwards. That does not
+    make the post-call check redundant — it is still the only thing covering
+    what happens after rendering.
 - Secrets come from `.env` only; never hardcode keys. `sa.json` (Google service
   account) is equally sensitive — never read it into a commit or log its contents.
 

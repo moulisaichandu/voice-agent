@@ -32,6 +32,29 @@ async def clear_doc(doc_name: str) -> None:
     await pool.execute("delete from doc_chunks where doc_name = $1", doc_name)
 
 
+async def replace_doc_chunks(
+    doc_name: str, rows: list[tuple[str, list[float]]]
+) -> None:
+    """Atomically replace a doc's chunks: delete the old ones and insert the new
+    ones in ONE transaction. *rows* is [(content, embedding), ...].
+
+    Atomicity matters twice: a concurrent match_chunks() on the live /rag/search
+    path never sees a partially-rebuilt or empty corpus mid-re-ingest, and any
+    failure during the inserts rolls back the delete so the prior chunks survive
+    intact (ingest.py embeds BEFORE calling this, so an embed failure never even
+    reaches here)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("delete from doc_chunks where doc_name = $1", doc_name)
+            for content, embedding in rows:
+                await conn.execute(
+                    "insert into doc_chunks (doc_name, section, content, embedding) "
+                    "values ($1, $2, $3, $4::vector)",
+                    doc_name, None, content, _to_vector_literal(embedding),
+                )
+
+
 async def match_chunks(
     embedding: list[float], *, match_count: int, min_score: float
 ) -> list[dict]:

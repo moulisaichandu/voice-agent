@@ -100,6 +100,52 @@ def test_list_strips_and_drops_empty_entries(monkeypatch):
     assert config._list("SOME_LIST") == ["a", "b"]
 
 
+# ── _choice ──────────────────────────────────────────────────────────────────
+
+def test_choice_accepts_an_allowed_value(monkeypatch):
+    monkeypatch.setenv("SOME_CHOICE", "sarvam")
+    assert config._choice("SOME_CHOICE", "openai_realtime",
+                          ("sarvam", "openai_realtime")) == "sarvam"
+
+
+def test_choice_is_case_and_whitespace_insensitive(monkeypatch):
+    """Operators edit .env by hand. ' Sarvam ' meaning something different from
+    'sarvam' would route every Telugu call to the wrong backend over a stray
+    space, and the only symptom would be the wrong voice on a live call."""
+    monkeypatch.setenv("SOME_CHOICE", "  SARVAM ")
+    assert config._choice("SOME_CHOICE", "openai_realtime",
+                          ("sarvam", "openai_realtime")) == "sarvam"
+
+
+def test_choice_warns_and_defaults_on_an_unknown_value(monkeypatch, caplog):
+    """CLAUDE.md's rule for every config helper: a malformed override warns and
+    falls back, it never crashes at import. A typo'd backend name must not be
+    able to stop the app booting, and must not pass silently either."""
+    monkeypatch.setenv("SOME_CHOICE", "elevnlabs")
+    with caplog.at_level("WARNING"):
+        assert config._choice("SOME_CHOICE", "sarvam",
+                              ("sarvam", "openai_realtime")) == "sarvam"
+    assert "SOME_CHOICE" in caplog.text
+
+
+def test_choice_unset_and_blank_use_the_default(monkeypatch):
+    monkeypatch.delenv("SOME_CHOICE", raising=False)
+    assert config._choice("SOME_CHOICE", "sarvam", ("sarvam", "x")) == "sarvam"
+    monkeypatch.setenv("SOME_CHOICE", "   ")
+    assert config._choice("SOME_CHOICE", "sarvam", ("sarvam", "x")) == "sarvam"
+
+
+# ── Sarvam / Telugu backend config ───────────────────────────────────────────
+
+def test_configured_telugu_backend_is_one_this_product_can_dial(monkeypatch):
+    """A guard on the live value rather than the parser. TELUGU_BACKEND is the
+    rollback switch: it decides which bridge carries every Telugu and Tinglish
+    call. A value outside this set would make languages.backend_for() return a
+    backend call_routes has no bridge for, and every Telugu call would fail at
+    dial time."""
+    assert config.TELUGU_BACKEND in ("sarvam", "openai_realtime")
+
+
 # ── OpenAI Realtime config tests ──────────────────────────────────────────────
 
 def test_a_malformed_realtime_threshold_warns_and_keeps_the_default(monkeypatch, caplog):
@@ -110,3 +156,58 @@ def test_a_malformed_realtime_threshold_warns_and_keeps_the_default(monkeypatch,
     with caplog.at_level("WARNING"):
         assert config._float("OPENAI_REALTIME_VAD_THRESHOLD", 0.5) == 0.5
     assert "OPENAI_REALTIME_VAD_THRESHOLD" in caplog.text
+
+
+# ── a dial lock must outlive the call it guards ────────────────────────────
+#
+# The `dialing:<phone>` lock stops one number being dialled twice at once, but
+# it was a flat 60s while a call may run CALL_MAX_DURATION_S (300s) — so it
+# stopped protecting four minutes before the first call could end. A person
+# enrolled in two campaigns could be rung a second time while still talking to
+# the agent: both legs billed, and the second attempt burned against
+# max_attempts for a conversation that already happened.
+
+def test_the_dialing_lock_outlives_the_longest_possible_call():
+    from app import config
+
+    assert config.DIALING_LOCK_TTL_S >= (
+        config.CALL_RING_TIMEOUT_S + config.CALL_MAX_DURATION_S
+    ), (
+        f"lock expires after {config.DIALING_LOCK_TTL_S}s but a call can ring "
+        f"for {config.CALL_RING_TIMEOUT_S}s then run for "
+        f"{config.CALL_MAX_DURATION_S}s — the same person can be dialled twice"
+    )
+
+
+# ── a calling window that can never open must not pass silently ────────────
+#
+# `END=0` is the natural way to write midnight, but the code means [start, end)
+# on a 24-hour clock and wants 24. `9 <= hour < 0` is false at every hour of
+# every day: all dialling stops permanently while the readiness dashboard still
+# reports it can dial.
+
+def test_an_inverted_calling_window_falls_back_to_the_defaults():
+    from app import config
+
+    assert config._validated_hours(9, 0) == (
+        config._DEFAULT_HOURS_START, config._DEFAULT_HOURS_END)
+
+
+def test_an_out_of_range_calling_window_falls_back_to_the_defaults():
+    from app import config
+
+    assert config._validated_hours(-3, 99) == (
+        config._DEFAULT_HOURS_START, config._DEFAULT_HOURS_END)
+
+
+def test_a_fully_open_window_is_still_allowed():
+    """0-24 is the owner's deliberate current setting; it must keep working."""
+    from app import config
+
+    assert config._validated_hours(0, 24) == (0, 24)
+
+
+def test_an_ordinary_window_is_left_alone():
+    from app import config
+
+    assert config._validated_hours(10, 19) == (10, 19)

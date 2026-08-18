@@ -26,6 +26,7 @@ fire twice, per the blueprint's own "one scheduler, one instance" warning).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from datetime import datetime, timezone
@@ -38,15 +39,18 @@ from apscheduler.triggers.cron import CronTrigger
 from app import redis_client
 from app.compliance.calling_hours import within_calling_hours
 from app.config import (
+    CALL_MAX_DURATION_S,
     CALLING_HOURS_TZ,
     CAMPAIGN_TICK_SECONDS,
     MAX_CONCURRENT_CALLS,
+    PER_NUMBER_RETRY_COOLDOWN_S,
     PROCESSING_REAPER_TIMEOUT_S,
     RETRY_SWEEP_MINUTES,
     SHEETS_SYNC_MINUTES,
     TRANSCRIPT_RECONCILE_MINUTES,
 )
 from app.db import leads as leads_db
+from app.sheets import client as sheets_client
 from app.sheets import sync as sheets_sync_module
 from app.sheets import writeback as sheets_writeback
 from app.telephony import worker
@@ -94,7 +98,27 @@ async def campaign_tick(campaign_id: UUID | None = None) -> int:
     queued = 0
     for lead in due:
         if await leads_db.mark_queued(lead.lead_id):
-            await worker.enqueue_lead(str(lead.lead_id))
+            try:
+                await worker.enqueue_lead(str(lead.lead_id))
+            except Exception:
+                # The DB transition and Redis enqueue cannot share a
+                # transaction. If Redis fails after mark_queued succeeds, a
+                # lead left queued is invisible to due_leads forever. Roll it
+                # back so the next tick can retry; a push that partially
+                # succeeded is harmless because worker.mark_calling() guards
+                # against duplicate dialing.
+                logger.exception(
+                    f"[scheduler] could not enqueue lead {lead.lead_id}; "
+                    "returning it to pending for retry"
+                )
+                try:
+                    await leads_db.mark_result(lead.lead_id, "pending")
+                except Exception:
+                    logger.exception(
+                        f"[scheduler] could not roll back queued lead "
+                        f"{lead.lead_id} after Redis enqueue failure"
+                    )
+                continue
             queued += 1
     return queued
 
@@ -104,13 +128,30 @@ async def retry_sweeper() -> None:
       1. Crash recovery — anything still in calls:processing past
          PROCESSING_REAPER_TIMEOUT_S means the worker that popped it died
          before acking; requeue it (see worker.reaper_sweep's docstring).
-      2. Business retry — leads whose calls didn't connect (no_answer/failed,
-         under their campaign's max_attempts) are already left in a
-         non-terminal DB status by the worker; nothing further is needed here
-         beyond the reaper today, since due_leads() already re-selects them
-         on the next campaign_tick once they're back to 'pending'.
+      2. Business retry — leads left 'failed' by a call that connected but did
+         not run its course. due_leads() selects only 'pending', and nothing
+         else in the codebase moves a lead out of 'failed', so without this
+         step max_attempts is silently never honoured for exactly the calls it
+         exists for. See leads_db.requeue_failed_leads.
     """
     await worker.reaper_sweep(PROCESSING_REAPER_TIMEOUT_S)
+    requeued = await leads_db.requeue_failed_leads(
+        cooldown_s=PER_NUMBER_RETRY_COOLDOWN_S)
+    if requeued:
+        logger.info(f"[scheduler] returned {len(requeued)} failed lead(s) to "
+                    "'pending' — still under their campaign's max_attempts")
+    # 3. Slot recovery — a call whose process died mid-flight never ran either
+    #    teardown path, so its concurrency slot was never returned and its lead
+    #    is still 'calling'. Bounded by CALL_MAX_DURATION_S plus slack, so a
+    #    genuinely live call is never touched.
+    await worker.reap_stranded_calls(CALL_MAX_DURATION_S + _STRANDED_SLACK_S)
+    # 4. ...and any slot left behind with no lead to attribute it to, which
+    #    step 3 structurally cannot see.
+    await worker.reconcile_live_slots()
+    # 5. Queue recovery — leads reserved as 'queued' whose Redis entry is gone
+    #    (a flush, a recreated container, an eviction). Nothing else looks at
+    #    that status, so without this they wait forever.
+    await worker.reap_orphaned_queued_leads()
 
 
 async def dnd_refresh() -> None:
@@ -121,15 +162,40 @@ async def dnd_refresh() -> None:
     `leads.dnd = true` flags already recorded in Supabase (e.g. from a lead
     explicitly asking not to be called again) into Redis for the worker's
     O(1) dial-time check."""
-    phones = await leads_db.dnd_phones()
+    phone_list = await leads_db.dnd_phones()
+    phones = set(phone_list)
     r = redis_client.get_redis()
-    if phones:
-        await r.sadd(worker.DND_SET_KEY, *phones)
+    # This is a real sync, not an append-only cache fill. A number can be
+    # cleared in the database by an operator or a corrected import; retaining
+    # it in Redis would make the dial-time SISMEMBER gate block that person
+    # forever. Remove stale members first, then add current ones. The worker's
+    # immediate mark_dnd() path still closes the opt-out window between runs.
+    existing = set(await r.smembers(worker.DND_SET_KEY))
+    stale = existing - phones
+    if stale:
+        await r.srem(worker.DND_SET_KEY, *stale)
+    if phone_list:
+        await r.sadd(worker.DND_SET_KEY, *phone_list)
 
 
 async def sheets_sync() -> None:
     r = redis_client.get_redis()
     now_iso = datetime.now(timezone.utc).isoformat()
+
+    reason = sheets_client.unconfigured_reason()
+    if reason:
+        # A settings gap, not an outage. Logged at WARNING once per sweep with
+        # the fix in it, rather than as an ERROR that looks like something
+        # broke; the Sheet is a human-friendly mirror, and the app is fully
+        # functional without it.
+        logger.warning(f"[scheduler] skipping sheets_sync — {reason}")
+        record = {"at": now_iso, "synced": None, "error": reason}
+        try:
+            await r.set(SHEETS_LAST_SYNC_KEY, json.dumps(record))
+        except Exception:
+            pass
+        return
+
     try:
         synced = await sheets_sync_module.sheets_sync()
         record = {"at": now_iso, "synced": synced, "error": None}
@@ -146,19 +212,80 @@ async def sheets_sync() -> None:
         pass  # Redis itself may be what's down; the log line above still landed
 
 
+# How long past a call's maximum duration before it is certainly over. Slack
+# absorbs clock skew and the drain PlivoCall.run() allows for trailing audio.
+_STRANDED_SLACK_S = 120
+
+_WRITEBACK_QUEUE = "sheets:writeback:queue"
+# Reserve-then-ack processing list, mirroring the calls worker's BLMOVE pattern
+# (app/telephony/worker.py). A lead_id is moved here BEFORE its write-back runs
+# and only removed after the write-back succeeds or is re-queued, so a crash
+# mid-drain leaves it recoverable instead of dropping the Sheet write-back.
+_WRITEBACK_PROCESSING = "sheets:writeback:processing"
+# Where an id goes when it can never succeed. write_back_lead returns False for
+# both a transient failure and the permanent "this phone has no row in the
+# Sheet", and every False used to be requeued with no counter and no ceiling.
+# File-imported and API-added leads are not in the Sheet BY DESIGN, so they
+# cycled through every sweep forever at 3-4 Sheets reads each — pushing the
+# batch over Google's per-minute quota, so genuine write-backs in the same batch
+# started failing too. Kept rather than dropped: the transcript is still in
+# Supabase, and this list is how an operator finds out which ones never landed.
+_WRITEBACK_DEAD = "sheets:writeback:dead"
+_WRITEBACK_ATTEMPTS_FMT = "sheets:writeback:attempts:{lead_id}"
+# Generous: a real Sheets outage lasting several sweeps must not evict anything.
+# At TRANSCRIPT_RECONCILE_MINUTES=30 this is a full day of trying.
+_WRITEBACK_MAX_ATTEMPTS = 48
+
+
 async def transcript_reconcile() -> None:
-    """Drains up to _WRITEBACK_BATCH_SIZE lead_ids from sheets:writeback:queue,
-    writing each one's latest call outcome back to their Sheet row. A failed
-    write (row/phone unresolvable, Sheets API error) re-queues the lead_id for
-    the next run rather than dropping it."""
+    """Drain up to _WRITEBACK_BATCH_SIZE lead_ids from sheets:writeback:queue,
+    writing each one's latest call outcome back to their Sheet row.
+
+    Reserve-then-ack, not rpop: the old code popped a whole batch off the queue
+    at once (at-most-once), so a crash/restart mid-drain permanently lost those
+    Sheet write-backs — the calls worker uses BLMOVE+ack+reaper to avoid exactly
+    this. Here each lead_id is reserved onto a processing list before its
+    write-back and removed only after success (or an explicit re-queue). A run
+    first reclaims anything a previous crashed run stranded in the processing
+    list. write_back_lead overwrites the Sheet row idempotently, so an
+    at-least-once re-run after a crash-between-write-and-ack is harmless."""
     r = redis_client.get_redis()
-    raw = await r.rpop("sheets:writeback:queue", _WRITEBACK_BATCH_SIZE)
-    if not raw:
+
+    reason = sheets_client.unconfigured_reason()
+    if reason:
+        # Leave the queue completely alone. Every transcript in it is still
+        # wanted; it just cannot be delivered until the Sheet is set up, and
+        # draining it into certain failure would mean nine doomed API calls and
+        # nine ERROR lines every sweep, forever.
+        try:
+            waiting = await r.llen(_WRITEBACK_QUEUE)
+        except Exception:
+            waiting = "?"
+        logger.warning(
+            f"[scheduler] {waiting} transcript(s) are queued for the Sheet and "
+            f"waiting: {reason} Nothing is lost — they will be written as soon "
+            "as it is configured."
+        )
         return
-    lead_ids = raw if isinstance(raw, list) else [raw]
+
+    # Reclaim items a previous crashed run left mid-flight. Only one instance of
+    # this job runs at a time (APScheduler max_instances=1), so nothing else is
+    # holding them.
+    while await r.lmove(_WRITEBACK_PROCESSING, _WRITEBACK_QUEUE, "LEFT", "RIGHT"):
+        pass
+
+    # Reserve a fixed snapshot of up to BATCH ids into the processing list FIRST,
+    # so a failure re-queued below is retried on the NEXT run, not re-processed
+    # in a hot loop this run.
+    reserved: list[str] = []
+    for _ in range(_WRITEBACK_BATCH_SIZE):
+        lead_id_str = await r.lmove(_WRITEBACK_QUEUE, _WRITEBACK_PROCESSING, "RIGHT", "LEFT")
+        if lead_id_str is None:
+            break
+        reserved.append(lead_id_str)
 
     ok, failed = 0, 0
-    for lead_id_str in lead_ids:
+    for lead_id_str in reserved:
         try:
             success = await sheets_writeback.write_back_lead(UUID(lead_id_str))
         except Exception as exc:
@@ -167,9 +294,33 @@ async def transcript_reconcile() -> None:
             success = False
         if success:
             ok += 1
+            with contextlib.suppress(Exception):
+                await r.delete(_WRITEBACK_ATTEMPTS_FMT.format(lead_id=lead_id_str))
         else:
             failed += 1
-            await r.lpush("sheets:writeback:queue", lead_id_str)
+            attempts = 0
+            with contextlib.suppress(Exception):
+                attempts = int(
+                    await r.incr(_WRITEBACK_ATTEMPTS_FMT.format(lead_id=lead_id_str)))
+            if attempts >= _WRITEBACK_MAX_ATTEMPTS:
+                # It is not coming back. Keep it somewhere an operator can find
+                # rather than retrying it against Google's quota forever.
+                await r.lpush(_WRITEBACK_DEAD, lead_id_str)
+                with contextlib.suppress(Exception):
+                    await r.delete(
+                        _WRITEBACK_ATTEMPTS_FMT.format(lead_id=lead_id_str))
+                logger.error(
+                    f"[scheduler] giving up on the Sheet write-back for lead "
+                    f"{lead_id_str} after {attempts} attempts — it is most "
+                    f"likely not in the Sheet at all (file-imported or added "
+                    f"via the API). Moved to {_WRITEBACK_DEAD}; the transcript "
+                    "itself is safe in Supabase."
+                )
+            else:
+                await r.lpush(_WRITEBACK_QUEUE, lead_id_str)  # retry next run
+        # Ack: remove from the processing list now that it is either done or
+        # safely back on the queue.
+        await r.lrem(_WRITEBACK_PROCESSING, 1, lead_id_str)
 
     if ok or failed:
         logger.info(f"[scheduler] transcript_reconcile: {ok} written back, "
