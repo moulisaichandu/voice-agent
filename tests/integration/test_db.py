@@ -22,6 +22,45 @@ def _uniq_phone() -> str:
     return "+91" + uuid.uuid4().hex[:10]
 
 
+@pytest.fixture(autouse=True)
+async def _deactivate_campaigns_this_test_creates():
+    """Leave no active campaign behind.
+
+    create_campaign() defaults to active=true, and this module makes one (often
+    several) per test against a database that is ALSO the running app's. Nothing
+    here switched them off, so they accumulated: 258 of them, and the readiness
+    dashboard reported "All 32 active campaign(s) are blocked" for agent ids
+    that only ever existed in a test.
+
+    That went unnoticed because test_pipeline.py's isolation fixture ran a bare
+    `update campaigns set active = false` and was silently cleaning up after
+    this module as a side effect. Fixing that one to restore what it deactivated
+    (correctly — it was switching off the operator's live campaigns) removed the
+    accidental cleanup and left this visible.
+
+    Scoped by ID, not by name: matching 'test-%' would also catch a real
+    campaign an operator happened to name that way.
+    """
+    from app.db.pool import get_pool
+
+    pool = await get_pool()
+    before = {
+        r["campaign_id"] for r in
+        await pool.fetch("select campaign_id from campaigns")
+    }
+    try:
+        yield
+    finally:
+        after = await pool.fetch("select campaign_id from campaigns where active")
+        created = [r["campaign_id"] for r in after if r["campaign_id"] not in before]
+        if created:
+            await pool.execute(
+                "update campaigns set active = false "
+                "where campaign_id = any($1::uuid[])",
+                created,
+            )
+
+
 @pytest.fixture
 async def campaign():
     return await campaigns_db.create_campaign(
