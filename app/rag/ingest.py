@@ -6,6 +6,7 @@ Chunking sizes mirror ai-voice-agent/backend/rag.py's proven values (1000 chars
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from app.db import rag_store
@@ -21,11 +22,106 @@ CHUNK_CHARS = 1_000
 CHUNK_OVERLAP = 200
 
 
+_HEADING = re.compile(r"^#{1,6} \S")
+
+
+def _blocks(text: str) -> list[str]:
+    """Paragraph blocks, with a markdown heading glued to what it introduces.
+
+    A heading alone embeds as almost nothing, and the content under it embeds
+    without the word that says what it IS. Keeping them together is what makes
+    a fee table retrievable by the query "course fee".
+    """
+    raw = [b.strip() for b in re.split(r"\n\s*\n", text) if b.strip()]
+    out: list[str] = []
+    heading: str | None = None
+    for block in raw:
+        if _HEADING.match(block) and "\n" not in block and len(block) < 120:
+            # Two headings in a row: the first introduces a section with no
+            # body of its own, so it still belongs with what follows.
+            heading = f"{heading}\n{block}" if heading else block
+            continue
+        out.append(f"{heading}\n\n{block}" if heading else block)
+        heading = None
+    if heading:
+        out.append(heading)
+    return out
+
+
+def _split_long(block: str, chunk_chars: int) -> list[str]:
+    """Break a block bigger than one chunk, never mid-word.
+
+    Sentence ends first, then whitespace. A chunk may run slightly over
+    chunk_chars rather than cut a word in half: half a word embeds as noise,
+    and the few characters saved are worth less than that.
+    """
+    pieces = re.split(r"(?<=[.!?\u0964])\s+", block)
+    parts: list[str] = []
+    current = ""
+    for piece in pieces:
+        while len(piece) > chunk_chars:
+            # A single "sentence" longer than a chunk (a table row, a run-on):
+            # cut at the last space before the limit.
+            cut = piece.rfind(" ", 0, chunk_chars)
+            if cut <= 0:
+                cut = chunk_chars
+            parts.append(piece[:cut].strip())
+            piece = piece[cut:].strip()
+        if current and len(current) + 1 + len(piece) > chunk_chars:
+            parts.append(current)
+            current = piece
+        else:
+            current = f"{current} {piece}".strip()
+    if current:
+        parts.append(current)
+    return [p for p in parts if p]
+
+
+def _tail(chunk: str, overlap: int) -> str:
+    """The last whole sentences of *chunk*, up to *overlap* characters.
+
+    Whole sentences, not a character slice: the point of overlap is that a fact
+    split across a seam is still readable on one side of it, and half a
+    sentence is not.
+    """
+    if overlap <= 0:
+        return ""
+    sentences = re.split(r"(?<=[.!?\u0964])\s+", chunk)
+    out = ""
+    for sentence in reversed(sentences):
+        candidate = f"{sentence} {out}".strip()
+        if len(candidate) > overlap:
+            break
+        out = candidate
+    if out:
+        return out
+    # No sentence boundary fits — a table row, or a long unbroken run.
+    # Fall back to a character slice cut at a space, because SOME overlap is
+    # the point: a fact sitting on the seam has to be readable from one side.
+    tail = chunk[-overlap:]
+    space = tail.find(" ")
+    return tail[space + 1:] if 0 <= space < len(tail) - 1 else tail
+
+
 def chunk_text(
     text: str, chunk_chars: int = CHUNK_CHARS, overlap: int = CHUNK_OVERLAP
 ) -> list[str]:
-    """Split into overlapping chunks. Whitespace-only input yields no chunks —
-    an empty/blank document contributes nothing to search, not a blank chunk."""
+    """Split into chunks that respect the document's structure.
+
+    This used to slice on raw character offsets, which cut straight through the
+    facts a lead actually asks for. Measured on the live corpus: only 2 of 91
+    chunks contained a rupee amount, and both began mid-sentence ("ce, build
+    confidence..." and "0). Outcome:..."). Their embeddings were dominated by
+    whatever else had landed in them, so a query for "course fee" ranked the
+    CURRICULUM page above both, and the agent told a prospective student it did
+    not have the fee information while the amounts sat in the corpus the whole
+    time. That is a sales conversation lost to a chunk boundary.
+
+    Blocks are packed whole, so a heading stays with its table and a price
+    stays with the programme it names. Whitespace-only input still yields no
+    chunks, and *overlap* still carries context across the seam, but as whole
+    trailing sentences rather than an arbitrary number of characters.
+    """
     text = text.strip()
     if not text:
         return []
@@ -33,14 +129,19 @@ def chunk_text(
         raise ValueError("chunk_chars must be greater than overlap")
 
     chunks: list[str] = []
-    n = len(text)
-    i = 0
-    while i < n:
-        end = min(i + chunk_chars, n)
-        chunks.append(text[i:end])
-        if end == n:
-            break
-        i = end - overlap
+    current = ""
+    for block in _blocks(text):
+        parts = (_split_long(block, chunk_chars)
+                 if len(block) > chunk_chars else [block])
+        for part in parts:
+            if current and len(current) + 2 + len(part) > chunk_chars:
+                chunks.append(current)
+                seam = _tail(current, overlap)
+                current = f"{seam}\n\n{part}".strip() if seam else part
+            else:
+                current = f"{current}\n\n{part}".strip() if current else part
+    if current:
+        chunks.append(current)
     return chunks
 
 

@@ -81,6 +81,19 @@ def _mock_all_healthy(monkeypatch, *, redis: _FakeRedis | None = None) -> _FakeR
     r.store[admin_system._LAST_PUBLIC_URL_KEY] = "https://stable.trycloudflare.com"
     monkeypatch.setattr(admin_system.public_url, "refresh", stable_url)
 
+    # ...and it must ANSWER. The check verifies reachability now, because a
+    # cloudflared that stays "Up" serving a hostname Cloudflare has torn down
+    # reads as unchanged while resolving nowhere.
+    class _OkResp:
+        status_code = 200
+
+    class _OkClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, url): return _OkResp()
+
+    monkeypatch.setattr(admin_system.httpx, "AsyncClient", lambda **kw: _OkClient())
+
     async def fake_get_pool():
         return _FakePool()
 
@@ -870,48 +883,97 @@ async def test_clearing_an_untripped_breaker_is_harmless(client, monkeypatch):
 # questions about the courses. The module's own docstring records 22 distinct
 # hostnames minted on this machine.
 
-async def test_a_rotated_tunnel_is_reported_rather_than_passing_silently(monkeypatch):
+# ── a tunnel that dies without rotating ────────────────────────────────────
+#
+# The first version of this check compared hostnames, so it only noticed
+# ROTATION. On 2026-08-20 Cloudflare tore down the tunnel record while
+# cloudflared stayed "Up" and kept serving the dead hostname from
+# /quicktunnel for hours. Nothing resolved it — from the host or the container
+# — and this check cheerfully reported "Stable at https://…". Only preflight's
+# real round-trip caught it, and only because an operator went looking.
+#
+# Reachability is the property that matters: if Plivo cannot fetch the answer
+# URL, every call rings and drops on answer. That is critical, not a warning.
+
+class _Resp:
+    def __init__(self, status): self.status_code = status
+
+
+async def test_an_unreachable_tunnel_is_critical_even_when_the_name_is_unchanged(
+        monkeypatch):
     from app.admin import system as sys_mod
 
-    seen = {"stored": "https://old-hostname.trycloudflare.com"}
-
     class _R:
-        async def get(self, key):
-            return seen["stored"]
+        async def get(self, key): return "https://same-host.trycloudflare.com"
+        async def set(self, key, value, **kw): return True
 
-        async def set(self, key, value, **kw):
-            seen["stored"] = value
-            return True
+    async def resolve(): return "https://same-host.trycloudflare.com"
 
-    async def resolve():
-        return "https://brand-new-hostname.trycloudflare.com"
+    class _Client:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, url):
+            raise sys_mod.httpx.ConnectError("Name or service not known")
 
     monkeypatch.setattr(sys_mod.redis_client, "get_redis", lambda: _R())
     monkeypatch.setattr(sys_mod.public_url, "refresh", resolve)
+    monkeypatch.setattr(sys_mod.httpx, "AsyncClient", lambda **kw: _Client())
 
-    check = await sys_mod._check_public_url_rotation()
+    check = await sys_mod._check_public_url()
+
+    assert check["status"] == "critical", (
+        "a dead tunnel that kept its hostname was reported as healthy"
+    )
+    assert "unreachable" in check["detail"].lower()
+
+
+async def test_a_reachable_rotation_is_only_a_warning(monkeypatch):
+    """Dialling genuinely still works after a rotation — this app re-resolves.
+    What breaks is what is configured OUTSIDE the repo, so: warn, don't block."""
+    from app.admin import system as sys_mod
+
+    store = {"v": "https://old-host.trycloudflare.com"}
+
+    class _R:
+        async def get(self, key): return store["v"]
+        async def set(self, key, value, **kw):
+            store["v"] = value
+            return True
+
+    async def resolve(): return "https://new-host.trycloudflare.com"
+
+    class _Client:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, url): return _Resp(200)
+
+    monkeypatch.setattr(sys_mod.redis_client, "get_redis", lambda: _R())
+    monkeypatch.setattr(sys_mod.public_url, "refresh", resolve)
+    monkeypatch.setattr(sys_mod.httpx, "AsyncClient", lambda **kw: _Client())
+
+    check = await sys_mod._check_public_url()
 
     assert check["status"] == "warning"
     assert "ElevenLabs" in check["detail"]
-    assert "brand-new-hostname" in check["detail"]
-    # ...and the new value is remembered, so it reports once, not forever.
-    assert seen["stored"] == "https://brand-new-hostname.trycloudflare.com"
+    assert store["v"] == "https://new-host.trycloudflare.com"
 
 
-async def test_an_unchanged_tunnel_is_quiet(monkeypatch):
+async def test_a_reachable_unchanged_tunnel_is_good(monkeypatch):
     from app.admin import system as sys_mod
 
     class _R:
-        async def get(self, key):
-            return "https://same-hostname.trycloudflare.com"
+        async def get(self, key): return "https://same-host.trycloudflare.com"
+        async def set(self, key, value, **kw): return True
 
-        async def set(self, key, value, **kw):
-            return True
+    async def resolve(): return "https://same-host.trycloudflare.com"
 
-    async def resolve():
-        return "https://same-hostname.trycloudflare.com"
+    class _Client:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, url): return _Resp(200)
 
     monkeypatch.setattr(sys_mod.redis_client, "get_redis", lambda: _R())
     monkeypatch.setattr(sys_mod.public_url, "refresh", resolve)
+    monkeypatch.setattr(sys_mod.httpx, "AsyncClient", lambda **kw: _Client())
 
-    assert (await sys_mod._check_public_url_rotation())["status"] == "good"
+    assert (await sys_mod._check_public_url())["status"] == "good"

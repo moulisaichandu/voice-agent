@@ -20,6 +20,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Awaitable, Callable, Literal
 
+import httpx
 from fastapi import APIRouter
 from pydantic import BaseModel
 
@@ -108,60 +109,90 @@ def _check_calling_hours() -> dict:
 
 
 _LAST_PUBLIC_URL_KEY = "public_url:last_seen"
+# Short: this runs on every dashboard poll, and a tunnel that needs longer than
+# this to answer is not one Plivo will wait for either.
+_PUBLIC_URL_TIMEOUT_S = 8.0
 
 
-async def _check_public_url_rotation() -> dict:
-    """Whether the tunnel hostname has changed since this check last ran.
+async def _check_public_url() -> dict:
+    """Whether the public URL RESOLVES AND ANSWERS, and whether it has changed.
 
-    Rotation is only handled in ONE direction. public_url.refresh() re-resolves
-    the hostname this app gives Plivo, so dialling keeps working and preflight
-    stays green. But the ElevenLabs agent's course-lookup tool URL and its
-    transcript webhook are configured against that same hostname in the
-    ElevenLabs DASHBOARD, and nothing here can re-point them. The resulting
-    failure is silent and specific: calls connect, every check is green, and
-    the agent simply cannot answer questions about the courses.
+    Reachability first, because that is the property that matters: if Plivo
+    cannot fetch the answer URL, every call rings and drops the moment it is
+    answered. Critical, not a warning.
 
-    So this reports the rotation rather than trying to repair it. Warning, not
-    critical: dialling genuinely still works, and treating it as a hard stop
-    would ground a system that is only partly degraded. The real fix is a NAMED
-    Cloudflare tunnel, which public_url.py's own docstring already recommends.
+    This check originally compared hostnames only, so it noticed ROTATION and
+    nothing else. On 2026-08-20 Cloudflare tore down the quick tunnel's record
+    while cloudflared stayed "Up" and went on serving the dead hostname from
+    /quicktunnel for hours — resolving nowhere, from the host or the container.
+    This check reported "Stable at https://…" throughout. Only preflight's real
+    round-trip caught it. A name that has not changed is not evidence of a
+    tunnel that works.
 
-    Reports ONCE per rotation — the new value is stored, so a hostname that has
-    been seen stops warning. A read failure is reported rather than swallowed,
-    matching the breaker check's reasoning: "I could not tell" is the honest
-    answer, and silently reading as healthy is how the original problem stayed
-    invisible.
+    Rotation, when the new URL DOES answer, stays a warning: dialling genuinely
+    still works because this app re-resolves at dial time. What breaks is
+    everything configured OUTSIDE this repo against the old hostname — the
+    ElevenLabs agent's search-tool URL and its transcript webhook — and nothing
+    here can repair those. The real fix is a named Cloudflare tunnel; see the
+    CLOUDFLARE_TUNNEL_TOKEN block in docker-compose.yml.
     """
     try:
         current = await public_url.refresh()
     except Exception as exc:  # noqa: BLE001 - one dead check must not take the dashboard down
-        return {"key": "public_url", "status": "warning", "label": "Public URL",
+        return {"key": "public_url", "status": "critical", "label": "Public URL",
                 "detail": f"Could not resolve the tunnel: {type(exc).__name__}: {exc}"}
     if not current:
-        return {"key": "public_url", "status": "warning", "label": "Public URL",
+        return {"key": "public_url", "status": "critical", "label": "Public URL",
                 "detail": "No public URL is resolvable — Plivo cannot reach this "
-                          "app, so no call can connect."}
+                          "app, so every call would ring and drop on answer."}
+
+    # Does it actually answer? /health is unauthenticated and cheap by design.
+    try:
+        async with httpx.AsyncClient(timeout=_PUBLIC_URL_TIMEOUT_S) as client:
+            response = await client.get(f"{current.rstrip('/')}/health")
+        reachable = response.status_code == 200
+        why = f"HTTP {response.status_code}"
+    except Exception as exc:  # noqa: BLE001 - any failure to reach it is the finding
+        reachable = False
+        why = f"{type(exc).__name__}"
+
+    if not reachable:
+        return {
+            "key": "public_url", "status": "critical", "label": "Public URL",
+            "detail": (
+                f"{current} is unreachable ({why}). Plivo cannot fetch the "
+                "answer URL, so every call would ring and drop on answer. If "
+                "this is a quick tunnel, cloudflared can stay 'Up' and keep "
+                "serving a hostname Cloudflare has already torn down — restart "
+                "the cloudflared service, then re-point the ElevenLabs agent's "
+                "tool URL and webhook at the new hostname."
+            ),
+        }
+
     try:
         r = redis_client.get_redis()
         previous = await r.get(_LAST_PUBLIC_URL_KEY)
         await r.set(_LAST_PUBLIC_URL_KEY, current)
     except Exception as exc:  # noqa: BLE001
         return {"key": "public_url", "status": "warning", "label": "Public URL",
-                "detail": f"Could not check for rotation: {type(exc).__name__}: {exc}"}
+                "detail": f"Reachable at {current}, but could not check for "
+                          f"rotation: {type(exc).__name__}: {exc}"}
+
     if previous and previous != current:
         return {
             "key": "public_url", "status": "warning", "label": "Public URL",
             "detail": (
-                f"The tunnel rotated to {current} (was {previous}). Dialling is "
-                "unaffected — this app re-resolves it. But anything configured "
-                "against the OLD hostname is now dead, and nothing here can "
-                "update it: in the ElevenLabs dashboard, re-point the agent's "
-                "search-tool URL and the transcript webhook. A named Cloudflare "
-                "tunnel would stop this recurring."
+                f"The tunnel rotated to {current} (was {previous}) and the new "
+                "one answers, so dialling is unaffected — this app re-resolves "
+                "it. But anything configured against the OLD hostname is now "
+                "dead, and nothing here can update it: in the ElevenLabs "
+                "dashboard, re-point the agent's search-tool URL and the "
+                "transcript webhook. A named Cloudflare tunnel would stop this "
+                "recurring."
             ),
         }
     return {"key": "public_url", "status": "good", "label": "Public URL",
-            "detail": f"Stable at {current}"}
+            "detail": f"Reachable and stable at {current}"}
 
 
 async def _check_sarvam_circuit_breaker() -> dict:
@@ -193,7 +224,7 @@ async def _check_sarvam_circuit_breaker() -> dict:
 
 
 _REQUIRED_FOR_DIALING = [
-    "ELEVENLABS_API_KEY", "PLIVO_AUTH_ID", "PLIVO_AUTH_TOKEN",
+    "PLIVO_AUTH_ID", "PLIVO_AUTH_TOKEN",
     "PLIVO_FROM_NUMBER", "PUBLIC_BASE_URL",
 ]
 
@@ -377,6 +408,22 @@ async def _compute_billing(*, force_refresh: bool = False) -> dict:
     so preflight.py can share this exact cache entry — see that function. This
     is now only the presentation half; the dashboard output is unchanged.
     """
+    if not app_config.ELEVENLABS_API_KEY:
+        # Sarvam Telugu and OpenAI Realtime campaigns do not use ElevenLabs.
+        # Only inspect billing when an active campaign actually routes there;
+        # campaign-specific preflight still blocks that campaign honestly.
+        try:
+            active = await campaigns_db.list_active_campaigns()
+        except Exception:
+            active = []
+        uses_elevenlabs = any(
+            languages.backend_for(c.language) == languages.ELEVENLABS for c in active
+        )
+        if not uses_elevenlabs:
+            return {
+                "key": "billing", "status": "good", "label": "ElevenLabs billing",
+                "detail": "Not configured; only required for ElevenLabs campaigns",
+            }
     try:
         sub = await elevenlabs_client.cached_subscription_status(
             force_refresh=force_refresh)
@@ -458,7 +505,7 @@ async def _build_readiness(*, force_refresh: bool) -> ReadinessResponse:
 
     breaker_check = await _check_sarvam_circuit_breaker()
 
-    url_check = await _check_public_url_rotation()
+    url_check = await _check_public_url()
 
     cheap = [db_check, redis_check, worker_check, hours_check, config_check,
              queue_check, breaker_check, url_check]

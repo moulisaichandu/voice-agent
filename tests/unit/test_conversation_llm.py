@@ -384,6 +384,15 @@ async def test_a_gpt5_model_gets_max_completion_tokens(llm, monkeypatch):
         "gpt-5 rejects max_tokens with HTTP 400 — every turn would fail")
 
 
+async def test_a_gpt5_voice_turn_uses_configured_reasoning_effort(llm, monkeypatch):
+    llm()
+    monkeypatch.setattr(conversation_llm, "CONVERSATION_LLM_MODEL", "gpt-5.4-mini")
+    monkeypatch.setattr(conversation_llm, "CONVERSATION_LLM_REASONING_EFFORT", "none")
+    await conversation_llm.turn(_HISTORY)
+
+    assert _FakeAsyncClient.calls[0]["json"]["reasoning_effort"] == "none"
+
+
 async def test_an_older_model_still_gets_max_tokens(llm, monkeypatch):
     """gpt-4o-mini takes the original spelling, and Sarvam NEEDS it: its
     reasoning eats the default 2048 budget and returns no content at all."""
@@ -411,3 +420,40 @@ async def test_a_sarvam_model_keeps_max_tokens(llm, monkeypatch):
     await conversation_llm.turn(_HISTORY)
 
     assert _FakeAsyncClient.calls[0]["json"]["max_tokens"] == 4096
+
+
+# ── the only reasoning_effort OpenAI accepts alongside tools ────────────────
+#
+# Measured against the live API on 2026-08-20 with gpt-5.4-mini:
+#
+#   minimal -> HTTP 400    low  -> HTTP 400    medium -> HTTP 400
+#   high    -> HTTP 400    none -> 1.05s, tool call returned
+#
+#   "Function tools with reasoning_effort are not supported for gpt-5.4-mini in
+#    /v1/chat/completions. To use function tools, use /v1/responses or set
+#    reasoning_effort to 'none'."
+#
+# Every two-way turn sends TOOLS (search_course_material is how the agent
+# answers anything about the courses), so any other value fails EVERY turn.
+# _reply then swallows the TurnFailed into the spoken fallback and the agent
+# apologises for the whole call.
+#
+# 'none' is also the fastest option available: omitting the parameter entirely
+# — what production ran before this — lets the model use its default reasoning
+# budget and measured 2.7-5.0s per turn on a live call, against ~1.0-1.5s here.
+
+def test_none_is_an_accepted_reasoning_effort():
+    from app import config
+
+    assert "none" in config._REASONING_EFFORT_CHOICES, (
+        "'none' is the only value OpenAI accepts alongside function tools"
+    )
+
+
+def test_the_default_reasoning_effort_is_one_the_api_accepts():
+    from app import config
+
+    assert config.CONVERSATION_LLM_REASONING_EFFORT == "none", (
+        f"default is {config.CONVERSATION_LLM_REASONING_EFFORT!r}, which the "
+        "API rejects with HTTP 400 on every tool-calling turn"
+    )

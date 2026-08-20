@@ -328,6 +328,35 @@ CONVERSATION_LLM_PROVIDER = _choice(
 # Blank picks the provider's default (gpt-4o-mini / sarvam-105b) rather than
 # forcing an operator switching providers to remember to change two variables.
 CONVERSATION_LLM_MODEL = os.getenv("CONVERSATION_LLM_MODEL", "")
+# GPT-5 reasoning is useful for long-form work but adds avoidable dead air to a
+# phone turn. This is only sent to OpenAI GPT-5 models; Sarvam and older
+# OpenAI chat models keep their existing request shape.
+#
+# 'none' is the DEFAULT and very nearly the only usable value. Measured against
+# the live API on 2026-08-20 with gpt-5.4-mini, every other setting is refused
+# outright when the request also carries tools:
+#
+#   minimal/low/medium/high -> HTTP 400
+#   none                    -> 1.05s, tool call returned
+#
+#   "Function tools with reasoning_effort are not supported for gpt-5.4-mini in
+#    /v1/chat/completions. To use function tools, use /v1/responses or set
+#    reasoning_effort to 'none'."
+#
+# Every two-way turn sends tools — search_course_material is how the agent
+# answers anything about the courses — so a rejected value fails EVERY turn,
+# and sarvam_bridge._reply turns each failure into the spoken fallback: the
+# agent apologises for the entire call. The other values are kept in the choice
+# list because this is an API-side restriction that may lift, and _choice warns
+# and falls back rather than crashing if one is set deliberately.
+#
+# 'none' is also the fastest option, not merely the safe one: OMITTING the
+# parameter (what this code did before) leaves the model on its default
+# reasoning budget, which measured 2.7-5.0s per turn on a real call against
+# ~1.0-1.5s with 'none'.
+_REASONING_EFFORT_CHOICES = ("none", "minimal", "low", "medium", "high", "xhigh")
+CONVERSATION_LLM_REASONING_EFFORT = _choice(
+    "CONVERSATION_LLM_REASONING_EFFORT", "none", _REASONING_EFFORT_CHOICES)
 # A turn the lead is waiting through. Far shorter than the render timeout on
 # purpose: past this the answer is no longer worth having, because the lead has
 # already decided the line is dead.
@@ -339,7 +368,7 @@ CONVERSATION_LLM_TIMEOUT_S = _float("CONVERSATION_LLM_TIMEOUT_S", 12.0)
 # (that's END_SPEECH; see app/telephony/sarvam_stt.py). Tunable because it is
 # a straight trade: too low risks answering mid-sentence on a lead who pauses
 # briefly, too high adds dead air to every single turn.
-SARVAM_REPLY_SETTLE_S = _float("SARVAM_REPLY_SETTLE_S", 0.25)
+SARVAM_REPLY_SETTLE_S = _float("SARVAM_REPLY_SETTLE_S", 0.12)
 
 # Ceiling on the same wait if END_SPEECH never arrives for an utterance —
 # preserves the previous fixed-debounce behaviour as a FALLBACK rather than a
@@ -460,6 +489,8 @@ CALLING_HOURS_TZ = os.getenv("CALLING_HOURS_TZ", "Asia/Kolkata")
 
 # ── CAMPAIGN / DIALLING ────────────────────────────────────────────────────────
 MAX_CONCURRENT_CALLS = _int("MAX_CONCURRENT_CALLS", 10)
+MAX_UPLOAD_BYTES = _int("MAX_UPLOAD_BYTES", 10 * 1024 * 1024)
+ADMIN_LIST_MAX = _int("ADMIN_LIST_MAX", 200)
 PER_NUMBER_RETRY_COOLDOWN_S = _int("PER_NUMBER_RETRY_COOLDOWN_S", 3600)
 CAMPAIGN_TICK_SECONDS = _int("CAMPAIGN_TICK_SECONDS", 60)
 RETRY_SWEEP_MINUTES = _int("RETRY_SWEEP_MINUTES", 15)
