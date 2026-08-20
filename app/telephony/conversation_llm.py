@@ -39,6 +39,7 @@ import httpx
 from app.config import (
     CONVERSATION_LLM_MODEL,
     CONVERSATION_LLM_PROVIDER,
+    CONVERSATION_LLM_REASONING_EFFORT,
     CONVERSATION_LLM_TIMEOUT_S,
     OPENAI_API_KEY,
     SARVAM_API_KEY,
@@ -357,6 +358,14 @@ async def turn(messages: list[dict]) -> LLMReply:
         # returning content=null — see sarvam_llm._MAX_TOKENS.
         _token_budget_param(model): 4096,
     }
+    # The configured live model is a GPT-5 family model. Its default reasoning
+    # budget is designed for difficult tasks, not a short voice turn, and the
+    # extra reasoning is heard as dead air. Keep this provider/model-gated so
+    # the OpenAI-compatible Sarvam endpoint never receives an OpenAI-only
+    # option, and older chat models retain their existing request shape.
+    if (CONVERSATION_LLM_PROVIDER == OPENAI
+            and model.lower().startswith("gpt-5")):
+        payload["reasoning_effort"] = CONVERSATION_LLM_REASONING_EFFORT
 
     loop = asyncio.get_running_loop()
     started = loop.time()

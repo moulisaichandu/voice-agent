@@ -14,8 +14,6 @@
  * still hit the backend directly and are unaffected by any of this — CORS is
  * a browser mechanism only.
  */
-const BACKEND_URL = process.env.BACKEND_URL ?? "http://localhost:8091";
-
 /**
  * Dev and production builds write to DIFFERENT directories.
  *
@@ -34,11 +32,6 @@ const distDir = process.env.NODE_ENV === "production" ? ".next-build" : ".next";
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   distDir,
-  async rewrites() {
-    return [
-      { source: "/api/backend/:path*", destination: `${BACKEND_URL}/:path*` },
-    ];
-  },
 };
 
 module.exports = nextConfig;

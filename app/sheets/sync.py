@@ -15,6 +15,7 @@ import logging
 from datetime import datetime
 
 from app import languages
+from app.compliance.consent import normalize_consent_at
 from app.compliance.dnd import normalize_phone_e164
 from app.db import campaigns as campaigns_db
 from app.db import leads as leads_db
@@ -55,9 +56,14 @@ def parse_consent_at(raw: object) -> datetime | None:
     if not raw:
         return None
     text = str(raw).strip()
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S"):
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return normalize_consent_at(parsed)
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
         try:
-            return datetime.strptime(text, fmt)
+            return normalize_consent_at(datetime.strptime(text, fmt))
         except ValueError:
             continue
     logger.warning(f"[sheets] unparseable consent timestamp: {text!r}")

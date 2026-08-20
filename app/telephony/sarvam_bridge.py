@@ -440,6 +440,10 @@ class _Conversation:
         audio duration. If the generation changes mid-way the lead has
         interrupted, so the rest is abandoned unplayed.
         """
+        # This is the last boundary before Sarvam TTS. Keep every fallback,
+        # tool farewell, opening, and normal reply safe even if it bypassed
+        # the renderer or came from a cached/third-party model response.
+        text = sarvam_prompts.normalize_spoken_telugu(text)
         sentences = _split_sentences(text)
         if not sentences:
             return
@@ -736,6 +740,7 @@ class _Conversation:
         # agreeing about what the lead said. A live call was lost to this: the
         # brand came back as "బ్రౌనీ" and the agent refused a question about
         # its own courses. See term_repair's docstring.
+        text = sarvam_prompts.normalize_heard_telugu(text)
         text = term_repair.repair(text)
         self.turns.append(TranscriptTurn(role="lead", text=text))
         self.history.append({"role": "user", "content": text})
@@ -892,7 +897,13 @@ class _Conversation:
                 self._turn_llm_rounds += 1
                 if not reply.tool_calls:
                     if reply.text:
-                        await self.say(tts, reply.text)
+                        # Sarvam TTS reads Telugu literally. Keep the model's
+                        # response in the history/transcript in the same form
+                        # that is actually spoken, including the narrow repair
+                        # for recurring missing-vowel spellings.
+                        reply_text = sarvam_prompts.normalize_spoken_telugu(
+                            reply.text)
+                        await self.say(tts, reply_text)
                         self._failed_turns = 0
                     return
                 # Text that arrives WITH a tool call is usually filler — "let
@@ -918,7 +929,12 @@ class _Conversation:
                     # whatever the model wrote — or, if it wrote nothing at
                     # all, a canned farewell rather than hanging up in
                     # silence. See _FALLBACK_FAREWELL.
-                    await self.say(tts, reply.text or _FALLBACK_FAREWELL)
+                    await self.say(
+                        tts,
+                        sarvam_prompts.normalize_spoken_telugu(
+                            reply.text or _FALLBACK_FAREWELL
+                        ),
+                    )
                 elif reply.text:
                     logger.debug(f"[sarvam] lead={self.lead_id} not speaking "
                                  f"tool-call filler: {reply.text[:60]!r}")
@@ -1166,9 +1182,13 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
         # Last line of defence before a real person hears this. render() already
         # repairs a dropped disclosure, but the greeting is spliced in AFTER
         # that, and only the composed text is what the lead actually hears.
-        spoken = sarvam_llm.ensure_disclosure(sarvam_prompts.compose_spoken(
-            body, lead_name=variables.get("lead_name"),
-        ))
+        spoken = sarvam_llm.ensure_disclosure(
+            sarvam_prompts.normalize_spoken_telugu(
+                sarvam_prompts.compose_spoken(
+                    body, lead_name=variables.get("lead_name"),
+                )
+            )
+        )
 
         if not one_way:
             await _run_two_way(

@@ -497,9 +497,8 @@ async def process_one(lead_id: str) -> None:
         # el_conversation_id is NULL here on purpose: with Plivo placing the
         # call there is no ElevenLabs conversation yet — one is created when
         # the audio bridge connects, and call_routes.py fills it in then.
-        await calls_db.create_call(
-            lead_id=lead.lead_id, campaign_id=campaign.campaign_id, mode=campaign.mode,
-            el_conversation_id=None, provider_call_id=result.call_uuid,
+        await _create_call_with_retry(
+            lead=lead, campaign=campaign, provider_call_id=result.call_uuid,
         )
         # The slot is now owned by the call routes, released when the call
         # actually ends (stream closes, or Plivo posts the hangup) — not here.
@@ -522,8 +521,9 @@ async def process_one(lead_id: str) -> None:
                 logger.error(
                     f"[worker] lead {lead_id}: call was already placed when this "
                     "failed — leaving it 'calling' for the transcript webhook to "
-                    "resolve. If create_call() is what failed, the calls row is "
-                    "missing and this call's transcript cannot be matched back."
+                    "resolve. If all calls-row retries failed, the stream path "
+                    "will attempt to create the missing row before recording "
+                    "the outcome."
                 )
             else:
                 if slot_held:
@@ -550,6 +550,48 @@ async def process_one(lead_id: str) -> None:
 
 
 _MAX_LOOP_BACKOFF_S = 30
+
+_CALL_ROW_RETRIES = 3
+
+
+async def _create_call_with_retry(*, lead, campaign, provider_call_id):
+    """Persist a placed call before acknowledging the queue item.
+
+    A transient Postgres error after Plivo accepted the call must not turn into
+    a missing calls row. The stream path also has a repair fallback, but these
+    short retries cover the common connection blip without waiting for the
+    lead to answer.
+    """
+    for attempt in range(_CALL_ROW_RETRIES):
+        try:
+            return await calls_db.create_call(
+                lead_id=lead.lead_id, campaign_id=campaign.campaign_id,
+                mode=campaign.mode, el_conversation_id=None,
+                provider_call_id=provider_call_id,
+            )
+        except Exception:
+            # The insert may well have COMMITTED and the connection dropped
+            # while reading the result — the same transient error this retry
+            # exists for. Retrying that blindly writes a second row for one
+            # call; set_conversation_and_record then updates only one of them
+            # and get_latest_call_for_lead can hand the Sheets write-back the
+            # blank one. Look before leaping.
+            if provider_call_id:
+                try:
+                    existing = await calls_db.get_call_by_provider_id(
+                        provider_call_id)
+                except Exception:
+                    existing = None       # the DB is still unwell; fall through
+                if existing is not None:
+                    logger.warning(
+                        f"[worker] call row for {provider_call_id} already "
+                        "existed — the failed insert had committed. Not "
+                        "retrying, which would duplicate it."
+                    )
+                    return existing
+            if attempt == _CALL_ROW_RETRIES - 1:
+                raise
+            await asyncio.sleep(0.2 * (2 ** attempt))
 
 
 async def run_worker(stop_event: asyncio.Event) -> None:

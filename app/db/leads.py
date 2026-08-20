@@ -6,6 +6,7 @@ from datetime import datetime
 from uuid import UUID
 
 from app.compliance.consent import has_valid_consent
+from app.config import ADMIN_LIST_MAX
 from app.db.models import Lead
 from app.db.pool import get_pool
 
@@ -307,11 +308,14 @@ async def mark_dnd(lead_id: UUID) -> str | None:
     return phone
 
 
-async def list_leads_for_campaign(campaign_id: UUID) -> list[Lead]:
+async def list_leads_for_campaign(
+    campaign_id: UUID, *, limit: int = ADMIN_LIST_MAX, offset: int = 0,
+) -> list[Lead]:
     """Used by the admin API's per-campaign lead list view."""
     pool = await get_pool()
     rows = await pool.fetch(
-        "select * from leads where campaign_id = $1 order by created_at desc", campaign_id,
+        "select * from leads where campaign_id = $1 order by created_at desc "
+        "limit $2 offset $3", campaign_id, limit, offset,
     )
     return [_row_to_lead(r) for r in rows]
 
@@ -352,7 +356,9 @@ async def lead_status_counts_for_active_campaigns() -> dict[str, int]:
     return {r["status"]: r["n"] for r in rows}
 
 
-async def search_leads_by_phone(phone_e164: str) -> list[Lead]:
+async def search_leads_by_phone(
+    phone_e164: str, *, limit: int = ADMIN_LIST_MAX, offset: int = 0,
+) -> list[Lead]:
     """Every lead across every campaign with this phone number — the admin
     API's global lookup ("someone rang back, what do we know about them?").
     Exact match, not fuzzy: callers should normalize with
@@ -360,7 +366,8 @@ async def search_leads_by_phone(phone_e164: str) -> list[Lead]:
     number is unambiguous."""
     pool = await get_pool()
     rows = await pool.fetch(
-        "select * from leads where phone_e164 = $1 order by created_at desc", phone_e164,
+        "select * from leads where phone_e164 = $1 order by created_at desc "
+        "limit $2 offset $3", phone_e164, limit, offset,
     )
     return [_row_to_lead(r) for r in rows]
 

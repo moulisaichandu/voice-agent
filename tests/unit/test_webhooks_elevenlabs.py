@@ -229,3 +229,24 @@ def test_unrecognised_event_type_is_acknowledged_not_rejected(app_client, monkey
         headers={"ElevenLabs-Signature": "t=1,v0=correct"},
     )
     assert r.status_code == 200
+
+
+async def test_a_redis_without_delete_is_reported_not_silently_ignored(caplog):
+    """release_claim did `getattr(r, "delete", None)` and simply returned when
+    it was missing, so the idempotency claim was never released AND nothing
+    said so — the provider's retry stays suppressed for the whole TTL, which is
+    the exact failure the release was added to prevent."""
+    import logging
+
+    from app.webhooks import elevenlabs as wh
+
+    class _NoDelete:
+        async def set(self, *a, **kw):
+            return True
+
+    caplog.set_level(logging.WARNING)
+    await wh._release_idempotency_claim(_NoDelete(), "idem:key", "conv-1")
+
+    assert any("idempotency" in r.message.lower() for r in caplog.records), (
+        "the claim could not be released and nothing was logged"
+    )

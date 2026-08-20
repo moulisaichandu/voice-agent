@@ -13,6 +13,7 @@ import json
 from datetime import datetime
 from uuid import UUID
 
+from app.config import ADMIN_LIST_MAX
 from app.db.models import Call, TranscriptTurn
 from app.db.pool import get_pool
 
@@ -101,11 +102,31 @@ async def get_latest_call_for_lead(lead_id: UUID) -> Call | None:
     return _row_to_call(row) if row else None
 
 
-async def list_calls_for_campaign(campaign_id: UUID) -> list[Call]:
+async def get_call_by_provider_id(provider_call_id: str) -> Call | None:
+    """The call row for a provider call id, if one was already written.
+
+    Exists so worker._create_call_with_retry can tell "the insert never
+    happened" from "the insert committed and the connection dropped while
+    reading the result" — the second is precisely the transient error that
+    retry targets, and retrying it blindly writes a duplicate row.
+    """
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "select * from calls where provider_call_id = $1 "
+        "order by created_at desc limit 1",
+        provider_call_id,
+    )
+    return _row_to_call(row) if row else None
+
+
+async def list_calls_for_campaign(
+    campaign_id: UUID, *, limit: int = ADMIN_LIST_MAX, offset: int = 0,
+) -> list[Call]:
     """Used by the admin API's per-campaign call/transcript list view."""
     pool = await get_pool()
     rows = await pool.fetch(
-        "select * from calls where campaign_id = $1 order by created_at desc", campaign_id,
+        "select * from calls where campaign_id = $1 order by created_at desc "
+        "limit $2 offset $3", campaign_id, limit, offset,
     )
     return [_row_to_call(r) for r in rows]
 
@@ -119,11 +140,14 @@ async def list_recent_calls(limit: int = 50) -> list[Call]:
     return [_row_to_call(r) for r in rows]
 
 
-async def list_calls_for_lead(lead_id: UUID) -> list[Call]:
+async def list_calls_for_lead(
+    lead_id: UUID, *, limit: int = ADMIN_LIST_MAX, offset: int = 0,
+) -> list[Call]:
     """Every call ever placed to this lead — the admin API's per-lead history."""
     pool = await get_pool()
     rows = await pool.fetch(
-        "select * from calls where lead_id = $1 order by created_at desc", lead_id,
+        "select * from calls where lead_id = $1 order by created_at desc "
+        "limit $2 offset $3", lead_id, limit, offset,
     )
     return [_row_to_call(r) for r in rows]
 

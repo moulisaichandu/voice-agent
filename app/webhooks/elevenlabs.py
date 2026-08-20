@@ -55,6 +55,30 @@ def _map_transcript(raw_turns: list[dict]) -> list[TranscriptTurn]:
     return turns
 
 
+async def _release_idempotency_claim(r, idem_key: str, conversation_id: str) -> None:
+    """Release the claim so a provider retry is not suppressed for the TTL.
+
+    A Redis client with no `delete` used to return silently: the claim stayed,
+    the retry stayed suppressed, and nothing anywhere said so — the very
+    failure releasing the claim exists to prevent, minus the evidence.
+    """
+    delete = getattr(r, "delete", None)
+    if delete is None:
+        logger.warning(
+            f"[webhooks] cannot release the idempotency claim for "
+            f"{conversation_id}: this Redis client has no delete(). A provider "
+            "retry will be treated as a duplicate until the key expires."
+        )
+        return
+    try:
+        await delete(idem_key)
+    except Exception:
+        logger.exception(
+            f"[webhooks] could not release idempotency claim for "
+            f"{conversation_id}; provider retry may be suppressed"
+        )
+
+
 async def _handle_post_call_transcription(data: dict) -> None:
     conversation_id = data.get("conversation_id")
     if not conversation_id:
@@ -63,14 +87,17 @@ async def _handle_post_call_transcription(data: dict) -> None:
 
     r = redis_client.get_redis()
     idem_key = f"idem:post_call_transcription:{conversation_id}"
-    # SET ... NX: only the FIRST caller to see this conversation_id gets True
-    # back — a retried webhook (ElevenLabs retries up to 5x) finds the key
-    # already set and skips reprocessing, without needing a DB round-trip
-    # first just to check.
+    # Claim before work so concurrent duplicate deliveries do not both update
+    # the row and enqueue Sheets. Every failure path below rolls the claim
+    # back, which is the important difference from the old implementation:
+    # a transient DB error cannot suppress the provider's retry for six hours.
     is_first = await r.set(idem_key, "1", nx=True, ex=_IDEMPOTENCY_TTL_S)
     if not is_first:
         logger.info(f"[webhooks] duplicate transcript for {conversation_id} — skipping")
         return
+
+    async def release_claim() -> None:
+        await _release_idempotency_claim(r, idem_key, conversation_id)
 
     # NOTE: this handler deliberately does NOT release the concurrency slot.
     # It used to, back when ElevenLabs placed the call and this webhook was
@@ -84,19 +111,24 @@ async def _handle_post_call_transcription(data: dict) -> None:
     turns = _map_transcript(data.get("transcript"))
     summary = (data.get("analysis") or {}).get("transcript_summary")
 
-    call = await calls_db.record_transcript(
-        el_conversation_id=conversation_id,
-        status=data.get("status") or "unknown",
-        turns=len(turns),
-        transcript=turns,
-        summary=summary,
-    )
+    try:
+        call = await calls_db.record_transcript(
+            el_conversation_id=conversation_id,
+            status=data.get("status") or "unknown",
+            turns=len(turns),
+            transcript=turns,
+            summary=summary,
+        )
+    except Exception:
+        await release_claim()
+        raise
     if call is None:
         # The call row should already exist (created at dial time) — if it
         # doesn't, either the worker never got to create_call(), or this
         # conversation_id doesn't belong to us. Log loudly; don't silently drop.
         logger.error(f"[webhooks] no call row for conversation_id={conversation_id} "
                      "— transcript could not be recorded")
+        await release_claim()
         return
 
     # Sheets write-back is a QUEUE, not a direct call from here — several
@@ -104,7 +136,13 @@ async def _handle_post_call_transcription(data: dict) -> None:
     # concurrent 429s from the Sheets API. app/sheets/sync.py (Phase 5)
     # consumes this list.
     if call.lead_id:
-        await r.lpush("sheets:writeback:queue", str(call.lead_id))
+        try:
+            await r.lpush("sheets:writeback:queue", str(call.lead_id))
+        except Exception:
+            # Do not leave a successful idempotency claim hiding a failed
+            # write-back enqueue. The webhook provider can retry the event.
+            await release_claim()
+            raise
 
 
 async def _handle_call_initiation_failure(data: dict) -> None:

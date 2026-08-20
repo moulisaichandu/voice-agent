@@ -571,3 +571,43 @@ async def test_queued_leads_missing_from_redis_are_returned_to_pending(monkeypat
     assert n == 2
     assert "still-queued" not in released, "a lead still in the queue was reset"
     assert "being-worked" not in released, "a lead being dialled right now was reset"
+
+
+async def test_a_retried_call_row_does_not_create_a_duplicate(monkeypatch):
+    """create_call is a bare INSERT, so a connection reset AFTER the insert
+    committed — precisely the transient Postgres error this retry targets —
+    made the retry insert a SECOND row for the same call. The outcome is then
+    written to only one of them, leaving an orphan at status=NULL that
+    get_latest_call_for_lead (Sheets write-back) may pick instead."""
+    inserted = []
+
+    class _Existing:
+        call_id = "already-there"
+
+    async def flaky_create(**kw):
+        inserted.append(kw["provider_call_id"])
+        raise ConnectionResetError("connection lost reading the result")
+
+    async def existing_after_first(provider_call_id):
+        # The first insert DID commit; the row is findable on the retry.
+        return _Existing() if inserted else None
+
+    monkeypatch.setattr(worker.calls_db, "create_call", flaky_create)
+    monkeypatch.setattr(worker.calls_db, "get_call_by_provider_id",
+                        existing_after_first)
+
+    class _Lead:
+        lead_id = "l"
+
+    class _Campaign:
+        campaign_id = "c"
+        mode = "twoway"
+
+    got = await worker._create_call_with_retry(
+        lead=_Lead(), campaign=_Campaign(), provider_call_id="plivo-abc")
+
+    assert got is not None and got.call_id == "already-there"
+    assert len(inserted) == 1, (
+        f"insert was attempted {len(inserted)} times — the second one is a "
+        "duplicate calls row for one call"
+    )

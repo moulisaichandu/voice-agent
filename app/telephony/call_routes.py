@@ -334,7 +334,7 @@ async def stream(ws: WebSocket) -> None:
         logger.exception(f"[calls] bridge failed for lead {lead_id}: "
                          f"{type(exc).__name__}: {exc}")
     finally:
-        await _finalise_call(lead, outcome)
+        await _finalise_call(lead, outcome, campaign=campaign)
         await _end_plivo_leg(lead_id)
         await _release_slot_once(lead_id)
 
@@ -384,7 +384,7 @@ def _spoken_disclosure_ok(outcome: dict) -> bool:
     return True
 
 
-async def _finalise_call(lead, outcome: dict) -> None:
+async def _finalise_call(lead, outcome: dict, *, campaign=None) -> None:
     """Record the transcript and queue the Sheets write-back.
 
     This replaces what the post-call transcript webhook used to do. That
@@ -402,14 +402,50 @@ async def _finalise_call(lead, outcome: dict) -> None:
         # status=NULL and ended_at=NULL forever and the Sheets mirror was
         # written blank. The failure with the most urgent cause looked like
         # nothing having happened.
-        await calls_db.set_conversation_and_record(
-            lead_id=lead.lead_id,
-            el_conversation_id=conversation_id,
-            status=outcome.get("status") or "unknown",
-            turns=outcome.get("turns") or 0,
-            transcript=outcome.get("transcript") or [],
-            summary=None,
-        )
+        try:
+            recorded = await calls_db.set_conversation_and_record(
+                lead_id=lead.lead_id,
+                el_conversation_id=conversation_id,
+                status=outcome.get("status") or "unknown",
+                turns=outcome.get("turns") or 0,
+                transcript=outcome.get("transcript") or [],
+                summary=None,
+            )
+        except Exception as exc:
+            # A row lookup can fail because the worker's create_call retries
+            # exhausted during a short database outage. Give the repair path
+            # below a chance once the stream has finished.
+            logger.warning(
+                f"[calls] initial outcome write failed for lead {lead.lead_id}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            recorded = None
+        if recorded is None and campaign is not None:
+            # The worker retries this row creation, but a database outage can
+            # still span the whole ringing window. Repair the row at stream
+            # teardown while the campaign and lead are still known, then run
+            # the same durable outcome update again.
+            provider_call_id = outcome.get("provider_call_id")
+            if not provider_call_id:
+                try:
+                    provider_call_id = await redis_client.get_redis().get(
+                        CALL_PLIVO_UUID_KEY_FMT.format(lead_id=lead.lead_id)
+                    )
+                except Exception:
+                    provider_call_id = None
+            await calls_db.create_call(
+                lead_id=lead.lead_id, campaign_id=campaign.campaign_id,
+                mode=campaign.mode, el_conversation_id=None,
+                provider_call_id=provider_call_id,
+            )
+            await calls_db.set_conversation_and_record(
+                lead_id=lead.lead_id,
+                el_conversation_id=conversation_id,
+                status=outcome.get("status") or "unknown",
+                turns=outcome.get("turns") or 0,
+                transcript=outcome.get("transcript") or [],
+                summary=None,
+            )
         # Guarded on status='calling' so this and /calls/hangup — which both
         # fire for the same call, in either order — can't overwrite each
         # other. See mark_result_if_calling in db/leads.py.

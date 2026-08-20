@@ -26,7 +26,6 @@ from app import languages as languages_module
 from app.config import (
     CALL_WEBHOOK_SECRET,
     CONVERSATION_LLM_PROVIDER,
-    CONVERSATION_LLM_TIMEOUT_S,
     ELEVENLABS_API_KEY,
     ELEVENLABS_VOICE_ID,
     OPENAI_API_KEY,
@@ -98,7 +97,11 @@ async def preflight(
             "campaign."
         )
 
-    if not ELEVENLABS_API_KEY:
+    # Only the backend that actually carries this call needs ElevenLabs. The
+    # previous unconditional check made every Sarvam Telugu campaign fail
+    # when ElevenLabs was intentionally not configured.
+    if (languages_module.backend_for_iso(language) == languages_module.ELEVENLABS
+            and not ELEVENLABS_API_KEY):
         return "ELEVENLABS_API_KEY is not set, so no agent can answer. Set it in .env."
 
     if not (PLIVO_AUTH_ID and PLIVO_AUTH_TOKEN):
@@ -109,7 +112,8 @@ async def preflight(
         return ("PLIVO_FROM_NUMBER is not set — there is no number to dial from. "
                 "Use the E.164 number you own in Plivo, e.g. +918035383564.")
 
-    if not agent_id or not agent_id.strip():
+    if (languages_module.backend_for_iso(language) == languages_module.ELEVENLABS
+            and (not agent_id or not agent_id.strip())):
         return ("No agent_id is set for this campaign. Set campaigns.agent_id to a "
                 "real ElevenLabs agent id.")
 
@@ -154,6 +158,52 @@ async def preflight(
                 "than this app is answering on that URL (a tunnel error page, or "
                 f"another service?). URL: {base_url}/calls/answer")
 
+    # Validate the provider-specific prerequisites before touching ElevenLabs.
+    # Sarvam and OpenAI campaigns do not have an ElevenLabs agent at all.
+    call_backend = languages_module.backend_for_iso(language)
+    if call_backend == languages_module.SARVAM:
+        if not SARVAM_API_KEY:
+            return (
+                f"This campaign dials in '{language}', which runs on the "
+                "Sarvam backend, but SARVAM_API_KEY is not set. Get one from "
+                "https://dashboard.sarvam.ai and set it in .env. To fall back "
+                "to the previous backend instead, set "
+                "TELUGU_BACKEND=openai_realtime."
+            )
+        breaker_reason = await sarvam_circuit_breaker.tripped_reason()
+        if breaker_reason:
+            return (
+                f"Sarvam reported {breaker_reason!r} on a recent call, and "
+                "dialling on this backend has been paused rather than risk "
+                "repeating it on every other lead. Check credits at "
+                "dashboard.sarvam.ai/usage, top up if needed, then clear it: "
+                "POST /admin/system/sarvam-circuit-breaker/clear."
+            )
+        if mode == "twoway" and CONVERSATION_LLM_PROVIDER == conversation_llm.SARVAM:
+            return (
+                f"This campaign dials in '{language}' as a two-way call. "
+                "CONVERSATION_LLM_PROVIDER is set to 'sarvam', but Sarvam's "
+                "chat models are too slow for a live conversational turn. Set "
+                "CONVERSATION_LLM_PROVIDER=openai in .env and restart."
+            )
+        if mode == "twoway":
+            missing = conversation_llm.missing_key_name()
+            if missing:
+                return (
+                    f"This campaign dials in '{language}' as a two-way call, "
+                    f"but {missing} is not set. Set {missing} in .env and restart."
+                )
+        return None
+
+    if call_backend == languages_module.OPENAI_REALTIME:
+        if not OPENAI_API_KEY:
+            return (
+                f"This campaign dials in '{language}', which runs on the "
+                "OpenAI Realtime backend, but OPENAI_API_KEY is not set. "
+                "Set it in .env."
+            )
+        return None
+
     # Cheapest last: this is the only check that costs an ElevenLabs API call.
     #
     # Off the event loop: agent_exists is a SYNCHRONOUS SDK call, and this
@@ -185,76 +235,6 @@ async def preflight(
     # lookup. Checked OUTSIDE the `if language:` below because a forced voice
     # must not drag an OpenAI-backed call into the ElevenLabs branch;
     # backend_for_iso(None) is ELEVENLABS, so an 'auto' campaign never enters.
-    call_backend = languages_module.backend_for_iso(language)
-    if call_backend == languages_module.SARVAM:
-        if not SARVAM_API_KEY:
-            return (
-                f"This campaign dials in '{language}', which runs on the "
-                "Sarvam backend, but SARVAM_API_KEY is not set. Get one from "
-                "https://dashboard.sarvam.ai and set it in .env. To fall back "
-                "to the previous backend instead, set "
-                "TELUGU_BACKEND=openai_realtime."
-            )
-        # Sarvam publishes no balance/credits endpoint, so this is the only
-        # way the account's state is knowable before dialling: a previous call
-        # already failed with it and tripped the breaker. Checked after the
-        # key (can we talk to Sarvam at all) and before the campaign-config
-        # guard below (is this campaign set up sanely).
-        breaker_reason = await sarvam_circuit_breaker.tripped_reason()
-        if breaker_reason:
-            return (
-                f"Sarvam reported {breaker_reason!r} on a recent call, and "
-                "dialling on this backend has been paused rather than risk "
-                "repeating it on every other lead. Check credits at "
-                "dashboard.sarvam.ai/usage, top up if needed, then clear it: "
-                "POST /admin/system/sarvam-circuit-breaker/clear."
-            )
-        # A two-way call on this backend is answered by conversation_llm.turn(),
-        # not by Sarvam's own chat models — see conversation_llm.py's docstring.
-        # Sarvam's are reasoning models measured at 21.8s on a real turn and
-        # cannot be told to stop reasoning, so pointing CONVERSATION_LLM_PROVIDER
-        # at 'sarvam' does not make the agent slow, it makes it silent: most
-        # turns exceed CONVERSATION_LLM_TIMEOUT_S, raise TurnFailed, and are
-        # swallowed by sarvam_bridge._reply's catch-all — the lead hears
-        # nothing, and the call is still graded a clean exit. Same discipline
-        # as the twoway-flag gate above: a config combination that is known not
-        # to work must refuse to dial, not degrade into a silent call.
-        if mode == "twoway" and CONVERSATION_LLM_PROVIDER == conversation_llm.SARVAM:
-            return (
-                f"This campaign dials in '{language}' as a two-way call. "
-                "CONVERSATION_LLM_PROVIDER is set to 'sarvam', but Sarvam's "
-                "chat models are reasoning models measured at 21.8s on a real "
-                f"conversational turn, against a "
-                f"{CONVERSATION_LLM_TIMEOUT_S:.0f}s CONVERSATION_LLM_TIMEOUT_S — "
-                "most turns would time out and the lead would hear silence, not "
-                "a slow reply. Set CONVERSATION_LLM_PROVIDER=openai in .env (or "
-                "remove the line; that is already the default) and restart."
-            )
-        # ...and the chosen provider must actually be usable. Checked here
-        # rather than discovered a turn at a time on a live call, where every
-        # turn fails into the spoken fallback, the call ends on the silence
-        # watchdog (a clean exit), and a campaign of non-conversations is
-        # recorded as successful calls.
-        if mode == "twoway":
-            missing = conversation_llm.missing_key_name()
-            if missing:
-                return (
-                    f"This campaign dials in '{language}' as a two-way call, "
-                    f"which is answered by CONVERSATION_LLM_PROVIDER="
-                    f"'{CONVERSATION_LLM_PROVIDER}' — but {missing} is not set. "
-                    "Every turn would fail and the lead would hear an apology "
-                    f"instead of an answer. Set {missing} in .env and restart."
-                )
-        return None
-    if call_backend == languages_module.OPENAI_REALTIME:
-        if not OPENAI_API_KEY:
-            return (
-                f"This campaign dials in '{language}', which runs on the "
-                "OpenAI Realtime backend, but OPENAI_API_KEY is not set. "
-                "Set it in .env — it is the same key the RAG embedder uses."
-            )
-        return None
-
     # ElevenLabs billing applies to every call this backend carries, whatever
     # the language or voice override — so this runs BEFORE the
     # 'auto'-with-no-override early return just below. Placing it after would

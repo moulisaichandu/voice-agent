@@ -62,12 +62,21 @@ _AGENT_ID_BY_MODE = {
 }
 
 
-def _resolve_agent_id(mode: str, supplied: str | None) -> str:
+def _resolve_agent_id(
+    mode: str, supplied: str | None, language: str = languages_module.AUTO,
+) -> str:
     """The agent this campaign dials with. Derived from config so an operator
     doesn't hand-copy an `agent_...` string the server already knows — but
     never guessed: an unset variable is a 422 naming it, not a placeholder."""
     if supplied and supplied.strip():
         return supplied.strip()
+    backend = languages_module.backend_for(language)
+    if backend != languages_module.ELEVENLABS:
+        # Campaign.agent_id is retained as a required database field for
+        # compatibility with existing migrations, but these backends do not
+        # use an ElevenLabs agent. Store an explicit backend marker instead of
+        # rejecting a valid Telugu/OpenAI campaign for a missing EL key.
+        return backend
     var_name = _AGENT_ID_BY_MODE[mode]
     configured = getattr(app_config, var_name, None)
     if not configured:
@@ -230,7 +239,7 @@ async def create_campaign(
     body: CampaignCreate, background_tasks: BackgroundTasks,
 ) -> Campaign:
     _check_twoway_capable(body.mode, body.language)
-    agent_id = _resolve_agent_id(body.mode, body.agent_id)
+    agent_id = _resolve_agent_id(body.mode, body.agent_id, body.language)
     await _check_language_support(agent_id, body.language)
     try:
         campaign = await campaigns_db.create_campaign(

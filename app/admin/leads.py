@@ -12,12 +12,13 @@ from datetime import datetime, timezone
 from typing import Literal
 from uuid import UUID
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, Response, UploadFile
 from pydantic import BaseModel, Field
 
 from app import languages, leads_import
 from app.compliance.consent import has_valid_consent
 from app.compliance.dnd import normalize_phone_e164
+from app.config import ADMIN_LIST_MAX, MAX_UPLOAD_BYTES
 from app.db import calls as calls_db
 from app.db import campaigns as campaigns_db
 from app.db import leads as leads_db
@@ -25,6 +26,20 @@ from app.db.models import Call, Lead
 from app.telephony import worker as telephony_worker
 
 router = APIRouter()
+
+# Bulk CSV import is a core feature, so a campaign with more rows than
+# ADMIN_LIST_MAX is the normal case, not an edge one. Returning a full page
+# with nothing to distinguish it from a complete one lets an operator believe
+# they are seeing every lead. The header costs nothing and is the only signal
+# a client can act on without a second count query.
+_TRUNCATED_HEADER = "X-Result-Truncated"
+
+
+def _flag_if_truncated(response, rows, limit) -> None:
+    """Mark a page that filled its limit — there is very likely more."""
+    if len(rows) >= limit:
+        response.headers[_TRUNCATED_HEADER] = "true"
+
 logger = logging.getLogger(__name__)
 
 
@@ -38,10 +53,18 @@ class LeadCreate(BaseModel):
 
 
 @router.get("/campaigns/{campaign_id}/leads", response_model=list[Lead])
-async def list_leads(campaign_id: UUID) -> list[Lead]:
+async def list_leads(
+    response: Response,
+    campaign_id: UUID,
+    limit: int = Query(default=ADMIN_LIST_MAX, ge=1, le=ADMIN_LIST_MAX),
+    offset: int = Query(default=0, ge=0),
+) -> list[Lead]:
     if await campaigns_db.get_campaign(campaign_id) is None:
         raise HTTPException(status_code=404, detail="campaign not found")
-    return await leads_db.list_leads_for_campaign(campaign_id)
+    rows = await leads_db.list_leads_for_campaign(
+        campaign_id, limit=limit, offset=offset)
+    _flag_if_truncated(response, rows, limit)
+    return rows
 
 
 @router.post("/campaigns/{campaign_id}/leads", response_model=Lead, status_code=201)
@@ -103,7 +126,26 @@ async def upload_leads(
     if await campaigns_db.get_campaign(campaign_id) is None:
         raise HTTPException(status_code=404, detail="campaign not found")
 
-    data = await file.read()
+    if file.size is not None and file.size > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"the uploaded file is too large; maximum is {MAX_UPLOAD_BYTES} bytes",
+        )
+
+    # Do not trust UploadFile.size: streaming clients may omit it. Read in
+    # bounded chunks so a huge multipart body cannot consume process memory
+    # before the parser's row limit gets a chance to reject it.
+    chunks: list[bytes] = []
+    total = 0
+    while chunk := await file.read(64 * 1024):
+        total += len(chunk)
+        if total > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"the uploaded file is too large; maximum is {MAX_UPLOAD_BYTES} bytes",
+            )
+        chunks.append(chunk)
+    data = b"".join(chunks)
     if not data:
         raise HTTPException(status_code=400, detail="the uploaded file is empty")
 
@@ -165,7 +207,12 @@ async def upload_leads(
 
 
 @router.get("/leads", response_model=list[Lead])
-async def search_leads(phone: str = Query(min_length=1)) -> list[Lead]:
+async def search_leads(
+    response: Response,
+    phone: str = Query(min_length=1),
+    limit: int = Query(default=ADMIN_LIST_MAX, ge=1, le=ADMIN_LIST_MAX),
+    offset: int = Query(default=0, ge=0),
+) -> list[Lead]:
     """Every lead across every campaign matching this phone number — "someone
     rang back / complained, what do we know about them?" without SQL. Any
     reasonable Indian format works; normalized the same way a dial-path phone
@@ -173,14 +220,33 @@ async def search_leads(phone: str = Query(min_length=1)) -> list[Lead]:
     normalized = normalize_phone_e164(phone)
     if not normalized:
         raise HTTPException(status_code=400, detail=f"{phone!r} is not a valid Indian phone number")
-    return await leads_db.search_leads_by_phone(normalized)
+    if limit == ADMIN_LIST_MAX and offset == 0:
+        rows = await leads_db.search_leads_by_phone(normalized)
+    else:
+        rows = await leads_db.search_leads_by_phone(
+            normalized, limit=limit, offset=offset)
+    _flag_if_truncated(response, rows, limit)
+    return rows
 
 
 @router.get("/leads/{lead_id}/calls", response_model=list[Call])
-async def lead_calls(lead_id: UUID) -> list[Call]:
+async def lead_calls(
+    response: Response,
+    lead_id: UUID,
+    limit: int = Query(default=ADMIN_LIST_MAX, ge=1, le=ADMIN_LIST_MAX),
+    offset: int = Query(default=0, ge=0),
+) -> list[Call]:
     if await leads_db.get_lead(lead_id) is None:
         raise HTTPException(status_code=404, detail="lead not found")
-    return await calls_db.list_calls_for_lead(lead_id)
+    if limit == ADMIN_LIST_MAX and offset == 0:
+        # Keep the default call shape compatible with lightweight adapters and
+        # older integrations; the database layer still enforces the cap.
+        rows = await calls_db.list_calls_for_lead(lead_id)
+    else:
+        rows = await calls_db.list_calls_for_lead(
+            lead_id, limit=limit, offset=offset)
+    _flag_if_truncated(response, rows, limit)
+    return rows
 
 
 @router.post("/leads/{lead_id}/do-not-call", response_model=Lead)

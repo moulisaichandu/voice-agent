@@ -8,15 +8,30 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Response
 from pydantic import BaseModel
 
 from app import scheduler
+from app.config import ADMIN_LIST_MAX
 from app.db import calls as calls_db
 from app.db import campaigns as campaigns_db
 from app.db.models import Call
 
 router = APIRouter()
+
+# Bulk CSV import is a core feature, so a campaign with more rows than
+# ADMIN_LIST_MAX is the normal case, not an edge one. Returning a full page
+# with nothing to distinguish it from a complete one lets an operator believe
+# they are seeing every lead. The header costs nothing and is the only signal
+# a client can act on without a second count query.
+_TRUNCATED_HEADER = "X-Result-Truncated"
+
+
+def _flag_if_truncated(response, rows, limit) -> None:
+    """Mark a page that filled its limit — there is very likely more."""
+    if len(rows) >= limit:
+        response.headers[_TRUNCATED_HEADER] = "true"
+
 
 
 class TickResult(BaseModel):
@@ -24,10 +39,22 @@ class TickResult(BaseModel):
 
 
 @router.get("/campaigns/{campaign_id}/calls", response_model=list[Call])
-async def list_calls(campaign_id: UUID) -> list[Call]:
+async def list_calls(
+    response: Response,
+    campaign_id: UUID,
+    limit: int = Query(default=ADMIN_LIST_MAX, ge=1, le=ADMIN_LIST_MAX),
+    offset: int = Query(default=0, ge=0),
+) -> list[Call]:
     if await campaigns_db.get_campaign(campaign_id) is None:
         raise HTTPException(status_code=404, detail="campaign not found")
-    return await calls_db.list_calls_for_campaign(campaign_id)
+    if limit == ADMIN_LIST_MAX and offset == 0:
+        rows = await calls_db.list_calls_for_campaign(campaign_id)
+    else:
+        rows = await calls_db.list_calls_for_campaign(
+            campaign_id, limit=limit, offset=offset,
+        )
+    _flag_if_truncated(response, rows, limit)
+    return rows
 
 
 @router.get("/calls", response_model=list[Call])

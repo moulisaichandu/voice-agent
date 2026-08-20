@@ -141,3 +141,91 @@ def test_trigger_tick_calls_the_real_campaign_tick_not_a_bypass(client, monkeypa
     assert r.status_code == 200
     assert r.json() == {"queued": 3}
     assert calls["n"] == 1
+
+
+# ── the list cap must not depend on which query string you used ────────────
+#
+# The routes took a "no args" fast path when limit == ADMIN_LIST_MAX, and that
+# path used the DB function's OWN hardcoded default of 200. With
+# ADMIN_LIST_MAX raised to 500 the default request returned 200 rows while
+# ?limit=500 returned 500 — the same endpoint with two different caps, and the
+# operator has no way to tell which they got.
+
+def test_the_two_list_paths_cannot_disagree_on_the_cap():
+    """The routes take a "no args" fast path when limit == ADMIN_LIST_MAX, to
+    keep the default call shape stable for lightweight adapters. That path used
+    the DB function's OWN hardcoded 200, so raising ADMIN_LIST_MAX changed what
+    ?limit=N returned while the default request silently kept the old cap: one
+    endpoint, two caps, and no way for an operator to tell which they got.
+
+    Fixed at the DB layer rather than by deleting the fast path, so the call
+    shape the routes deliberately preserve still works and the two paths agree
+    by construction.
+    """
+    import inspect
+
+    from app.config import ADMIN_LIST_MAX
+    from app.db import calls as calls_db
+    from app.db import leads as leads_db
+
+    for module, name in (
+        (calls_db, "list_calls_for_campaign"),
+        (calls_db, "list_calls_for_lead"),
+        (leads_db, "list_leads_for_campaign"),
+        (leads_db, "search_leads_by_phone"),
+    ):
+        default = inspect.signature(getattr(module, name)).parameters["limit"].default
+        assert default == ADMIN_LIST_MAX, (
+            f"{name} defaults to {default} while the routes cap at "
+            f"{ADMIN_LIST_MAX} — the same endpoint would return two sizes"
+        )
+
+
+async def test_a_truncated_list_says_so_in_a_header(monkeypatch):
+    """A campaign with more leads than the cap returned a full-looking page
+    with nothing to indicate more existed. Bulk CSV import is a core feature,
+    so this is the normal case, not an edge one — and an operator reading a
+    silently truncated list believes they are seeing everything."""
+    from fastapi import Response
+
+    from app.admin import calls as admin_calls
+
+    async def full_page(campaign_id, *a, **kw):
+        return [object()] * admin_calls.ADMIN_LIST_MAX
+
+    async def fake_campaign(cid):
+        return object()
+
+    monkeypatch.setattr(admin_calls.calls_db, "list_calls_for_campaign", full_page)
+    monkeypatch.setattr(admin_calls.campaigns_db, "get_campaign", fake_campaign)
+
+    response = Response()
+    await admin_calls.list_calls(
+        campaign_id=uuid4(), response=response,
+        limit=admin_calls.ADMIN_LIST_MAX, offset=0)
+
+    assert response.headers.get("X-Result-Truncated") == "true", (
+        "the operator is shown a full page with no sign there is more"
+    )
+
+
+async def test_a_partial_list_is_not_flagged(monkeypatch):
+    from fastapi import Response
+
+    from app.admin import calls as admin_calls
+
+    async def short_page(campaign_id, *a, **kw):
+        return [object(), object()]
+
+    async def fake_campaign(cid):
+        return object()
+
+    monkeypatch.setattr(admin_calls.calls_db, "list_calls_for_campaign", short_page)
+    monkeypatch.setattr(admin_calls.campaigns_db, "get_campaign", fake_campaign)
+
+    response = Response()
+    await admin_calls.list_calls(
+        campaign_id=uuid4(), response=response,
+        limit=admin_calls.ADMIN_LIST_MAX, offset=0)
+
+    assert "X-Result-Truncated" not in response.headers

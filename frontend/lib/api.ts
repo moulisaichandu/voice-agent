@@ -1,15 +1,15 @@
 // lib/api.ts — thin fetch wrapper over the backend's /admin routes.
-// No auth header is sent unless NEXT_PUBLIC_API_AUTH_TOKEN is set, matching
-// the backend's APP_AUTH_TOKEN: unset on both sides = open for local dev.
+// Backend authentication is added by the server-side /api/backend proxy. The
+// browser must never receive APP_AUTH_TOKEN/BACKEND_AUTH_TOKEN as a
+// NEXT_PUBLIC variable or it can be copied from the built JavaScript bundle.
 
 // Same-origin by design: /api/backend/* is proxied to the real FastAPI server
-// by next.config.js's rewrite (see the reasoning in that file). Requests from
+// by the server-side route handler in app/api/backend/[...path]/route.ts.
+// Requests from
 // the browser are therefore never cross-origin, so the console doesn't depend
 // on the backend's ALLOWED_ORIGINS listing this exact port. Point BACKEND_URL
 // (server-side, in .env.local) at the backend instead of changing this.
 export const API_BASE = "/api/backend";
-
-const AUTH_TOKEN = process.env.NEXT_PUBLIC_API_AUTH_TOKEN;
 
 export type CampaignMode = "oneway" | "twoway";
 
@@ -162,13 +162,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     ...(isFormData ? {} : { "Content-Type": "application/json" }),
     ...(init?.headers as Record<string, string> | undefined),
   };
-  if (AUTH_TOKEN) headers["Authorization"] = `Bearer ${AUTH_TOKEN}`;
-
   let res: Response;
   try {
     res = await fetch(`${API_BASE}${path}`, { ...init, headers });
   } catch {
-    // Requests go through this Next server's proxy (next.config.js), so a
+    // Requests go through this Next server's proxy route, so a
     // throw here means the proxy couldn't reach the backend — not a CORS
     // rejection, which this same branch used to report misleadingly as
     // "is the backend running?".

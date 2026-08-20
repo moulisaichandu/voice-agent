@@ -81,6 +81,9 @@ _MAX_TOKENS = 4096
 # stop abandoned campaigns' renders living in Redis forever.
 _CACHE_PREFIX = "sarvam:render:"
 _CACHE_TTL_S = 7 * 24 * 3600
+# Bump this whenever the Telugu spelling/normalisation contract changes. A
+# script hash alone cannot invalidate renders produced by the old prompt.
+_RENDER_VERSION = "telugu-spelling-v3"
 
 # Prepended when the model returns Telugu that does not disclose the call is
 # automated. Deliberately a fixed string rather than another completion: the
@@ -113,7 +116,9 @@ def _cache_key(script: str, language_style: str | None) -> str:
     changes the voice's phrasing and the old render should not be served as if
     it came from the new one.
     """
-    material = "\x00".join([script, language_style or "", SARVAM_LLM_MODEL])
+    material = "\x00".join([
+        _RENDER_VERSION, script, language_style or "", SARVAM_LLM_MODEL,
+    ])
     return _CACHE_PREFIX + hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
@@ -235,14 +240,17 @@ async def render(script: str, *, language_style: str | None = None) -> str:
     key = _cache_key(cleaned, language_style)
     cached = await _cache_get(key)
     if cached:
-        return cached
+        repaired = sarvam_prompts.normalize_spoken_telugu(ensure_disclosure(cached))
+        if repaired != cached:
+            await _cache_put(key, repaired)
+        return repaired
 
-    rendered = ensure_disclosure(
+    rendered = sarvam_prompts.normalize_spoken_telugu(ensure_disclosure(
         await _complete(
             sarvam_prompts.render_instructions(cleaned, language_style=language_style),
             cleaned,
         )
-    )
+    ))
     # Cache the REPAIRED text, never the raw model output: a cached
     # non-compliant opening would be served to every later call on the
     # campaign, and would look compliant to anyone who trusted the cache.
