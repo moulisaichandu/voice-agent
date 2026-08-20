@@ -59,6 +59,14 @@ def _split_long(block: str, chunk_chars: int) -> list[str]:
     parts: list[str] = []
     current = ""
     for piece in pieces:
+        # Flush what has already been accumulated BEFORE emitting this piece's
+        # fragments, or document order breaks: the fragments would be appended
+        # straight to `parts` while the earlier sentences sat in `current` and
+        # were only flushed afterwards, landing them AFTER their own table. On
+        # a fee block that separates "## Course Fees" from the fees.
+        if len(piece) > chunk_chars and current:
+            parts.append(current)
+            current = ""
         while len(piece) > chunk_chars:
             # A single "sentence" longer than a chunk (a table row, a run-on):
             # cut at the last space before the limit.

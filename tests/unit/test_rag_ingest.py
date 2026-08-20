@@ -259,3 +259,29 @@ def test_a_block_larger_than_the_chunk_size_is_still_split():
 
     assert len(chunks) > 1
     assert max(len(c) for c in chunks) <= 700, "a chunk blew well past the size"
+
+
+def test_a_long_block_does_not_reorder_the_text_before_it():
+    """_split_long appended an oversized piece's fragments straight to `parts`
+    while the sentences already accumulated in `current` were flushed only
+    afterwards — so the text that came FIRST in the document ended up after the
+    fragments. On a fee block that is fatal in exactly the way this chunker
+    exists to prevent: the '## Course Fees' heading and its intro sentence land
+    in a LATER chunk than the table they introduce."""
+    parts = ingest._split_long("Alpha beta. " + "z" * 300, 100)
+
+    assert parts[0].startswith("Alpha beta."), (
+        f"document order was not preserved: {[p[:14] for p in parts]}"
+    )
+
+
+def test_a_heading_stays_ahead_of_the_long_table_it_introduces():
+    row = " | ".join(f"BD{c}P Rs {n},000" for c, n in zip("LCDM", [25, 50, 150, 165]))
+    block = "## Course Fees\n\nSee the table below. " + row * 12
+
+    chunks = ingest.chunk_text(block, chunk_chars=400, overlap=80)
+
+    heading_at = next(i for i, c in enumerate(chunks) if "Course Fees" in c)
+    assert heading_at == 0, (
+        f"the heading landed in chunk {heading_at}, after its own table"
+    )
