@@ -668,3 +668,93 @@ async def test_stream_and_hangup_release_one_slot_when_no_attempt_id_was_recorde
         f"one call released {len(releases)} slots — calls:live:count now "
         "over-admits permanently"
     )
+
+
+# ── a failed write is not evidence that the row is missing ─────────────────
+#
+# _finalise_call set `recorded = None` both when set_conversation_and_record
+# genuinely found no call row AND when it merely RAISED, then ran create_call
+# on either. A transient database blip therefore wrote a SECOND row for a call
+# that already had one: the outcome lands on one of them and the other stays at
+# status=NULL, where get_latest_call_for_lead (the Sheets write-back) may pick
+# it up blank. Same failure the worker's own retry was fixed for.
+
+class _Lead:
+    lead_id = "lead-1"
+
+
+class _Campaign:
+    campaign_id = "camp-1"
+    mode = "twoway"
+
+
+class _FinaliseRedis:
+    async def get(self, key):
+        return "plivo-uuid-1"
+
+    async def lpush(self, *a, **kw):
+        return 1
+
+
+async def test_a_transient_write_failure_does_not_duplicate_an_existing_row(
+        monkeypatch):
+    created, updates = [], {"n": 0}
+
+    async def flaky_record(**kw):
+        updates["n"] += 1
+        if updates["n"] == 1:
+            raise ConnectionResetError("blip during the outcome write")
+        return object()
+
+    async def fake_create(**kw):
+        created.append(kw)
+        return object()
+
+    async def existing(provider_call_id):
+        return object()          # the row is there; the write just failed
+
+    monkeypatch.setattr(call_routes.calls_db, "set_conversation_and_record",
+                        flaky_record)
+    monkeypatch.setattr(call_routes.calls_db, "create_call", fake_create)
+    monkeypatch.setattr(call_routes.calls_db, "get_call_by_provider_id", existing)
+    monkeypatch.setattr(call_routes.leads_db, "mark_result_if_calling",
+                        lambda *a, **kw: _noop())
+    monkeypatch.setattr(call_routes.redis_client, "get_redis",
+                        lambda: _FinaliseRedis())
+
+    await call_routes._finalise_call(
+        _Lead(), {"status": "done", "turns": 3, "transcript": []},
+        campaign=_Campaign())
+
+    assert created == [], "a duplicate call row was written for one call"
+    assert updates["n"] == 2, "the outcome update was not retried"
+
+
+async def test_a_genuinely_missing_row_is_still_created(monkeypatch):
+    """The repair must keep working — a call that reached the stream with no
+    row at all still needs one, which is why this path exists."""
+    created = []
+
+    async def no_row(**kw):
+        return None              # returned cleanly: there really is no row
+
+    async def fake_create(**kw):
+        created.append(kw)
+        return object()
+
+    monkeypatch.setattr(call_routes.calls_db, "set_conversation_and_record", no_row)
+    monkeypatch.setattr(call_routes.calls_db, "create_call", fake_create)
+    monkeypatch.setattr(call_routes.leads_db, "mark_result_if_calling",
+                        lambda *a, **kw: _noop())
+    monkeypatch.setattr(call_routes.redis_client, "get_redis",
+                        lambda: _FinaliseRedis())
+
+    await call_routes._finalise_call(
+        _Lead(), {"status": "done", "turns": 3, "transcript": []},
+        campaign=_Campaign())
+
+    assert len(created) == 1, "the repair path stopped creating a missing row"
+
+
+async def _noop():
+    return None

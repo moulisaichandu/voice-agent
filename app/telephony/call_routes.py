@@ -402,6 +402,7 @@ async def _finalise_call(lead, outcome: dict, *, campaign=None) -> None:
         # status=NULL and ended_at=NULL forever and the Sheets mirror was
         # written blank. The failure with the most urgent cause looked like
         # nothing having happened.
+        write_failed = False
         try:
             recorded = await calls_db.set_conversation_and_record(
                 lead_id=lead.lead_id,
@@ -420,6 +421,7 @@ async def _finalise_call(lead, outcome: dict, *, campaign=None) -> None:
                 f"{type(exc).__name__}: {exc}"
             )
             recorded = None
+            write_failed = True
         if recorded is None and campaign is not None:
             # The worker retries this row creation, but a database outage can
             # still span the whole ringing window. Repair the row at stream
@@ -433,11 +435,32 @@ async def _finalise_call(lead, outcome: dict, *, campaign=None) -> None:
                     )
                 except Exception:
                     provider_call_id = None
-            await calls_db.create_call(
-                lead_id=lead.lead_id, campaign_id=campaign.campaign_id,
-                mode=campaign.mode, el_conversation_id=None,
-                provider_call_id=provider_call_id,
-            )
+            # A write that RAISED is not evidence that the row is missing —
+            # only a write that returned None is. Treating the two alike wrote
+            # a second row for a call that already had one on any transient
+            # database blip; the outcome then lands on one of them while the
+            # other stays at status=NULL, and get_latest_call_for_lead (the
+            # Sheets write-back) can pick up the blank one. Same failure
+            # worker._create_call_with_retry was fixed for, same guard.
+            existing = None
+            if write_failed and provider_call_id:
+                try:
+                    existing = await calls_db.get_call_by_provider_id(
+                        provider_call_id)
+                except Exception:
+                    existing = None        # still unwell; fall through
+            if existing is None:
+                await calls_db.create_call(
+                    lead_id=lead.lead_id, campaign_id=campaign.campaign_id,
+                    mode=campaign.mode, el_conversation_id=None,
+                    provider_call_id=provider_call_id,
+                )
+            else:
+                logger.warning(
+                    f"[calls] outcome write for lead {lead.lead_id} failed but "
+                    "its call row exists — retrying the update instead of "
+                    "creating a duplicate."
+                )
             await calls_db.set_conversation_and_record(
                 lead_id=lead.lead_id,
                 el_conversation_id=conversation_id,
