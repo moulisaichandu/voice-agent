@@ -382,8 +382,12 @@ SARVAM_REPLY_MAX_WAIT_S = _float("SARVAM_REPLY_MAX_WAIT_S", 0.7)
 # model. RAG ingestion/search cannot run for real without this; code + tests run
 # fine against a mocked embeddings client regardless.
 OPENAI_API_KEY: str | None = os.getenv("OPENAI_API_KEY")
+# The dimension that goes with this model is NOT configurable: it is pinned in
+# migrations/0001_init.sql as vector(1536). Changing EMBED_MODEL to a model with
+# a different width therefore needs a migration, not just an env var. (An
+# EMBED_DIM setting used to sit here suggesting otherwise; it was read by
+# nothing.)
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
-EMBED_DIM = _int("EMBED_DIM", 1536)
 
 # ── RAG RETRIEVAL ─────────────────────────────────────────────────────────────
 # Below this cosine-similarity score, search_relevant() returns "" / a "no

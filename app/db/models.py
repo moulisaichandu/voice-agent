@@ -94,11 +94,3 @@ class Call(BaseModel):
     transcript: list[TranscriptTurn] | None = None
     summary: str | None = None
     created_at: datetime
-
-
-class DocChunk(BaseModel):
-    chunk_id: UUID
-    doc_name: str | None = None
-    section: str | None = None
-    content: str
-    created_at: datetime
