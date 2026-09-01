@@ -79,6 +79,31 @@ def llm(monkeypatch):
     return _install
 
 
+async def test_a_summary_request_offers_the_model_no_tools(llm):
+    """call_summary.py asks for a note, not a turn: the model must not be
+    offered end_call or a course lookup, and the temperature is the caller's."""
+    llm(payload=_reply(content="Interested\nAsked the fee."))
+
+    reply = await conversation_llm.turn(
+        [{"role": "user", "content": "summarise"}], tools=[], temperature=0.2)
+
+    sent = _FakeAsyncClient.calls[-1]["json"]
+    assert "tools" not in sent and "tool_choice" not in sent
+    assert sent["temperature"] == 0.2
+    assert reply.text == "Interested\nAsked the fee."
+
+
+async def test_a_conversational_turn_still_offers_the_tools_by_default(llm):
+    llm(payload=_reply(content="సరే."))
+
+    await conversation_llm.turn([{"role": "user", "content": "హలో"}])
+
+    sent = _FakeAsyncClient.calls[-1]["json"]
+    assert sent["tools"] == conversation_llm.TOOLS
+    assert sent["tool_choice"] == "auto"
+    assert sent["temperature"] == 0.6
+
+
 def _reply(content=None, tool_calls=None):
     message: dict = {"role": "assistant", "content": content}
     if tool_calls:

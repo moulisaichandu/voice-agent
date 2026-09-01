@@ -326,6 +326,18 @@ SARVAM_LLM_MODEL = os.getenv("SARVAM_LLM_MODEL", "sarvam-105b")
 # what drives barge-in. Higher sensitivity catches quieter speech at the cost of
 # treating background noise as a turn.
 SARVAM_VAD_HIGH_SENSITIVITY = _bool("SARVAM_VAD_HIGH_SENSITIVITY", False)
+# The noise gate in app/telephony/sarvam_stt.py: Sarvam's START_SPEECH fires
+# on any sound, and it is the bridge's only barge-in signal, so room noise cut
+# the agent off exactly as the lead's voice would (live 2026-09-01). A START is
+# passed through only after MIN_MS of audio at an RMS of at least SNR times
+# the quiet stretch before it, never below MIN_RMS. The numbers were read off
+# that call — speech was 2.6-4.7x its floor, noise 0.1-0.2x — and every gate
+# decision is logged with its numbers so they can be tuned from real calls.
+# ENABLED=false restores START_SPEECH-as-barge-in outright.
+SARVAM_NOISE_GATE_ENABLED = _bool("SARVAM_NOISE_GATE_ENABLED", True)
+SARVAM_NOISE_GATE_MIN_MS = _int("SARVAM_NOISE_GATE_MIN_MS", 200)
+SARVAM_NOISE_GATE_MIN_RMS = _float("SARVAM_NOISE_GATE_MIN_RMS", 60.0)
+SARVAM_NOISE_GATE_SNR = _float("SARVAM_NOISE_GATE_SNR", 1.5)
 # The exact twin of OPENAI_TWOWAY_ENABLED, for the same reason and with the
 # same discipline: two-way does not go live on code review alone.
 SARVAM_TWOWAY_ENABLED = _bool("SARVAM_TWOWAY_ENABLED", False)
@@ -402,6 +414,14 @@ CONVERSATION_LLM_REASONING_EFFORT = _choice(
 # purpose: past this the answer is no longer worth having, because the lead has
 # already decided the line is dead.
 CONVERSATION_LLM_TIMEOUT_S = _float("CONVERSATION_LLM_TIMEOUT_S", 12.0)
+
+# A two-line English note per call — an outcome tag, then what the lead said
+# and asked for — written to calls.summary and mirrored to the Sheet's Notes
+# column (app/telephony/call_summary.py). Produced AFTER the outcome row is
+# written and never awaited by the call itself: a slow or failed summary
+# costs a blank note and nothing else.
+CALL_SUMMARY_ENABLED = _bool("CALL_SUMMARY_ENABLED", True)
+CALL_SUMMARY_TIMEOUT_S = _float("CALL_SUMMARY_TIMEOUT_S", 20.0)
 
 # How long to wait, after the lead's speech settles, before answering. Short —
 # it exists to absorb Sarvam's transcript and END_SPEECH signal arriving in

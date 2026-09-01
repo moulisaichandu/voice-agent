@@ -76,6 +76,29 @@ async def test_write_back_speaks_the_apps_script_protocol(monkeypatch):
     assert updated[0][1] == "done"
 
 
+async def test_the_sheet_notes_carry_the_post_call_note_when_there_is_one(monkeypatch):
+    """"Interested — asked the BDCP fee" is what the team reads; "2 turns"
+    was all the Notes column ever said for a Sarvam call."""
+    lead = _lead()
+    call = _script_call()
+    call.summary = "Interested — asked the BDCP fee, wants a callback."
+    _, updated = _patch_script_branch(monkeypatch, lead, call)
+
+    await writeback.write_back_lead(lead.lead_id)
+
+    assert updated[0][2] == "Interested — asked the BDCP fee, wants a callback."
+
+
+async def test_the_sheet_notes_fall_back_to_the_turn_count_without_a_note(monkeypatch):
+    lead = _lead()
+    call = _script_call()
+    _, updated = _patch_script_branch(monkeypatch, lead, call)
+
+    await writeback.write_back_lead(lead.lead_id)
+
+    assert updated[0][2] == "2 turns"
+
+
 async def test_a_failed_export_requests_a_retry_and_skips_the_status(monkeypatch):
     """Only the export's failure may request a retry: export_session appends
     blindly, so retrying after a SUCCESSFUL export would write the whole

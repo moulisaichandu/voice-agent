@@ -91,6 +91,26 @@ async def set_conversation_and_record(
     return _row_to_call(row) if row else None
 
 
+async def set_summary_for_latest_call(lead_id: UUID, summary: str) -> None:
+    """Attach a post-call note to this lead's newest call.
+
+    A separate statement from set_conversation_and_record on purpose: the
+    note comes from a model call the outcome row must never wait on, so it
+    lands a few seconds later. Same newest-call scoping as that function.
+    """
+    pool = await get_pool()
+    await pool.execute(
+        """
+        update calls set summary = $2
+        where call_id = (
+            select call_id from calls where lead_id = $1
+            order by created_at desc limit 1
+        )
+        """,
+        lead_id, summary,
+    )
+
+
 async def get_latest_call_for_lead(lead_id: UUID) -> Call | None:
     """Used by app/sheets/writeback.py — the most recent call attempt is what
     gets written back to the lead's Sheet row."""

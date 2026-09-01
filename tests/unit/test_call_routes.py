@@ -210,6 +210,93 @@ async def test_finalise_records_transcript_and_queues_writeback(redis, monkeypat
     assert redis.lists["sheets:writeback:queue"] == [str(lead.lead_id)]
 
 
+async def test_finalise_attaches_the_note_before_queueing_the_sheet(redis, monkeypatch):
+    """The Sheet's Notes column is written from calls.summary at write-back
+    time, so the note has to be on the row before the write-back is queued —
+    and the outcome row has to be there before the note (the note is a model
+    call the outcome never waits on)."""
+    lead = _lead()
+    campaign = SimpleNamespace(mode="twoway")
+    order = []
+
+    async def fake_record(**kwargs):
+        order.append("record")
+        return SimpleNamespace(**kwargs)
+
+    async def fake_mark(lead_id, status):
+        order.append("mark")
+
+    async def fake_summarize(transcript, *, one_way):
+        order.append(f"summarize(one_way={one_way})")
+        return "Interested — asked the BDCP fee, wants a callback."
+
+    async def fake_set_summary(lead_id, summary):
+        order.append(f"set_summary({summary})")
+
+    monkeypatch.setattr(call_routes.calls_db, "set_conversation_and_record", fake_record)
+    monkeypatch.setattr(call_routes.leads_db, "mark_result_if_calling", fake_mark)
+    monkeypatch.setattr(call_routes.call_summary, "summarize", fake_summarize)
+    monkeypatch.setattr(call_routes.calls_db, "set_summary_for_latest_call", fake_set_summary)
+
+    await call_routes._finalise_call(lead, {
+        "status": "done", "turns": 4, "transcript": [], "conversation_id": None,
+    }, campaign=campaign)
+
+    assert order == ["record", "mark", "summarize(one_way=False)",
+                     "set_summary(Interested — asked the BDCP fee, wants a callback.)"]
+    assert redis.lists["sheets:writeback:queue"] == [str(lead.lead_id)]
+
+
+async def test_a_one_way_campaign_is_summarised_as_one_way(redis, monkeypatch):
+    seen = {}
+
+    async def fake_record(**kwargs):
+        return SimpleNamespace(**kwargs)
+
+    async def fake_mark(lead_id, status):
+        pass
+
+    async def fake_summarize(transcript, *, one_way):
+        seen["one_way"] = one_way
+        return None
+
+    monkeypatch.setattr(call_routes.calls_db, "set_conversation_and_record", fake_record)
+    monkeypatch.setattr(call_routes.leads_db, "mark_result_if_calling", fake_mark)
+    monkeypatch.setattr(call_routes.call_summary, "summarize", fake_summarize)
+
+    await call_routes._finalise_call(lead := _lead(), {
+        "status": "done", "turns": 1, "transcript": [], "conversation_id": None,
+    }, campaign=SimpleNamespace(mode="oneway"))
+
+    assert seen == {"one_way": True}
+    assert redis.lists["sheets:writeback:queue"] == [str(lead.lead_id)]
+
+
+async def test_a_summary_failure_never_costs_the_outcome_or_the_sheet(redis, monkeypatch):
+    lead = _lead()
+    statuses = []
+
+    async def fake_record(**kwargs):
+        return SimpleNamespace(**kwargs)
+
+    async def fake_mark(lead_id, status):
+        statuses.append(status)
+
+    async def exploding_summarize(transcript, *, one_way):
+        raise RuntimeError("summariser bug")
+
+    monkeypatch.setattr(call_routes.calls_db, "set_conversation_and_record", fake_record)
+    monkeypatch.setattr(call_routes.leads_db, "mark_result_if_calling", fake_mark)
+    monkeypatch.setattr(call_routes.call_summary, "summarize", exploding_summarize)
+
+    await call_routes._finalise_call(lead, {
+        "status": "done", "turns": 3, "transcript": [], "conversation_id": None,
+    }, campaign=SimpleNamespace(mode="twoway"))
+
+    assert statuses == ["done"]
+    assert redis.lists["sheets:writeback:queue"] == [str(lead.lead_id)]
+
+
 async def test_finalise_marks_failed_when_the_bridge_did_not_complete(redis, monkeypatch):
     lead = _lead()
     statuses = []

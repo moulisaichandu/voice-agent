@@ -141,9 +141,12 @@ async def _write_back_via_script(lead, call) -> bool:
                 logger.warning(f"[sheets] could not record exported marker "
                                f"({type(exc).__name__}: {exc})")
 
+    # The post-call note when there is one — "Interested — asked the BDCP
+    # fee, wants a callback" is what the team reads; the turn count is the
+    # fallback for a call that produced no note.
     await apps_script.update_lead_status(
         phone=lead.phone_e164, status=call.status or "",
-        notes=f"{call.turns or 0} turns",
+        notes=call.summary or f"{call.turns or 0} turns",
     )
     return True
 

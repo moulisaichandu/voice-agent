@@ -65,6 +65,7 @@
       <li>1.6 Reading results</li>
       <li>1.7 Stopping</li>
       <li>1.8 Daily checklist</li>
+      <li>1.9 Five-minute demo</li>
     </ul>
   </li>
   <li>Part 2 — Build report (1 Sep 2026)
@@ -98,6 +99,15 @@
   <strong>After changing code, always rebuild</strong>
   <code>docker compose restart</code> and <code>--force-recreate</code> silently keep running the <i>old</i> image.
   Only <code>docker compose up -d --build</code> picks up code changes. Changes to <code>.env</code> do apply on a plain restart.
+</div>
+
+<div class="box warn">
+  <strong>If calls ring and drop the moment they are answered — the tunnel died</strong>
+  Cloudflare quick tunnels get torn down without warning; <code>cloudflared</code> stays "Up" serving a dead hostname, and Readiness shows
+  <i>"PUBLIC_BASE_URL … is unreachable (ConnectError)"</i> for every campaign at once. Fix:
+  <pre>docker compose restart cloudflared</pre>
+  That is all — the backend asks the tunnel for its new hostname by itself before every dial batch (happened 1 Sep, 19:35 IST; recovered this way).
+  The permanent fix is a <b>named</b> Cloudflare tunnel on your own domain (fixed hostname, needs a Cloudflare account): set <code>TUNNEL_TOKEN</code> and <code>PUBLIC_BASE_URL</code> in <code>.env</code>.
 </div>
 
 <p>Open the console and check the <b>Readiness</b> strip at the top of the home page. Every item must be green before you dial.
@@ -189,8 +199,9 @@ If dialable is 0 and imported is not, the consent columns are the reason.</p>
 
 <h3>1.6 Reading results</h3>
 <ul>
-  <li><b>Console → Calls</b>: the authoritative record. Transcript, duration, turns, outcome.</li>
-  <li><b>Sheet → Transcripts tab</b>: a copy of every transcript, written within 30 minutes of the call. The Leads tab's <code>Status</code> and <code>Notes</code> columns are updated for the matching phone number.</li>
+  <li><b>Console → Calls</b>: the authoritative record. Transcript, duration, turns, outcome, and the <b>Summary</b> — an outcome tag plus what the lead said, e.g. <i>"Interested — asked the BDCP fee, wants batch timings."</i></li>
+  <li><b>Sheet → Transcripts tab</b>: a copy of every transcript, written within 30 minutes of the call. On the Leads tab, <code>Status</code> becomes the call result and <code>Notes</code> becomes that same summary, for the matching phone number.</li>
+  <li><b>Test on a handset, not a speakerphone in a room.</b> Background voices and echo trigger the recogniser; the noise gate now filters most of it, but a quiet handset is what a real lead sounds like.</li>
   <li><b>Test-call checklist</b> for a two-way Telugu call to your own number:
     <ol>
       <li>Say <span class="te">"ఓకే"</span> mid-conversation — the call must <b>continue</b>.</li>
@@ -215,6 +226,18 @@ If dialable is 0 and imported is not, the consent columns are the reason.</p>
   <li>Campaign active, script correct, mode correct.</li>
   <li>One test call to your own number before real leads.</li>
   <li>Check the log for <code>[compliance]</code> — any ERROR there is a <b>stop-dialling</b> event.</li>
+</ol>
+
+<h3>1.9 Five-minute demo</h3>
+<p>Two campaigns are ready and <b>inactive</b>, each with one lead (your own number, consent recorded):
+<b>Demo - Telugu two-way</b> and <b>Demo - Tinglish two-way</b>. Nothing dials until you switch one on.</p>
+<ol>
+  <li>Home page: Readiness strip all green.</li>
+  <li>Campaigns → <b>Demo - Telugu two-way</b> → toggle <b>Active</b> → <b>Dial now</b>. Your phone rings within seconds.</li>
+  <li>Answer on a handset. Say <span class="te">"ఓకే"</span> (the call continues), ask <span class="te">"కోర్సు ఫీజు ఎంత?"</span> (answered from the documents), say <span class="te">"బై"</span> (farewell, then hang-up).</li>
+  <li>Calls page: the row appears with duration, turns and the <b>Summary</b> line. Click through for the transcript.</li>
+  <li>Toggle the campaign <b>Inactive</b> again. Repeat with the Tinglish one to hear the difference: <i>course fees, batch timings, placement</i> in English.</li>
+  <li>Settings: Sheets sync status — shows what the Sheet integration reports (needs the <code>Leads</code> tab, §1.2).</li>
 </ol>
 
 <!-- ═══════════════════════════════════════════════════════════════════════ -->
@@ -271,6 +294,10 @@ If dialable is 0 and imported is not, the consent columns are the reason.</p>
       <td><code>app/languages.py</code>, <code>app/telephony/sarvam_prompts.py</code></td></tr>
   <tr><td>15</td><td><b>A Tinglish opening.</b> Scriptless two-way calls had one Telugu constant for both registers. <code>DEFAULT_TWOWAY_TINGLISH</code> keeps the identical disclosure sentence (<span class="te">ఆటోమేటెడ్ కాల్</span>, never a Latin "AI") and then <i>"మా digital marketing courses గురించి… Course fees, batch timings, placement…"</i>. Chosen per call by <code>default_twoway_opening()</code>.</td>
       <td><code>sarvam_prompts.py</code>, <code>sarvam_bridge.py</code></td></tr>
+  <tr><td>17</td><td><b>Noise gate on the lead's audio.</b> Sarvam's "speech started" signal fires on <i>any</i> sound and was the agent's only interrupt signal, so a cough, a TV or a second person cut the agent off mid-sentence exactly like the lead's voice, and the recogniser even produced fake sentences from room noise. A "speech started" now counts only after 200 ms of audio at ≥ 1.5× the quiet level measured just before it (never below an absolute minimum); a transcript from a sound the gate <i>measured</i> as non-speech is dropped, but anything it could not measure passes through — ignoring a real lead is the worse failure. Every decision is logged as <code>noise gate:</code> with its numbers; all thresholds are <code>.env</code> knobs; <code>SARVAM_NOISE_GATE_ENABLED=false</code> restores the old behaviour. Real interruptions now land ~200 ms later.</td>
+      <td><code>app/telephony/sarvam_stt.py</code>, <code>app/config.py</code></td></tr>
+  <tr><td>18</td><td><b>A summary for every call.</b> Sarvam calls never had one — the console's Summary column was blank and the Sheet's Notes said "N turns". After each call the model now writes a two-line English note from the transcript: an outcome tag (<i>Interested / Not interested / Callback / No answer / Unclear</i>) and what the lead asked or said, e.g. <i>"Callback — asked the BDCP fee (₹50,000), wants a call tomorrow."</i> Written after the call outcome, never delaying it; a one-way call gets "One-way message delivered."; it uses only the transcript and is told never to invent a fact or price.</td>
+      <td><code>app/telephony/call_summary.py</code>, <code>call_routes.py</code>, <code>sheets/writeback.py</code></td></tr>
   <tr><td>16</td><td><b>Tests on the real catalogue text.</b> The Sarvam prompt tests had used hand-written placeholder styles, which is why the contradiction survived. 15 new tests use <code>languages.style("tinglish")</code> / <code>("te")</code> directly and assert each register's prompt is internally consistent.</td>
       <td><code>tests/unit/test_sarvam_prompts.py</code>, <code>test_sarvam_bridge.py</code>, <code>test_languages.py</code></td></tr>
 </table>
@@ -295,7 +322,7 @@ If dialable is 0 and imported is not, the consent columns are the reason.</p>
 
 <h3>2.3 How it was verified</h3>
 <ul>
-  <li><b>1,196 unit tests pass</b>, <code>ruff</code> clean. Every change above has a test that fails without it.</li>
+  <li><b>1,224 unit tests and 40 integration tests pass</b> (the integration suite ran against the separate <code>voiceagent_test</code> database), <code>ruff</code> clean. Every change above has a test that fails without it.</li>
   <li>Danda bug: proven with the exact deployed regex — <span class="te">ఉన్నాయి।</span>, <span class="te">ఉంటుంది॥</span>, <span class="te">ఫీజు…</span> all DROPPED before, all kept after; Armenian and Hindi still dropped.</li>
   <li>Manual sync exercised live against the backend: <code>{"synced":0,"received":0,"dialable":0,"error":null}</code> — correct until the tab exists.</li>
   <li>Console container exercised live: serves the page and proxies to the backend with auth through the compose network.</li>
@@ -308,7 +335,7 @@ If dialable is 0 and imported is not, the consent columns are the reason.</p>
 <h3>2.4 What remains</h3>
 <table>
   <tr><th style="width:26%">Item</th><th>Plan</th></tr>
-  <tr><td><b>Background-speech hallucination</b></td><td>Found on the Tinglish test call (two people in the room): Sarvam's STT produced three long, meaningless "lead" utterances before the real question, while its own audio-health line reported <code>speech_rms=0.0</code> — no speech energy in that window. The agent began replying to each and was interrupted by the next, costing about ten seconds before the real question was answered. Next fix: refuse a transcript whose audio window carried no speech energy. Real leads on a quiet phone are unaffected; a speakerphone in a busy room is the risk.</td></tr>
+  <tr><td><b>Noise gate — tune from real calls</b></td><td>Built (row 17) from the numbers of one call. On the next noisy test, search the log for <code>noise gate:</code>. If the agent ignores a soft-spoken lead, lower <code>SARVAM_NOISE_GATE_SNR</code> (1.5 → 1.2) or <code>SARVAM_NOISE_GATE_MIN_RMS</code>; if room sound still interrupts, raise them. The audio-health lines now end with <code>gate=pass|noise|unmeasured</code> per utterance.</td></tr>
   <tr><td><b>Latency</b></td><td>The LLM is the wait. Next steps in order of value: trim the system prompt and course digest, then cache answers to the handful of repeated questions (fees, duration, timings). Sentence-by-sentence streaming was built and removed twice — it breaks the one-turn-at-a-time invariant the barge-in handling depends on.</td></tr>
   <tr><td><b>Document gaps</b></td><td>Demo classes, batch timings and eligibility are not in the three ingested documents, so the agent promises a callback. Add them and re-run <code>scripts/ingest_docs.py</code>. Also: the BDCP document says "3 Months. Includes a 4 Months Internship" — a data error in the source.</td></tr>
   <tr><td><b>Second test number</b></td><td>Gayathri's number (+91 77299 74373) was dialled twice at 16:21 and 16:28 IST and rang out both times (<code>NO_ANSWER</code>); the lead is back to <code>pending</code> and has used its 2 attempts. If that was the team lead's phone, re-add the lead or raise the campaign's max attempts.</td></tr>
@@ -320,6 +347,8 @@ If dialable is 0 and imported is not, the consent columns are the reason.</p>
   <tr><td><b>Public Sheet endpoint</b></td><td>The Apps Script <code>/exec</code> URL accepts writes from anyone who has it — no token is set on either side. Before the Sheet holds a real lead list, set a <code>SHEETS_TOKEN</code> script property and the matching <code>.env</code> value.</td></tr>
   <tr><td><b>Calling hours open 24h</b></td><td>Owner's decision, 22 July 2026. Regulatory exposure attaches to the Plivo number. One-line revert.</td></tr>
   <tr><td><b>Nothing committed</b></td><td>All of today's changes are in the working tree, uncommitted, on branch <code>dev1</code>. Commit when you are satisfied with the live test.</td></tr>
+  <tr><td><b>ElevenLabs billing is past due</b></td><td>Readiness reports the ElevenLabs account as <code>past_due</code>: no English, Hindi or Hinglish call can run until the subscription is paid. Telugu and Tinglish run on Sarvam and are unaffected.</td></tr>
+  <tr><td><b>Test campaigns retired</b></td><td>All 16 test campaigns were deactivated on 1 Sep evening (leads and call history kept; visible under "Include inactive"). Only the two inactive demo campaigns remain listed, so nothing can dial by accident.</td></tr>
   <tr><td><b>212 stale test campaigns</b></td><td>The database holds 212 <code>auto</code>-language campaigns from earlier testing. Harmless, but they clutter the console. Deactivate or delete when convenient.</td></tr>
 </table>
 

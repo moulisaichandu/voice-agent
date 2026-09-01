@@ -34,7 +34,13 @@ from app.db import campaigns as campaigns_db
 from app.db import leads as leads_db
 from app.db.models import Campaign, Lead
 from app.telephony import bridge as bridge_module
-from app.telephony import openai_bridge, plivo_client, plivo_stream, sarvam_bridge
+from app.telephony import (
+    call_summary,
+    openai_bridge,
+    plivo_client,
+    plivo_stream,
+    sarvam_bridge,
+)
 from app.telephony import worker as telephony_worker
 
 router = APIRouter(tags=["Telephony"])
@@ -488,6 +494,21 @@ async def _finalise_call(lead, outcome: dict, *, campaign=None) -> None:
         logger.exception(f"[calls] could not record outcome for lead "
                          f"{lead.lead_id}: {type(exc).__name__}: {exc}")
         return
+
+    # The two-line note the team reads — AFTER the outcome row, BEFORE the
+    # Sheet write-back is queued so the Notes column carries it. Bounded by
+    # CALL_SUMMARY_TIMEOUT_S inside summarize(), which never raises; a slow
+    # or failed summary costs a blank note and nothing else.
+    try:
+        note = await call_summary.summarize(
+            outcome.get("transcript") or [],
+            one_way=(campaign.mode == "oneway") if campaign is not None else None,
+        )
+        if note:
+            await calls_db.set_summary_for_latest_call(lead.lead_id, note)
+    except Exception as exc:  # noqa: BLE001 - a note must never cost the call
+        logger.warning(f"[calls] could not attach a summary for lead "
+                       f"{lead.lead_id}: {type(exc).__name__}: {exc}")
 
     try:
         if not _spoken_disclosure_ok(outcome):

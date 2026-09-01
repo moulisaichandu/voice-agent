@@ -18,6 +18,7 @@ Two things here are load-bearing beyond "does it parse JSON":
 import asyncio
 import base64
 import json
+import logging
 
 import pytest
 
@@ -721,3 +722,241 @@ async def test_a_normal_close_ends_the_stream_without_raising(connected, monkeyp
         heard = [e async for e in stt.events()]
 
     assert [e.text for e in heard] == ["సరే"]
+
+
+# ── the noise gate ───────────────────────────────────────────────────────────
+#
+# Live 2026-09-01, two people on a speakerphone: Sarvam's VAD fired
+# START_SPEECH on room sound, which is the bridge's only barge-in signal, so
+# the agent was cut off mid-sentence by noise exactly as it would be by the
+# lead; and the recogniser produced three long meaningless transcripts before
+# the lead's real question. The energy already measured for the audio-health
+# line separated the two cleanly on that call (speech 2.6-4.7x the floor,
+# noise 0.1-0.2x). These tests drive the socket message by message and feed
+# audio in between, which is the only way to exercise a gate that decides on
+# the audio path and delivers on the event path.
+
+class _LiveSTTWS:
+    """A socket the test drives one message at a time."""
+
+    def __init__(self):
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self.sent: list[str] = []
+
+    def push(self, message: str) -> None:
+        self._queue.put_nowait(message)
+
+    async def send(self, payload):
+        self.sent.append(payload)
+
+    async def close(self):
+        pass
+
+    def __aiter__(self):
+        async def _gen():
+            while True:
+                yield await self._queue.get()
+        return _gen()
+
+
+def _frame(amplitude: int, samples: int = 160) -> str:
+    """One 20 ms Plivo frame whose PCM has RMS == amplitude (a square wave),
+    base64 mu-law like the real inbound leg."""
+    pcm = b"".join(
+        (amplitude if i % 2 else -amplitude).to_bytes(2, "little", signed=True)
+        for i in range(samples)
+    )
+    return base64.b64encode(ulaw.encode(pcm)).decode()
+
+
+async def _settle():
+    for _ in range(3):
+        await asyncio.sleep(0.005)
+
+
+@pytest.fixture
+def gated(connected, monkeypatch, caplog):
+    """A connected client with the gate ON (conftest pins it off for every
+    other test, because the bridge tests drive VAD signals with no audio).
+    The gate reports at INFO, so capture is raised here rather than relying
+    on an earlier test having done it — that made these order-dependent."""
+    caplog.set_level(logging.INFO, logger="app.telephony.sarvam_stt")
+    monkeypatch.setattr(sarvam_stt, "SARVAM_NOISE_GATE_ENABLED", True)
+    monkeypatch.setattr(sarvam_stt, "SARVAM_NOISE_GATE_MIN_RMS", 60.0)
+    monkeypatch.setattr(sarvam_stt, "SARVAM_NOISE_GATE_SNR", 1.5)
+    monkeypatch.setattr(sarvam_stt, "SARVAM_NOISE_GATE_MIN_MS", 200)
+    ws = _LiveSTTWS()
+    connected(ws)
+    return ws
+
+
+async def _pump(stt, got: list):
+    async for event in stt.events():
+        got.append(event.kind if event.kind != "transcript" else f"transcript:{event.text}")
+
+
+async def test_a_sound_below_speech_energy_is_never_a_barge_in(gated, caplog):
+    """The complaint itself: 'when the lead is talking and any sound comes,
+    the agent is disturbed and diverted'. Room sound at a fifth of the floor
+    must not reach the bridge as speech_started."""
+    got: list = []
+    async with sarvam_stt.SarvamSTT(lead_id="L") as stt:
+        pump = asyncio.ensure_future(_pump(stt, got))
+        for _ in range(20):                       # the quiet stretch: floor ~ 400
+            await stt.send_audio(_frame(400))
+        gated.push(_vad("START_SPEECH"))
+        await _settle()
+        for _ in range(15):                       # 300 ms of sound at 0.2x the floor
+            await stt.send_audio(_frame(80))
+        gated.push(_vad("END_SPEECH"))
+        await _settle()
+        pump.cancel()
+
+    assert "speech_started" not in got, got
+    assert got == ["speech_ended"], got
+    assert "noise gate: ignored a sound with no speech energy" in caplog.text
+    assert "gate=noise" in caplog.text
+
+
+async def test_the_lead_speaking_over_a_quiet_line_still_barges_in(gated):
+    """Speech well above the floor is confirmed on the audio path and
+    delivered before END_SPEECH — the interruption still works, just ~200 ms
+    later."""
+    got: list = []
+    async with sarvam_stt.SarvamSTT(lead_id="L") as stt:
+        pump = asyncio.ensure_future(_pump(stt, got))
+        for _ in range(20):
+            await stt.send_audio(_frame(40))
+        gated.push(_vad("START_SPEECH"))
+        await _settle()
+        assert got == [], "START_SPEECH was passed through before any audio confirmed it"
+        for _ in range(12):                       # 240 ms at 20x the floor
+            await stt.send_audio(_frame(800))
+        await _settle()
+        assert got == ["speech_started"], got
+        gated.push(_vad("END_SPEECH"))
+        gated.push(_transcript("ఫీజు ఎంత?"))
+        await _settle()
+        pump.cancel()
+
+    assert got == ["speech_started", "speech_ended", "transcript:ఫీజు ఎంత?"], got
+
+
+async def test_a_sound_barely_above_a_loud_room_is_not_the_lead(gated):
+    """The ratio, not just the absolute level: in a loud room (floor 500) a
+    sound at 600 is 1.2x — more room, not a person. At 1.8x it is."""
+    got: list = []
+    async with sarvam_stt.SarvamSTT(lead_id="L") as stt:
+        pump = asyncio.ensure_future(_pump(stt, got))
+        for _ in range(20):
+            await stt.send_audio(_frame(500))
+        gated.push(_vad("START_SPEECH"))
+        await _settle()
+        for _ in range(15):
+            await stt.send_audio(_frame(600))
+        await _settle()
+        assert got == [], f"1.2x the floor was treated as speech: {got}"
+        gated.push(_vad("END_SPEECH"))
+        await _settle()
+        # next utterance: 1.8x the (new) floor
+        for _ in range(20):
+            await stt.send_audio(_frame(500))
+        gated.push(_vad("START_SPEECH"))
+        await _settle()
+        for _ in range(12):
+            await stt.send_audio(_frame(900))
+        await _settle()
+        pump.cancel()
+
+    assert got == ["speech_ended", "speech_started"], got
+
+
+async def test_a_transcript_from_a_measured_non_speech_sound_is_dropped(gated, caplog):
+    """The three fake sentences of 2026-09-01. Sarvam transcribes what the
+    gate measured as noise; the bridge must never see it."""
+    got: list = []
+    async with sarvam_stt.SarvamSTT(lead_id="L") as stt:
+        pump = asyncio.ensure_future(_pump(stt, got))
+        for _ in range(20):
+            await stt.send_audio(_frame(400))
+        gated.push(_vad("START_SPEECH"))
+        await _settle()
+        for _ in range(15):
+            await stt.send_audio(_frame(80))
+        gated.push(_vad("END_SPEECH"))
+        await _settle()
+        gated.push(_transcript("క్యాప్ లాక్ పెట్టుకోండి"))
+        await _settle()
+        pump.cancel()
+
+    assert not any(e.startswith("transcript:") for e in got), got
+    assert "noise gate: dropped transcript 'క్యాప్ లాక్ పెట్టుకోండి'" in caplog.text
+
+
+async def test_a_transcript_the_gate_could_not_measure_passes_through(gated, caplog):
+    """Only what was MEASURED and failed is dropped. An utterance too short
+    to judge, or one with no START_SPEECH at all, is passed to the bridge —
+    ignoring a real lead is the worse failure."""
+    got: list = []
+    async with sarvam_stt.SarvamSTT(lead_id="L") as stt:
+        pump = asyncio.ensure_future(_pump(stt, got))
+        for _ in range(20):
+            await stt.send_audio(_frame(400))
+        gated.push(_vad("START_SPEECH"))
+        await _settle()
+        for _ in range(3):                        # 60 ms: under the 200 ms window
+            await stt.send_audio(_frame(80))
+        gated.push(_vad("END_SPEECH"))
+        gated.push(_transcript("ఓకే"))
+        await _settle()
+        gated.push(_transcript("హలో"))            # bare: no START/END of its own
+        await _settle()
+        pump.cancel()
+
+    assert "transcript:ఓకే" in got, got
+    assert "transcript:హలో" in got, got
+    assert "gate=unmeasured" in caplog.text
+    assert "dropped transcript" not in caplog.text
+
+
+async def test_a_confirmed_utterance_keeps_its_transcript(gated):
+    got: list = []
+    async with sarvam_stt.SarvamSTT(lead_id="L") as stt:
+        pump = asyncio.ensure_future(_pump(stt, got))
+        gated.push(_vad("START_SPEECH"))
+        await _settle()
+        for _ in range(12):
+            await stt.send_audio(_frame(800))
+        gated.push(_vad("END_SPEECH"))
+        gated.push(_transcript("డిజిటల్ మార్కెటింగ్ లో ఏమేమి కోర్సెస్ ఉన్నాయి?"))
+        await _settle()
+        pump.cancel()
+
+    assert got[-1] == "transcript:డిజిటల్ మార్కెటింగ్ లో ఏమేమి కోర్సెస్ ఉన్నాయి?", got
+
+
+async def test_the_gate_off_is_exactly_the_old_behaviour(connected, monkeypatch):
+    """SARVAM_NOISE_GATE_ENABLED=false must restore START_SPEECH-as-barge-in
+    with no audio needed, so the switch is a real rollback."""
+    monkeypatch.setattr(sarvam_stt, "SARVAM_NOISE_GATE_ENABLED", False)
+    ws = _LiveSTTWS()
+    connected(ws)
+    got: list = []
+    async with sarvam_stt.SarvamSTT() as stt:
+        pump = asyncio.ensure_future(_pump(stt, got))
+        ws.push(_vad("START_SPEECH"))
+        ws.push(_vad("END_SPEECH"))
+        ws.push(_transcript("ఓకే"))
+        await _settle()
+        pump.cancel()
+
+    assert got == ["speech_started", "speech_ended", "transcript:ఓకే"], got
+
+
+def test_the_threshold_never_drops_below_the_absolute_floor(monkeypatch):
+    """A dead-quiet line (floor 5) must not make a 10-RMS hiss count as
+    speech: the absolute minimum wins over the ratio."""
+    monkeypatch.setattr(sarvam_stt, "SARVAM_NOISE_GATE_MIN_RMS", 60.0)
+    monkeypatch.setattr(sarvam_stt, "SARVAM_NOISE_GATE_SNR", 1.5)
+    assert sarvam_stt._gate_threshold(5.0) == 60.0
+    assert sarvam_stt._gate_threshold(400.0) == 600.0

@@ -337,8 +337,15 @@ def _token_budget_param(model: str) -> str:
     return "max_tokens"
 
 
-async def turn(messages: list[dict]) -> LLMReply:
+async def turn(messages: list[dict], *, tools: list[dict] | None = None,
+               temperature: float = 0.6) -> LLMReply:
     """One conversational turn: what to say next, or which tools to run first.
+
+    *tools* defaults to the conversation's own (TOOLS); pass an empty list
+    for a request that must simply answer — call_summary.py's post-call note
+    — so the model is never offered end_call or a course lookup it has no
+    business calling. *temperature* likewise: 0.6 suits conversation, a
+    summary wants less invention.
 
     Deliberately not cached, unlike sarvam_llm.render(). That cache is keyed on
     a script's content and works because one script renders identically for
@@ -361,21 +368,24 @@ async def turn(messages: list[dict]) -> LLMReply:
             "anything without it."
         )
 
+    if tools is None:
+        tools = TOOLS
     payload = {
         "model": model,
         "messages": messages,
-        "tools": TOOLS,
-        "tool_choice": "auto",
-        # Higher than render()'s: this is conversation, where identical
-        # phrasing every time sounds robotic, not a translation with one right
-        # answer.
-        "temperature": 0.6,
+        # Higher than render()'s by default: this is conversation, where
+        # identical phrasing every time sounds robotic, not a translation with
+        # one right answer.
+        "temperature": temperature,
         # Harmless on OpenAI, where a conversational reply is a few dozen
         # tokens. Load-bearing if CONVERSATION_LLM_PROVIDER is flipped back to
         # sarvam: its default budget is 2048 and its reasoning eats all of it,
         # returning content=null — see sarvam_llm._MAX_TOKENS.
         _token_budget_param(model): 4096,
     }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
     # The configured live model is a GPT-5 family model. Its default reasoning
     # budget is designed for difficult tasks, not a short voice turn, and the
     # extra reasoning is heard as dead air. Keep this provider/model-gated so

@@ -51,6 +51,15 @@ os.environ["SCHEDULER_ENABLED"] = "false"
 # flag on explicitly (the two_way fixture does).
 os.environ["SARVAM_TWOWAY_ENABLED"] = "false"
 os.environ["OPENAI_TWOWAY_ENABLED"] = "false"
+# The STT noise gate holds START_SPEECH until AUDIO confirms it, and the
+# bridge tests drive VAD signals with no audio at all — with the gate on, no
+# barge-in test could ever see speech_started. Pinned off here; the gate's
+# own tests in test_sarvam_stt.py switch it on and feed real frames.
+os.environ["SARVAM_NOISE_GATE_ENABLED"] = "false"
+# The post-call summary reaches for the conversation model and then the
+# database. Off for the suite so _finalise_call's existing tests stay pure;
+# test_call_summary.py and the call-route summary tests switch it on.
+os.environ["CALL_SUMMARY_ENABLED"] = "false"
 # Same reasoning as SCHEDULER_ENABLED: a handful of unit tests boot the real
 # app via TestClient (test_health.py, test_startup_checks.py, ...). If a real
 # local Redis happens to be reachable, an enabled worker would start a

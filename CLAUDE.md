@@ -153,6 +153,17 @@ the only transcoding anywhere in the project. It is pure-Python on purpose —
   nobody heard, and the agent starts referring back to things it never said.
   A partly-played sentence is DROPPED, not kept — under-claiming makes the
   agent repeat itself, over-claiming makes it incoherent.
+  - **START_SPEECH is gated on audio energy before it becomes a barge-in.**
+    Sarvam's VAD fires on any sound, and on a speakerphone in a room (live
+    2026-09-01) that cut the agent off mid-sentence and produced fake
+    transcripts. `sarvam_stt.py`'s noise gate passes a START through only
+    after `SARVAM_NOISE_GATE_MIN_MS` of audio at ≥ `SARVAM_NOISE_GATE_SNR` ×
+    the floor measured just before it, and drops a transcript only when its
+    sound was MEASURED and failed — anything unmeasured passes, because
+    ignoring a real lead is the worse failure. It lives entirely in the STT
+    client so the bridge's event contract is unchanged; the bridge tests run
+    with it OFF (conftest) because they drive VAD signals with no audio.
+    `SARVAM_NOISE_GATE_ENABLED=false` is the one-line rollback.
 - **Nothing relies on the model calling `end_call`.** Measured against the live
   API: instructed to say goodbye and end the call, it says the goodbye and does
   not call the tool — 0/3, even when told to do it in that exact turn; the best

@@ -35,6 +35,7 @@ TWO THINGS HERE ARE LOAD-BEARING.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import json
@@ -50,6 +51,10 @@ from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
 
 from app.config import (
     SARVAM_API_KEY,
+    SARVAM_NOISE_GATE_ENABLED,
+    SARVAM_NOISE_GATE_MIN_MS,
+    SARVAM_NOISE_GATE_MIN_RMS,
+    SARVAM_NOISE_GATE_SNR,
     SARVAM_STT_LANGUAGE,
     SARVAM_STT_MODEL,
     SARVAM_VAD_HIGH_SENSITIVITY,
@@ -140,6 +145,66 @@ def _rms(sumsq: int, count: int) -> float:
     return (sumsq / count) ** 0.5 if count else 0.0
 
 
+# ── the noise gate ──────────────────────────────────────────────────────────
+#
+# Sarvam's VAD fires START_SPEECH on ANY sound, and START_SPEECH is the
+# bridge's only barge-in signal — so a cough, a television, or a second person
+# in the room stopped the agent mid-sentence exactly as the lead's own voice
+# would. Live 2026-09-01 (two people on a speakerphone): the recogniser also
+# produced three long, meaningless transcripts before the lead's real question,
+# and the agent spent ten seconds starting and abandoning replies to them.
+#
+# The energy already measured here for the audio-health line separates the
+# two cleanly on that call. Per utterance, speech RMS against the RMS of the
+# quiet stretch before it (the "floor"):
+#
+#     the lead's question   3471.6  vs floor 739.7   (4.7x)   speech
+#     a soft reply           155.9  vs floor  59.8   (2.6x)   speech
+#     another                178.4  vs floor  38.5   (4.6x)   speech
+#     room sound              86.1  vs floor 469.5   (0.2x)   noise
+#     room sound               9.0  vs floor  93.4   (0.1x)   noise
+#
+# So: a START_SPEECH is passed to the bridge only once SARVAM_NOISE_GATE_MIN_MS
+# of audio has arrived at an RMS of at least SARVAM_NOISE_GATE_SNR times the
+# floor (and never below SARVAM_NOISE_GATE_MIN_RMS, which is near-silence). A
+# real interruption therefore lands about that many milliseconds later; a
+# sound that never reaches the bar is never a barge-in at all. A transcript is
+# dropped only when its utterance was MEASURED and failed — anything the gate
+# could not measure passes through, because ignoring a real lead is the worse
+# failure. Every decision is logged with its numbers so the thresholds can be
+# tuned from real calls, and SARVAM_NOISE_GATE_ENABLED=false restores the old
+# behaviour outright.
+#
+# This is deliberately a gate, not a noise canceller: nothing here cleans the
+# audio (there is no DSP library in the image, and Sarvam's model is trained
+# on telephony noise anyway). It decides what counts as the lead speaking.
+
+_SAMPLE_RATE = 8000
+# How long a verdict on an ended utterance stays attributable to a transcript
+# that arrives after it. END_SPEECH-to-transcript measured 0-1.2 s live; after
+# this a late transcript is judged unmeasured, i.e. passed through.
+_VERDICT_TTL_S = 3.0
+
+
+def _gate_min_samples() -> int:
+    return max(1, SARVAM_NOISE_GATE_MIN_MS * _SAMPLE_RATE // 1000)
+
+
+def _gate_threshold(floor_rms: float) -> float:
+    return max(SARVAM_NOISE_GATE_MIN_RMS, floor_rms * SARVAM_NOISE_GATE_SNR)
+
+
+@dataclass(frozen=True)
+class _Verdict:
+    """What the gate concluded about the utterance that just ended."""
+
+    measured: bool
+    passed: bool
+    rms: float
+    floor: float
+    at: float
+
+
 class SarvamSTT:
     """One STT socket for the life of a call.
 
@@ -161,6 +226,15 @@ class SarvamSTT:
         self._last_frame_at: float | None = None
         self._frame_gap_max_ms = 0.0
         self._frame_count = 0
+        # Noise-gate state — see the block above _gate_min_samples.
+        # Confirmations are decided on the audio path (send_audio) but
+        # delivered on the event path (events()), which is a different
+        # coroutine, so they cross through this queue.
+        self._gate_events: asyncio.Queue = asyncio.Queue()
+        self._start_pending = False      # START_SPEECH seen, energy not yet confirmed
+        self._utterance_passed = False   # this utterance's audio confirmed as speech
+        self._floor_rms = 0.0            # the quiet stretch before this utterance
+        self._last_verdict: _Verdict | None = None
 
     async def __aenter__(self) -> SarvamSTT:
         if not SARVAM_API_KEY:
@@ -235,6 +309,8 @@ class SarvamSTT:
         if self._speaking:
             self._speech_sumsq += sumsq
             self._speech_count += count
+            if self._start_pending:
+                self._confirm_if_speech()
         else:
             self._silence_sumsq += sumsq
             self._silence_count += count
@@ -246,7 +322,61 @@ class SarvamSTT:
         self._last_frame_at = now
         self._frame_count += 1
 
-    def _log_audio_health(self) -> None:
+    def _gate_enabled(self) -> bool:
+        return SARVAM_NOISE_GATE_ENABLED
+
+    def _confirm_if_speech(self) -> None:
+        """Pass the pending START_SPEECH through once enough audio has arrived
+        at speech energy. Runs on every frame while a START is pending, so the
+        confirmation lands the moment the running RMS crosses the bar."""
+        if self._speech_count < _gate_min_samples():
+            return
+        rms = _rms(self._speech_sumsq, self._speech_count)
+        if rms >= _gate_threshold(self._floor_rms):
+            self._start_pending = False
+            self._utterance_passed = True
+            self._gate_events.put_nowait(STTEvent("speech_started"))
+
+    def _close_utterance(self) -> str:
+        """Judge the utterance END_SPEECH just closed, remember the verdict
+        for the transcript that usually follows, and return the word for the
+        health line. A START that never reached the bar is dropped here
+        without ever having been a barge-in."""
+        measured = self._speech_count >= _gate_min_samples()
+        rms = _rms(self._speech_sumsq, self._speech_count)
+        threshold = _gate_threshold(self._floor_rms)
+        passed = self._utterance_passed or (measured and rms >= threshold)
+        self._last_verdict = _Verdict(measured, passed, rms, self._floor_rms,
+                                      time.monotonic())
+        if self._start_pending and measured and not passed:
+            logger.info(
+                f"[sarvam-stt] lead={self._lead_id} noise gate: ignored a "
+                f"sound with no speech energy (rms={rms:.1f} "
+                f"floor={self._floor_rms:.1f} need>={threshold:.1f})"
+            )
+        self._start_pending = False
+        return "pass" if passed else ("noise" if measured else "unmeasured")
+
+    def _transcript_is_noise(self) -> tuple[bool, str]:
+        """Whether the transcript that just arrived belongs to a sound the
+        gate MEASURED and rejected. Unmeasured is never noise: a wrongly
+        dropped word is the worse failure."""
+        if self._speaking:
+            # The utterance is still open — judge its live window.
+            if self._utterance_passed or self._speech_count < _gate_min_samples():
+                return False, ""
+            rms = _rms(self._speech_sumsq, self._speech_count)
+            threshold = _gate_threshold(self._floor_rms)
+            return rms < threshold, f"rms={rms:.1f} need>={threshold:.1f}"
+        verdict = self._last_verdict
+        if verdict is None or time.monotonic() - verdict.at > _VERDICT_TTL_S:
+            return False, ""
+        if not verdict.measured or verdict.passed:
+            return False, ""
+        return True, (f"rms={verdict.rms:.1f} "
+                      f"need>={_gate_threshold(verdict.floor):.1f}")
+
+    def _log_audio_health(self, gate: str = "") -> None:
         """One INFO line per utterance: what the audio actually looked like,
         from frames already decoded for Sarvam.
 
@@ -266,6 +396,7 @@ class SarvamSTT:
             f"silence_rms={silence_rms:.1f} speech_rms={speech_rms:.1f} "
             f"frame_gap_max_ms={self._frame_gap_max_ms:.1f} "
             f"frames={self._frame_count}"
+            + (f" gate={gate}" if gate else "")
         )
         self._silence_sumsq = 0
         self._silence_count = 0
@@ -296,8 +427,31 @@ class SarvamSTT:
         breaker could not fire however well it matched the wording, and all the
         bridge saw was a bare ConnectionClosed that says nothing about why.
         """
+        ws_iter = self._ws.__aiter__()
+        # Two sources, one consumer. The socket is pulled one message at a
+        # time (never ahead of the consumer, so a caller interleaving audio
+        # between events sees the same ordering it always has), and the gate's
+        # confirmations arrive from the audio path through _gate_events.
+        ws_next: asyncio.Future | None = None
+        gate_next: asyncio.Future | None = None
         try:
-            async for raw in self._ws:
+            while True:
+                if ws_next is None:
+                    ws_next = asyncio.ensure_future(ws_iter.__anext__())
+                if gate_next is None:
+                    gate_next = asyncio.ensure_future(self._gate_events.get())
+                done, _ = await asyncio.wait(
+                    {ws_next, gate_next}, return_when=asyncio.FIRST_COMPLETED)
+                if gate_next in done:
+                    # Checked FIRST: a speech_started confirmed just as the
+                    # END_SPEECH arrived must be delivered before its
+                    # speech_ended, or the bridge sees an end with no start.
+                    confirmed = gate_next.result()
+                    gate_next = None
+                    yield confirmed
+                    continue
+                raw = ws_next.result()
+                ws_next = None
                 try:
                     event = json.loads(raw)
                 except (ValueError, TypeError):
@@ -307,21 +461,41 @@ class SarvamSTT:
 
                 if etype == "data":
                     text = (data.get("transcript") or "").strip()
-                    if text:
+                    if not text:
                         # Sarvam emits empty transcripts for non-speech.
                         # Treating one as a turn would have the agent answer
                         # a cough.
-                        yield STTEvent("transcript", text)
+                        continue
+                    if self._gate_enabled():
+                        noise, detail = self._transcript_is_noise()
+                        if noise:
+                            logger.info(
+                                f"[sarvam-stt] lead={self._lead_id} noise gate: "
+                                f"dropped transcript {text!r} ({detail})"
+                            )
+                            continue
+                    yield STTEvent("transcript", text)
                 elif etype == "events":
                     signal = data.get("signal_type")
                     if signal == "START_SPEECH":
                         self._speaking = True
                         self._speech_sumsq = 0
                         self._speech_count = 0
-                        yield STTEvent("speech_started")
+                        self._utterance_passed = False
+                        self._last_verdict = None
+                        if self._gate_enabled():
+                            # Held until the audio confirms it — see
+                            # _confirm_if_speech. The floor is the quiet
+                            # stretch accumulated since the last END_SPEECH.
+                            self._floor_rms = _rms(self._silence_sumsq,
+                                                   self._silence_count)
+                            self._start_pending = True
+                        else:
+                            yield STTEvent("speech_started")
                     elif signal == "END_SPEECH":
                         self._speaking = False
-                        self._log_audio_health()
+                        gate = self._close_utterance() if self._gate_enabled() else ""
+                        self._log_audio_health(gate)
                         yield STTEvent("speech_ended")
                 elif etype == "error":
                     # 'message', not 'error'. Sarvam populates the former, so
@@ -337,6 +511,9 @@ class SarvamSTT:
                     if sarvam_circuit_breaker.looks_like_credits_exhausted(message):
                         await sarvam_circuit_breaker.trip(message)
                     return
+        except StopAsyncIteration:
+            # The socket's iterator ended without an exception — a tidy end.
+            return
         except ConnectionClosed as exc:
             reason = _close_reason(exc)
             credits = sarvam_circuit_breaker.looks_like_credits_exhausted(reason)
@@ -356,3 +533,7 @@ class SarvamSTT:
             # silence until the watchdog, billed for it, and the call is
             # recorded as a clean exit.
             raise
+        finally:
+            for pending in (ws_next, gate_next):
+                if pending is not None and not pending.done():
+                    pending.cancel()
