@@ -3479,3 +3479,79 @@ async def test_a_real_goodbye_ends_the_call_immediately(monkeypatch, farewell):
 
     assert _call.stop.is_set(), f"{farewell!r} should have ended the call"
     assert _call.exit_reason == "sarvam_end_call"
+
+
+# ── the line is not the lead ─────────────────────────────────────────────────
+
+@pytest.mark.parametrize("announcement", [
+    "ద పర్సన్ యు ఆర్ స్పీకింగ్ విత్ హస్ పుట్ యువర్ కాల్ ఆన్ హోల్డ్, ప్లీజ్ స్టే ఆన్ ద లైన్.",
+    "The person you are speaking with has put your call on hold, please stay on the line.",
+])
+async def test_a_hold_announcement_is_not_answered_and_does_not_end_the_call(
+        monkeypatch, announcement):
+    """Demo call 2026-09-01 21:00: the carrier's hold notice arrived as lead
+    speech, the model read it as the person leaving, said goodbye and hung
+    up while the lead was still on hold. The notice is kept in the
+    transcript (the operator should see the hold), kept from the model, and
+    answered by nobody."""
+    call, convo, turns = _failing_turn_convo()
+
+    async def never(history):
+        raise AssertionError("the model must never see a hold announcement")
+
+    monkeypatch.setattr(sarvam_bridge.conversation_llm, "turn", never)
+
+    await convo.on_lead_said(_CountingTTS(), announcement)
+
+    assert convo.reply_task is None, "a reply was started for the line's own voice"
+    assert all(m.get("role") != "user" for m in convo.history), (
+        "the announcement reached the model's history")
+    assert not call.stop.is_set(), "the call was ended on a hold notice"
+    assert turns[-1].role == "lead" and "హోల్డ్" in turns[-1].text or "hold" in turns[-1].text
+
+
+async def test_a_real_question_after_the_filter_is_still_answered(monkeypatch):
+    """The filter must be narrow: an ordinary question goes to the model
+    exactly as before."""
+    call, convo, turns = _failing_turn_convo()
+    started = []
+
+    async def fake_reply_when_they_stop(tts):
+        started.append(True)
+
+    monkeypatch.setattr(convo, "_reply_when_they_stop", fake_reply_when_they_stop)
+
+    await convo.on_lead_said(_CountingTTS(), "కోర్సు ఫీజు ఎంత?")
+
+    assert convo.history[-1] == {"role": "user", "content": "కోర్సు ఫీజు ఎంత?"}
+    await asyncio.sleep(0)
+    assert started, "an ordinary question was not answered"
+
+
+async def test_the_two_way_prompt_carries_the_telugu_name(two_way, monkeypatch):
+    """The greeting already spoke the transliterated name; the system prompt
+    was still given the English spelling, which the synthesiser cannot say —
+    so the model avoided the name altogether ("అవును గారు")."""
+    two_way([])
+
+    async def fake_telugu_name(name):
+        return "గాయత్రీ"
+
+    monkeypatch.setattr(sarvam_bridge.lead_name, "telugu_name", fake_telugu_name)
+    seen = {}
+    real = sarvam_bridge.sarvam_prompts.two_way_instructions
+
+    def capture(lead_name, script, **kwargs):
+        seen["lead_name"] = lead_name
+        return real(lead_name, script, **kwargs)
+
+    monkeypatch.setattr(sarvam_bridge.sarvam_prompts, "two_way_instructions", capture)
+
+    await asyncio.wait_for(
+        sarvam_bridge.bridge(_FakePlivoWS(), agent_id="x", lead_id="l",
+                             language="te", one_way=False,
+                             dynamic_variables={"lead_name": "Gayathri"}),
+        timeout=10,
+    )
+
+    assert seen["lead_name"] == "గాయత్రీ"

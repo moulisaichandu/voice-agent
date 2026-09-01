@@ -692,7 +692,24 @@ _STAY_ON_TOPIC_RULE = (
     "But a SHORT REPLY TO YOUR OWN QUESTION is never off-topic: if you just "
     "asked which course or which fee they want and they answer with a bare "
     "number like 25,000, a course code like BDLP, or a fragment, they are "
-    "ANSWERING you — treat it as naming that course and continue."
+    "ANSWERING you — treat it as naming that course and continue. "
+    "And garbled or mis-heard speech that still mentions courses, marketing, "
+    "fees, batches, classes or placement is ON topic — the speech-to-text on "
+    "this line is imperfect; never call such a question off-topic, answer the "
+    "closest sensible one or ask which they meant."
+)
+
+# Speech that reaches the model but was never said TO it. Live 2026-09-01:
+# a mid-call "హలో" was answered with a fresh greeting, and other people
+# talking near the phone were treated as questions. Carrier hold
+# announcements are filtered in code before the model sees them
+# (sarvam_bridge._is_hold_announcement); this covers what code cannot.
+_NOT_THE_LEAD_RULE = (
+    "Speech that is clearly not the lead talking to you — other people "
+    "talking in the background, a television, a recorded announcement — is "
+    "not a question: do not answer it and do not end the call because of it. "
+    "Reply only with a short check, addressing them by name, such as asking "
+    "whether they are still on the line, and wait."
 )
 
 # Sarvam's Telugu STT garbles heavily on 8 kHz phone audio: one live call
@@ -708,7 +725,8 @@ _UNCLEAR_INPUT_RULE = (
     "things, ask them politely to say it again — in Telugu, in one short "
     "sentence. NEVER treat unclear text as a question about something "
     "off-topic, and NEVER end the call because of it. Only unmistakable "
-    "words end a call."
+    "words end a call. "
+    + _NOT_THE_LEAD_RULE
 )
 _UNCLEAR_INPUT_RULE_MIXED = (
     "UNCLEAR SPEECH: The speech-to-text on this phone line is imperfect and "
@@ -717,7 +735,8 @@ _UNCLEAR_INPUT_RULE_MIXED = (
     "things, ask them politely to say it again — in the same natural mix of "
     "Telugu and everyday English, in one short sentence. NEVER treat unclear "
     "text as a question about something off-topic, and NEVER end the call "
-    "because of it. Only unmistakable words end a call."
+    "because of it. Only unmistakable words end a call. "
+    + _NOT_THE_LEAD_RULE
 )
 
 
@@ -780,6 +799,37 @@ _BREVITY_RULE = (
 )
 
 
+def _addressing(lead_name: str | None) -> str:
+    """How the model refers to the lead.
+
+    Live 2026-09-01, the team lead's test call: the prompt carried the name
+    in English letters, which the synthesiser cannot say, so the model
+    avoided it and produced a bare "అవును గారు" / "నమస్తే గారు" — polite, but
+    faceless, and the first thing a listener noticed. The bridge now passes
+    the name in Telugu script (the same one the greeting speaks), and the
+    rule asks for it by name: "మౌలి గారు", "గాయత్రీ గారు".
+
+    The mid-call greeting ban comes from the same call: the lead said "హలో"
+    to check the line and the agent started over with "నమస్తే గారు".
+    """
+    name = (lead_name or "").strip()
+    if not name:
+        return (
+            "You do not know the lead's name. Address them as గారు when you "
+            "need to, never as సార్ or మేడమ్. The greeting has already been "
+            "said; never greet again with నమస్తే or హలో mid-call, even if "
+            "they say హలో to check you are there — just carry on. "
+        )
+    return (
+        f"You are speaking with {name}. ADDRESSING: call them \"{name} గారు\" "
+        "— when you acknowledge what they said and when you ask them "
+        "something. Never a bare \"గారు\", \"సార్\" or \"మేడమ్\". Use the "
+        "name naturally, not in every sentence. The greeting has already been "
+        "said; never greet again with నమస్తే or హలో mid-call, even if they "
+        "say హలో to check you are there — just carry on. "
+    )
+
+
 def two_way_instructions(lead_name: str | None, script: str | None,
                          language_style: str | None = None,
                          course_facts: str | None = None) -> str:
@@ -794,7 +844,7 @@ def two_way_instructions(lead_name: str | None, script: str | None,
     makes the disclosure, the anti-Hindi rule or the verbatim-output rule less
     true — they are only easier to forget when writing a second prompt.
     """
-    who = f"You are speaking with {lead_name}. " if lead_name else ""
+    who = _addressing(lead_name)
     mixed = languages.is_code_mixed(language_style)
     parts = [
         "You are a voice assistant on an outbound phone call for Digital "

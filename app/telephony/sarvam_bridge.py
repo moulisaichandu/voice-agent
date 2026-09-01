@@ -228,6 +228,29 @@ _FALLBACK_HANDOFF = (
 _MAX_FAILED_TURNS = 3
 
 
+# Recorded announcements the CARRIER plays into the call — a hold notice, a
+# call-waiting voice — which Sarvam transcribes as if the lead had said
+# them. Live 2026-09-01 21:00: "the person you are speaking with has put your
+# call on hold, please stay on the line" arrived as lead speech, the model
+# read it as the person leaving, said goodbye and ended the call while the
+# lead was still on hold. These are not the lead: they stay in the transcript
+# (the operator should see the hold) but never reach history or the model,
+# and nothing is answered. Deliberately narrow — hold phrases only, in the
+# English and the Telugu-script spellings the STT produces. Voicemail
+# prompts are NOT here on purpose: on a voicemail the right outcome IS to end
+# the call, which the model already does.
+_HOLD_ANNOUNCEMENT_RE = re.compile(
+    r"(put\s+your\s+call\s+on\s+hold|call\s+on\s+hold|stay\s+on\s+the\s+line"
+    r"|please\s+hold|కాల్\s+ఆన్\s+హోల్డ్|ఆన్\s+హోల్డ్|స్టే\s+ఆన్\s+ద\s+లైన్"
+    r"|ప్లీజ్\s+హోల్డ్)",
+    re.IGNORECASE,
+)
+
+
+def _is_hold_announcement(text: str) -> bool:
+    return bool(_HOLD_ANNOUNCEMENT_RE.search(text))
+
+
 def _is_lead_goodbye(text: str) -> bool:
     """Whether a transcript is an explicit request to finish the call.
 
@@ -1067,6 +1090,12 @@ class _Conversation:
         text = sarvam_prompts.normalize_heard_telugu(text)
         text = term_repair.repair(text)
         self.turns.append(TranscriptTurn(role="lead", text=text))
+        if _is_hold_announcement(text):
+            # The line, not the lead. Recorded for the operator, kept from
+            # the model, answered by nobody — see _HOLD_ANNOUNCEMENT_RE.
+            logger.info(f"[sarvam] lead={self.lead_id} ignored a hold "
+                        f"announcement from the line: {text!r}")
+            return
         self.history.append({"role": "user", "content": text})
         if _is_lead_goodbye(text):
             # Do not ask the model to decide whether an explicit goodbye ends
@@ -1849,7 +1878,10 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
             await _run_two_way(
                 call, lead_id=lead_id, opening=spoken,
                 system_prompt=sarvam_prompts.two_way_instructions(
-                    variables.get("lead_name"),
+                    # The Telugu-script name the greeting speaks, so the
+                    # model can say it too — given the English spelling it
+                    # avoided the name and said a bare "గారు".
+                    spoken_name or variables.get("lead_name"),
                     variables.get("script"),
                     language_style=variables.get("language_style"),
                     course_facts=course_facts,

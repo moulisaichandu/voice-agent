@@ -877,3 +877,40 @@ def test_the_scriptless_opening_is_chosen_by_register():
     assert pick(languages.style("tinglish")) == sarvam_prompts.DEFAULT_TWOWAY_TINGLISH
     assert pick(languages.style("te")) == sarvam_prompts.DEFAULT_TWOWAY_TELUGU
     assert pick(None) == sarvam_prompts.DEFAULT_TWOWAY_TELUGU
+
+
+# ── the lead is a person with a name ─────────────────────────────────────────
+#
+# Team lead's test call, 2026-09-01 21:07: "అవును గారు", "నమస్తే గారు" — a bare
+# honorific every time, because the prompt carried the name in English
+# letters the synthesiser cannot say, so the model avoided it. The bridge now
+# passes the Telugu-script name and the prompt asks for it by name.
+
+def test_the_lead_is_addressed_by_name_and_garu():
+    prompt = sarvam_prompts.two_way_instructions(
+        "గాయత్రీ", None, language_style=languages.style("te"))
+
+    assert 'call them "గాయత్రీ గారు"' in prompt
+    assert 'never a bare "గారు"' in prompt.lower() or "Never a bare" in prompt
+    assert "never greet again" in prompt.lower(), (
+        "a mid-call హలో was answered with a fresh నమస్తే on the live call")
+
+
+def test_a_nameless_lead_is_still_never_sir_or_madam():
+    prompt = sarvam_prompts.two_way_instructions(
+        None, None, language_style=languages.style("te"))
+
+    assert "You do not know the lead's name" in prompt
+    assert "సార్" in prompt and "మేడమ్" in prompt
+
+
+@pytest.mark.parametrize("token", ["te", "tinglish"])
+def test_background_speech_and_garbled_course_questions_are_covered(token):
+    """Two things the team lead heard as 'deviating to noise': other people
+    near the phone being answered as if they were the lead, and a garbled
+    on-topic question refused as off-topic."""
+    prompt = sarvam_prompts.two_way_instructions(
+        "మౌలి", None, language_style=languages.style(token))
+
+    assert "recorded announcement" in prompt
+    assert "never call such a question off-topic" in prompt
