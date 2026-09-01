@@ -20,7 +20,7 @@ from app import config as app_config
 from app import languages as languages_module
 from app.db import campaigns as campaigns_db
 from app.db.models import Campaign, CampaignLanguage
-from app.telephony import sarvam_llm, sarvam_prompts
+from app.telephony import sarvam_llm
 from app.telephony.elevenlabs_client import agent_language_support
 
 router = APIRouter()
@@ -275,12 +275,15 @@ async def _warm_rendered_script(campaign: Campaign) -> None:
     """
     script = (campaign.script or "").strip()
     if not script:
-        if campaign.mode != "twoway":
-            return
-        # A two-way campaign needs no script and the bridge falls back to
-        # DEFAULT_TWOWAY_SCRIPT, so warming only campaign.script warmed nothing
-        # at all for the commonest two-way case.
-        script = sarvam_prompts.DEFAULT_TWOWAY_SCRIPT
+        # NOTHING to warm. A scriptless two-way call speaks
+        # sarvam_prompts.DEFAULT_TWOWAY_TELUGU — a constant — and never calls
+        # the renderer at all (see sarvam_bridge). Warming
+        # DEFAULT_TWOWAY_SCRIPT anyway cost ~93s of Sarvam reasoning per
+        # campaign, the credits for it, and — observed live 2026-08-31,
+        # seconds after a campaign was created — a FALSE "[compliance] the
+        # rendered Telugu did not disclose" warning, from a render nothing
+        # would ever read. That warning has to stay rare enough to believe.
+        return
     if languages_module.backend_for(campaign.language) != languages_module.SARVAM:
         # ElevenLabs renders nothing and OpenAI Realtime renders as it speaks.
         # Warming either would pay Sarvam to translate a script no Sarvam call

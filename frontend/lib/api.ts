@@ -142,6 +142,20 @@ export type SheetsStatus = {
   last_sync_at: string | null;
   last_synced_count: number | null;
   last_error: string | null;
+  // Of the rows imported, how many the dialer will actually call. A sheet
+  // with no consent columns imports every row and dials none, which read as
+  // a healthy sync for weeks.
+  last_dialable_count: number | null;
+  last_skips: Record<string, number> | null;
+};
+
+export type SheetsSyncResult = {
+  at: string;
+  synced: number | null;
+  received: number | null;
+  dialable: number | null;
+  skips: Record<string, number> | null;
+  error: string | null;
 };
 
 class ApiError extends Error {
@@ -290,6 +304,11 @@ export const api = {
   config: () => request<{ variables: ConfigVar[] }>("/admin/config"),
 
   sheetsStatus: () => request<SheetsStatus>("/admin/sheets-status"),
+
+  // Runs the same job the 10-minute sweep runs. Returns 200 with `error` set
+  // when the sheet itself is the problem, so the reason can be shown inline.
+  syncSheets: () =>
+    request<SheetsSyncResult>("/admin/sheets/sync", { method: "POST" }),
 
 };
 

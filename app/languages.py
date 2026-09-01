@@ -56,6 +56,10 @@ class Language:
     display: str
     iso: str | None
     style: str | None
+    # A code-mixed register keeps everyday English words in English. The
+    # Sarvam prompt reads this back off the style text (is_code_mixed) to
+    # drop the rules that would otherwise contradict it in the same prompt.
+    mixed: bool = False
 
 
 LANGUAGES: dict[str, Language] = {
@@ -86,6 +90,7 @@ LANGUAGES: dict[str, Language] = {
             f"speak. Keep these everyday English words in English rather than "
             f"translating them: {_KEEP_IN_ENGLISH}."
         ),
+        mixed=True,
     ),
     "hi": Language(
         token="hi",
@@ -102,6 +107,7 @@ LANGUAGES: dict[str, Language] = {
             f"cities. Keep these everyday English words in English rather than "
             f"translating them: {_KEEP_IN_ENGLISH}."
         ),
+        mixed=True,
     ),
 }
 
@@ -319,6 +325,24 @@ def iso_code(token: str) -> str | None:
 def style(token: str) -> str | None:
     """The prompt instruction for this language, or None for AUTO."""
     return LANGUAGES[normalize(token)].style
+
+
+def is_code_mixed(language_style: str | None) -> bool:
+    """Whether *language_style* — a style() text as it reaches a backend — is
+    a code-mixed register (Tinglish, Hinglish).
+
+    The style text is the only register signal that crosses the
+    dynamic_variables boundary, so a backend that needs the register has to
+    read it back off the text. Matched EXACTLY against the catalogue's own
+    strings: a substring test would misfire in both directions ("English"
+    appears in the pure-Telugu style too), and a placeholder that is not a
+    catalogue style must read as pure — a caller that bypasses resolution
+    must never be handed permission to mix in English by accident.
+    """
+    if not language_style:
+        return False
+    return any(lang.style == language_style and lang.mixed
+               for lang in LANGUAGES.values())
 
 
 def display(token: str) -> str | None:

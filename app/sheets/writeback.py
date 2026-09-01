@@ -20,16 +20,42 @@ from __future__ import annotations
 import asyncio
 import logging
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import gspread.utils as gsutils
 
+from app import redis_client
 from app.compliance.dnd import normalize_phone_e164
+from app.config import CALLING_HOURS_TZ, GOOGLE_SHEET_ID
 from app.db import calls as calls_db
 from app.db import leads as leads_db
+from app.sheets import apps_script
 from app.sheets.client import get_worksheet
 from app.sheets.sync import PHONE_HINTS, find_column
 
 logger = logging.getLogger(__name__)
+
+# The Apps Script transport APPENDS transcripts (export_session has no
+# overwrite), while transcript_reconcile is at-least-once by design — the
+# same lead can sit in the queue twice for one call, and a crash between
+# write and ack redrives. The gspread path shrugged that off by overwriting
+# cells; this path needs a per-call marker so a call's transcript lands in
+# the sheet exactly once. Set only AFTER a successful export: a marker set
+# first would turn one transient failure into a transcript that never
+# arrives. The crash window between export and marker is the remaining
+# at-least-once residue — rare, and a duplicate beats a loss. Redis being
+# flushable (CLAUDE.md) means a flush can also re-append old transcripts;
+# same trade.
+_EXPORTED_MARKER_FMT = "sheets:exported:{call_id}"
+_EXPORTED_MARKER_TTL_S = 90 * 24 * 3600
+
+
+def exported_marker_key(call_id) -> str:
+    """The per-call exported-marker Redis key. Public because the ElevenLabs
+    webhook must DELETE it when it overwrites the row with the provider's
+    canonical transcript — otherwise a marker set by an earlier drain of the
+    stream-teardown version suppresses the canonical re-export forever."""
+    return _EXPORTED_MARKER_FMT.format(call_id=call_id)
 
 _WRITEBACK_HEADERS = ["Status", "Turns", "CalledAt", "Transcript", "Summary"]
 
@@ -72,6 +98,56 @@ def _format_transcript(turns) -> str:
     return "\n".join(f"{t.role}: {t.text}" for t in (turns or []))
 
 
+async def _write_back_via_script(lead, call) -> bool:
+    """The Apps Script transport's half of write_back_lead.
+
+    The transcript goes to the script's Transcripts tab keyed by the call id
+    (its Session ID column), and the Leads-tab Status rides along
+    best-effort — 'Lead not found' is normal for console-added leads. ONLY
+    the export's failure requests a retry: export_session appends blindly,
+    so retrying after a successful export would write the whole transcript
+    into the sheet twice.
+    """
+    call_id = getattr(call, "call_id", None)
+    marker = exported_marker_key(call_id) if call_id else None
+    already_exported = False
+    if marker:
+        try:
+            already_exported = bool(
+                await redis_client.get_redis().exists(marker))
+        except Exception as exc:  # noqa: BLE001 - dedupe is best-effort
+            logger.warning(f"[sheets] exported-marker check failed "
+                           f"({type(exc).__name__}: {exc}) — exporting "
+                           "without dedupe rather than dropping the write-back")
+
+    if not already_exported:
+        session = str(call_id or lead.lead_id)[:8]
+        # In the operator's timezone, not UTC: the sheet has no tz column,
+        # and Apps Script parses the bare string in ITS OWN timezone — a UTC
+        # wall time showed every call 5½ hours early on the live sheet.
+        ended_at = getattr(call, "ended_at", None)
+        if ended_at is not None and ended_at.tzinfo is not None:
+            ended_at = ended_at.astimezone(ZoneInfo(CALLING_HOURS_TZ))
+        stamp = ended_at.strftime("%Y-%m-%d %H:%M:%S") if ended_at else ""
+        exported = await apps_script.export_transcript(
+            session=session, turns=call.transcript, timestamp=stamp)
+        if not exported:
+            return False
+        if marker:
+            try:
+                await redis_client.get_redis().set(
+                    marker, "1", ex=_EXPORTED_MARKER_TTL_S)
+            except Exception as exc:  # noqa: BLE001 - see the check above
+                logger.warning(f"[sheets] could not record exported marker "
+                               f"({type(exc).__name__}: {exc})")
+
+    await apps_script.update_lead_status(
+        phone=lead.phone_e164, status=call.status or "",
+        notes=f"{call.turns or 0} turns",
+    )
+    return True
+
+
 async def write_back_lead(lead_id: UUID) -> bool:
     """Writes the lead's MOST RECENT call outcome to their Sheet row. Returns
     True on success, False if the row/phone-column couldn't be resolved (the
@@ -86,6 +162,9 @@ async def write_back_lead(lead_id: UUID) -> bool:
     if call is None:
         logger.warning(f"[sheets] write_back_lead: no call found for lead {lead_id}")
         return True
+
+    if apps_script.is_apps_script(GOOGLE_SHEET_ID):
+        return await _write_back_via_script(lead, call)
 
     ws = await get_worksheet()
     col_map = await _ensure_writeback_columns(ws)

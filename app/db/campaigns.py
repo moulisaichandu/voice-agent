@@ -90,9 +90,18 @@ async def get_campaign_by_name(name: str) -> Campaign | None:
     """Used by app/sheets/sync.py to resolve a Sheet row's "Campaign" column
     (a human-typed name) to a campaign_id. Most-recently-created wins if a
     name was reused across campaigns, matching leads.get_lead_by_phone's
-    same tie-breaking convention."""
+    same tie-breaking convention.
+
+    Matched case-insensitively and ignoring surrounding whitespace. The name
+    is retyped by hand into a spreadsheet against a campaign the console
+    created, so a stray capital or a trailing space is the likeliest possible
+    difference — and an exact comparison turned that into a row skipped with
+    only a WARNING, which on a sheet of hundreds is indistinguishable from the
+    campaign not existing at all.
+    """
     pool = await get_pool()
     row = await pool.fetchrow(
-        "select * from campaigns where name = $1 order by created_at desc limit 1", name,
+        "select * from campaigns where lower(btrim(name)) = lower(btrim($1)) "
+        "order by created_at desc limit 1", name,
     )
     return _row_to_campaign(row) if row else None

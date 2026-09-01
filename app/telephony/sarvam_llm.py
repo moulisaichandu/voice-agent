@@ -58,7 +58,12 @@ _CHAT_URL = "https://api.sarvam.ai/v1/chat/completions"
 #
 # This was 20s, chosen before anyone had run it against the real API, and the
 # very first live render failed with ReadTimeout.
-_TIMEOUT_S = 60.0
+# 93.1s measured for a real render (see _MAX_TOKENS). At 60s the warm-up was
+# killed before it could finish, so the cache never filled and every new
+# campaign's first lead paid the failure again. This bound only ever applies
+# OFF the call path — the bridge's own RENDER_DEADLINE_S (30s) is what
+# protects an answered lead from waiting.
+_TIMEOUT_S = 180.0
 
 # How much of a failed response body is kept. Enough for Sarvam's own JSON
 # error objects, short enough that an upstream HTML error page cannot become
@@ -74,7 +79,23 @@ _MAX_ERROR_BODY = 300
 #
 # The same prompt with max_tokens=4000 succeeded 3/3, spending 1493-2234
 # tokens. The ceiling has to sit well clear of the reasoning, not near it.
-_MAX_TOKENS = 4096
+#
+# 2026-08-27: the reasoning outgrew that ceiling and two live calls were
+# abandoned mid-dial because of it. Re-measured against the API on the exact
+# default two-way script:
+#     4096  + effort=low  ->  50.2s  finish=length  content=''   (14k reasoning)
+#     4096  (no effort)   ->  51.3s  finish=length  content=''   (14k reasoning)
+#     16384 + effort=low  ->  93.1s  finish=stop    real Telugu  (25k reasoning)
+#     16384 (no effort)   -> 139.9s  finish=stop    real Telugu  (39k reasoning)
+# So the budget is not a tuning knob to trim — it is a floor that has to stay
+# far above however much this model decides to think, and 'low' effort buys
+# a third off the wall clock without changing whether it succeeds.
+_MAX_TOKENS = 16384
+
+# See _MAX_TOKENS: 'low' does not stop the reasoning (it still overran 4096),
+# but 93s versus 140s is the difference between a warm-up that finishes inside
+# its timeout and one that never fills the cache.
+_REASONING_EFFORT = "low"
 
 # A rendered script changes only when the script does, and the key is a content
 # hash, so a stale entry is unreachable rather than wrong. The TTL exists to
@@ -196,6 +217,7 @@ async def _complete(system_prompt: str, user_prompt: str) -> str:
         # See _MAX_TOKENS: below this the model runs out of budget mid-thought
         # and returns no answer at all.
         "max_tokens": _MAX_TOKENS,
+        "reasoning_effort": _REASONING_EFFORT,
     })
     text = (message.get("content") or "").strip()
     if not text:

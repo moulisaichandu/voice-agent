@@ -758,3 +758,57 @@ async def test_a_genuinely_missing_row_is_still_created(monkeypatch):
 
 async def _noop():
     return None
+
+
+async def test_the_repair_guard_looks_up_the_id_the_row_actually_stores(
+        monkeypatch):
+    """The duplicate-row guard compared two DIFFERENT Plivo identifiers.
+
+    worker.process_one writes the row with provider_call_id = Plivo's
+    request_uuid (and records that same value under call:uuid:{lead}), while
+    /calls/answer writes Plivo's CallUUID under call:plivo_uuid:{lead}. The
+    repair read the CallUUID key and asked get_call_by_provider_id for it, so
+    the lookup could never match the row it was meant to find — and the guard
+    silently degraded back into creating the duplicate it exists to prevent.
+    """
+    looked_up, created = [], []
+
+    async def flaky_record(**kw):
+        if not looked_up:
+            raise ConnectionResetError("blip during the outcome write")
+        return object()
+
+    async def fake_create(**kw):
+        created.append(kw)
+        return object()
+
+    async def lookup(provider_call_id):
+        looked_up.append(provider_call_id)
+        # The row was written by the worker with the REQUEST uuid.
+        return object() if provider_call_id == "request-uuid-1" else None
+
+    class _R:
+        async def get(self, key):
+            # what the worker recorded  vs  what /calls/answer recorded
+            return {"call:uuid:lead-1": "request-uuid-1",
+                    "call:plivo_uuid:lead-1": "CALLUUID-9"}.get(key)
+
+        async def lpush(self, *a, **kw):
+            return 1
+
+    monkeypatch.setattr(call_routes.calls_db, "set_conversation_and_record",
+                        flaky_record)
+    monkeypatch.setattr(call_routes.calls_db, "create_call", fake_create)
+    monkeypatch.setattr(call_routes.calls_db, "get_call_by_provider_id", lookup)
+    monkeypatch.setattr(call_routes.leads_db, "mark_result_if_calling",
+                        lambda *a, **kw: _noop())
+    monkeypatch.setattr(call_routes.redis_client, "get_redis", lambda: _R())
+
+    await call_routes._finalise_call(
+        _Lead(), {"status": "done", "turns": 3, "transcript": []},
+        campaign=_Campaign())
+
+    assert created == [], (
+        f"duplicate row written; the guard looked up {looked_up!r} but the row "
+        "stores the request uuid"
+    )

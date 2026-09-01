@@ -26,6 +26,9 @@ lead hears. The model must emit the spoken words and nothing else.
 from __future__ import annotations
 
 import re
+import unicodedata
+
+from app import languages
 
 _NO_HINDI_RULE = "Never use Hindi or any other language under any circumstances."
 
@@ -56,6 +59,27 @@ _OUTPUT_ONLY_RULE = (
     "or quotation marks around the message — every character you write is "
     "heard by a real person."
 )
+
+# The same rule for a code-mixed register. "In Telugu script" was ordering the
+# model to transliterate the very words the LANGUAGE rule told it to keep in
+# English — one prompt, two instructions, and the model picked one at random
+# per turn. Sarvam's TTS reads a Latin run as an English word, which for
+# "course" or "fees" is exactly right (it is only a NAME like "Mouli" that
+# it gets wrong, see lead_name.py).
+_OUTPUT_ONLY_RULE_MIXED = (
+    "OUTPUT FORMAT: Reply with ONLY the words to be spoken aloud. Telugu is "
+    "written in Telugu script; the everyday English words the LANGUAGE rule "
+    "keeps in English are written in ordinary English letters, spelled the "
+    "ordinary English way. Your entire reply is fed directly to a speech "
+    "synthesiser and read aloud to the person on the phone, exactly as you "
+    "write it. Do not add a preamble, an explanation, a note about the "
+    "translation, a label, or quotation marks around the message — every "
+    "character you write is heard by a real person."
+)
+
+
+def _output_only_rule(mixed: bool) -> str:
+    return _OUTPUT_ONLY_RULE_MIXED if mixed else _OUTPUT_ONLY_RULE
 
 # Telugu-capable chat models sometimes emit an ASCII-like Telugu skeleton:
 # consonants are present but dependent vowel signs are dropped (for example
@@ -92,6 +116,31 @@ _TELUGU_SPELLING_RULE = _TELUGU_SPELLING_RULE.replace(
     _RUPEE_SPEECH_RULE,
 )
 
+# The vowel-sign rule is about Telugu orthography and holds in every register.
+# What changes for a code-mixed register is the mandated-spelling list: the
+# pure-Telugu one mandates కోర్సు, ఫీజు and ప్లేస్‌మెంట్ — three of the eight
+# words languages.py's tinglish style keeps in English. Mandating a Telugu
+# spelling for a word the same prompt says to leave in English was the
+# contradiction the project's design notes warned about; here the list holds
+# only words the register actually says in Telugu.
+_TELUGU_SPELLING_RULE_MIXED = (
+    "TELUGU SPELLING: Every Telugu word must use complete, natural Telugu "
+    "orthography with all vowel signs and case endings. Never drop vowel "
+    "signs or shorten words into a consonant-only form. Always spell these "
+    "Telugu terms exactly as shown when they apply: నమస్తే, గారు, ఇది, "
+    "డిజిటల్ బ్రోలీ, ఆటోమేటెడ్, కాల్, నెలలు, నెల, సంవత్సరాలు, రూపాయలు, "
+    "ఇంటర్న్‌షిప్, ట్రైనింగ్, అసైన్‌మెంట్లు, ప్రాజెక్ట్‌లు, ధన్యవాదాలు, "
+    "శుభదినం. The English words you keep in English are never transliterated "
+    "into Telugu script. "
+    + _RUPEE_SPEECH_RULE
+    + " Before replying, silently proofread every Telugu word for missing "
+    "vowel signs."
+)
+
+
+def _spelling_rule(mixed: bool) -> str:
+    return _TELUGU_SPELLING_RULE_MIXED if mixed else _TELUGU_SPELLING_RULE
+
 # A small defensive repair for the recurring forms observed in production
 # transcripts. This is intentionally a whitelist, not a Telugu spellchecker:
 # guessing at arbitrary lead text could change its meaning. It is applied only
@@ -115,6 +164,12 @@ _COMMON_MANGLED_TELUGU = {
     "చపతర": "చెప్తారా",
     "గగల": "గూగుల్",
     "అడస": "యాడ్స్",
+    # Not a skeleton: the conversation LLM writes the fully-voweled "అడ్స్"
+    # when answering from RAG text that says "Ads" (heard live 2026-08-27 as
+    # "aḍs"), while the campaign renders spell it "యాడ్స్" — one call could
+    # contain both spellings of the same product name. Same-word orthography,
+    # so it is safe on the heard path too.
+    "అడ్స్": "యాడ్స్",
     "మట": "మెటా",
     "సషల": "సోషల్",
     "మడయ": "మీడియా",
@@ -130,7 +185,15 @@ _COMMON_MANGLED_TELUGU = {
     "నల": "నెల",
     "ఉటద": "ఉంటుంది",
     "ఎబఏ": "MBA",
-    "డటయలస": "డిటైల్స్",
+    # డీటెయిల్స్, matching the phrase map's spelling — the two maps used to
+    # disagree (డిటైల్స్ here), so which rendering the lead heard depended on
+    # whether కోర్సు happened to precede the word.
+    "డటయలస": "డీటెయిల్స్",
+    # Spoken orthography for the acronym: today's live calls said Latin "SEO"
+    # in one turn and ఎస్ఈఓ in the next, and TTS reads the two differently.
+    # Heard text is EXCLUDED below — it feeds the RAG query, where English
+    # embeds far better against the English-only corpus.
+    "SEO": "ఎస్ఈఓ",
     "ఫజ": "ఫీజు",
     "టరనగ": "ట్రైనింగ్",
     "డపలమ": "డిప్లొమా",
@@ -171,7 +234,20 @@ _COMMON_MANGLED_TELUGU = {
 #               when డిజిటల్ precedes it, because four words sit within edit
 #               distance 2 of the brand and only two of them are the brand.
 #               An unconditional entry here defeats that anchor entirely.
-_AMBIGUOUS_FOR_HEARD = {"మ", "ఫ", "య", "కల", "నల", "మట", "బరల"}
+#   మక        — the skeleton of BOTH మీకు ("to you") and మాకు ("to us").
+#               Resolving it flips the person of the lead's sentence.
+#   ఉటద / ఉననయ / చపతర — dropping dependent signs erases exactly the
+#               interrogative -ా, so each skeleton is both the statement and
+#               the question (ఉంటుంది/ఉంటుందా, ఉన్నాయి/ఉన్నాయా,
+#               చెప్తారు/చెప్తారా). Resolving to either form rewrites the
+#               lead's mood — a question becomes an assertion or vice versa.
+#   SEO       — not ambiguity: heard text becomes the RAG query, and the
+#               English-only course docs embed English far better (Telugu-
+#               script queries measured 0.10-0.19 against them vs 0.43+ for
+#               English), so converting the acronym in a lead's question
+#               would sabotage the very lookup it triggers.
+_AMBIGUOUS_FOR_HEARD = {"మ", "ఫ", "య", "కల", "నల", "మట", "బరల",
+                        "మక", "ఉటద", "ఉననయ", "చపతర", "SEO"}
 
 _HEARD_MANGLED_TELUGU = {
     key: value for key, value in _COMMON_MANGLED_TELUGU.items()
@@ -202,13 +278,36 @@ _MANGLED_PHRASES = {
     "ఎనన డస ఉటద": "ఎన్ని రోజులు ఉంటుంది",
     "డయరషన కరస డయరషన": "డ్యూరేషన్, కోర్సు డ్యూరేషన్",
     "ఫజ సటరకచరగ": "ఫీజు స్ట్రక్చర్‌గా",
-    "అదల ఎబఏ ఫ": "అదనపు MBA ఫీజు",
-    "పలసమట ఫ": "ప్లేస్‌మెంట్ ఫీజు",
+    # No keys ending in a bare consonant ("...ఫ"): such a key is a prefix of
+    # its own repaired form, so it matched INSIDE correct text ("పలసమట ఫీజు")
+    # and spliced a replacement mid-word. The token map's whole-token
+    # discipline repairs those inputs correctly on its own.
     "టరనగ/డపలమ": "ట్రైనింగ్/డిప్లొమా",
     "ఆన-జబ టరనగ": "ఆన్-జాబ్ ట్రైనింగ్",
     "నడ ఆటమటడ": "నుండి ఆటోమేటెడ్",
     "కరస ఎనన డస ఉటద": "కోర్సు ఎన్ని రోజులు ఉంటుంది",
 }
+
+# Phrase keys are matched as whole phrases, never inside a longer word. Bare
+# str.replace() spliced a key that was a PREFIX of the actual text mid-word
+# ("పలసమట ఫ" inside "పలసమట ఫీజు" → "ప్లేస్‌మెంట్ ఫీజుీజు" — a dangling
+# dependent vowel sign, read aloud by TTS in the sentence quoting the price).
+# \b is useless here: Python's \w excludes combining marks, so every dependent
+# vowel sign would BE a boundary. A word-character for this purpose is a
+# letter, a digit, or anything in the Telugu block (which includes the
+# dependent signs). Longest key first, so a key that is a suffix of another
+# ("ఎనన డస ఉటద" / "కరస ఎనన డస ఉటద") can never shadow the longer match.
+_PHRASE_BOUNDARY = "0-9A-Za-zఀ-౿"  # ASCII alphanumerics + Telugu block
+_MANGLED_PHRASE_RE = re.compile(
+    f"(?<![{_PHRASE_BOUNDARY}])"
+    + "(?:" + "|".join(re.escape(key) for key in
+                       sorted(_MANGLED_PHRASES, key=len, reverse=True)) + ")"
+    + f"(?![{_PHRASE_BOUNDARY}])"
+)
+
+
+def _repair_phrases(text: str) -> str:
+    return _MANGLED_PHRASE_RE.sub(lambda m: _MANGLED_PHRASES[m.group(0)], text)
 
 
 def _repair_tokens(text: str, mapping: dict[str, str]) -> str:
@@ -220,10 +319,26 @@ def _repair_tokens(text: str, mapping: dict[str, str]) -> str:
     for line in text.split("\n"):
         repaired: list[str] = []
         for word in line.split():
+            # Trailing is sliced from what remains AFTER leading, never from
+            # the whole word — a token made only of quote characters (present
+            # in both strip sets) was otherwise claimed by BOTH slices and
+            # emitted twice, and the render cache's repair-on-hit loop then
+            # doubled it again on every later call: 2^N growth.
             leading = word[:len(word) - len(word.lstrip("([{\"'"))]
-            trailing = word[len(word.rstrip(".,!?;:)]}\"'")):]
-            core = word[len(leading):len(word) - len(trailing) if trailing else None]
-            repaired.append(f"{leading}{mapping.get(core, core)}{trailing}")
+            rest = word[len(leading):]
+            trailing = rest[len(rest.rstrip(".,!?;:)]}\"'")):]
+            core = rest[:len(rest) - len(trailing)]
+            fixed = mapping.get(core)
+            if fixed is None and "‌" in core:
+                # The conversation model welds case endings onto loanwords
+                # with ZWNJ (అడ్స్‌లో, మార్కెటింగ్‌లో — its own live output),
+                # so a whole-token miss is retried on the pre-ZWNJ head with
+                # the suffix carried over. Map-driven, so the heard path's
+                # exclusions still apply to the head.
+                head, sep, tail = core.partition("‌")
+                if head in mapping:
+                    fixed = mapping[head] + sep + tail
+            repaired.append(f"{leading}{fixed if fixed is not None else core}{trailing}")
         out_lines.append(" ".join(repaired))
     return "\n".join(out_lines)
 
@@ -273,12 +388,19 @@ def _generic_rupee_words(number: int) -> str:
         return str(number)
 
     parts: list[str] = []
+    # Lakh and crore need the same singular special-casing thousand and
+    # hundred always had, and the OBLIQUE plural (లక్షల/కోట్ల), never the
+    # nominative లక్షలు/కోట్లు — the amount is always followed by another
+    # word (more parts, or రూపాయలు). "ఒక లక్షా" is the connective form used
+    # when more parts follow, exactly as _COMMON_RUPEE_WORDS hand-writes it.
     crore, number = divmod(number, 10_000_000)
     if crore:
-        parts.append(f"{_under_100(crore)} కోట్లు")
+        parts.append("ఒక కోటి" if crore == 1 else f"{_under_100(crore)} కోట్ల")
     lakh, number = divmod(number, 100_000)
-    if lakh:
-        parts.append(f"{_under_100(lakh)} లక్షలు")
+    if lakh == 1:
+        parts.append("ఒక లక్షా" if number else "ఒక లక్ష")
+    elif lakh:
+        parts.append(f"{_under_100(lakh)} లక్షల")
     thousand, number = divmod(number, 1_000)
     if thousand:
         parts.append("వెయ్యి" if thousand == 1
@@ -307,11 +429,58 @@ def _replace_rupee_amounts(text: str) -> str:
     return _RUPEE_RE.sub(_spoken_rupees, text)
 
 
+# Everything the synthesiser is allowed to be handed. Telugu is the language;
+# ASCII covers English loanwords, course codes and numerals, both of which
+# Sarvam TTS reads correctly. Anything else is a model slip, not a message.
+#
+# Earned on a live call 2026-09-01: the agent said "బ్యాచ్ వివరాలు నాకు ఈ
+# պահին లేవు" — "պահին" is ARMENIAN — and the synthesiser read it out at the
+# lead. The prompt already forbade it; nothing enforced it. The same rule
+# catches the older, documented failure of drifting into HINDI mid-call
+# (CLAUDE.md), because Devanagari is no more Telugu than Armenian is.
+#
+# Judged on a word's LETTERS ONLY. The first cut of this guard tested whole
+# tokens, so "ఉన్నాయి।" — a perfectly good Telugu word wearing the danda that
+# _SENTENCE_END itself splits sentences on — was called foreign and DELETED,
+# and a lead heard words vanish mid-sentence. Punctuation says nothing about
+# what language a word is in.
+#
+# Whole tokens go, not individual characters: half a foreign word is not an
+# improvement on all of it, and the surrounding Telugu still carries the
+# sentence.
+def _is_speakable(word: str) -> bool:
+    for ch in word:
+        category = unicodedata.category(ch)
+        if not (category.startswith("L") or category.startswith("M")):
+            continue          # punctuation, digits, symbols, spacing
+        if ch.isascii():
+            continue          # English loanwords, course codes
+        if "ఀ" <= ch <= "౿":
+            continue          # Telugu, including its combining vowel signs
+        if ch in "‌‍":
+            continue          # ZWNJ / ZWJ, used inside Telugu loanwords
+        return False
+    return True
+
+
+def foreign_script_tokens(text: str) -> list[str]:
+    """Words containing a script the synthesiser must never be given.
+
+    Pure — callers log these; see say() in app/telephony/sarvam_bridge.py. A
+    model emitting Armenian mid-sentence is worth an operator's attention
+    even though the sentence around it is rescued.
+    """
+    return [w for w in text.split() if w and not _is_speakable(w)]
+
+
 def normalize_spoken_telugu(text: str) -> str:
-    """Repair known agent spellings and make rupees speakable."""
-    for bad, good in _MANGLED_PHRASES.items():
-        text = text.replace(bad, good)
-    return _replace_rupee_amounts(_repair_tokens(text, _COMMON_MANGLED_TELUGU))
+    """Repair known agent spellings, drop unspeakable scripts, and make
+    rupees speakable."""
+    foreign = set(foreign_script_tokens(text))
+    if foreign:
+        text = " ".join(w for w in text.split() if w not in foreign)
+    return _replace_rupee_amounts(
+        _repair_tokens(_repair_phrases(text), _COMMON_MANGLED_TELUGU))
 
 
 def normalize_heard_telugu(text: str) -> str:
@@ -321,9 +490,7 @@ def normalize_heard_telugu(text: str) -> str:
     output can use a few known fallback repairs; lead speech must never be
     aggressively rewritten just because a token is short or ambiguous.
     """
-    for bad, good in _MANGLED_PHRASES.items():
-        text = text.replace(bad, good)
-    return _repair_tokens(text, _HEARD_MANGLED_TELUGU)
+    return _repair_tokens(_repair_phrases(text), _HEARD_MANGLED_TELUGU)
 
 # A short, name-only opener. It must stay a BARE GREETING as
 # app/compliance/disclosure.py defines one — few words, and naming no caller —
@@ -347,6 +514,61 @@ DEFAULT_TWOWAY_SCRIPT = (
     "digital marketing courses. Ask me anything you would like to know."
 )
 
+# ...and its Telugu, held as a constant rather than rendered.
+#
+# Translating a CONSTANT is a constant. Paying a model for it cost two live
+# calls on 2026-08-27: Sarvam's reasoning had outgrown its token budget, the
+# render returned nothing, and both leads answered the phone to silence and
+# were hung up on 30 seconds later. Every scriptless two-way campaign — the
+# normal case, since call_routes only forwards a script for one-way — was
+# rendering this same fixed English through a 93-second reasoning model on
+# every cold cache, for an answer that could never differ.
+#
+# NOT hand-written: this is what the model itself produced for this script,
+# spoken to real leads on the calls of 2026-08-27 and passed by the
+# post-call [compliance] disclosure re-check. A test pins the disclosure, and
+# another pins that it survives normalize_spoken_telugu unchanged — it is
+# spoken verbatim, so the repairs must have nothing left to do to it.
+#
+# "ఏఐ ద్వారా చేసే ఆటోమేటెడ్ కాల్", not "ఆటోమేటెడ్ AI కాల్": an audit of every
+# agent turn ever spoken found "AI" to be the ONLY Latin token the agent
+# says, and it is in every opening. Sarvam's Telugu TTS reads a Latin run as
+# an English word rather than the letter names, so the lead heard something
+# that was not "ఏ-ఐ" in the one sentence India's rules require them to
+# understand. The sentence is RESTRUCTURED rather than substituted: the
+# compliance check was matching that Latin \bai\b token, so swapping in ఏఐ
+# alone made the opening fail has_ai_disclosure — it now carries
+# "ఆటోమేటెడ్ కాల్" adjacently, which is a recognised marker in its own right.
+DEFAULT_TWOWAY_TELUGU = (
+    "ఇది డిజిటల్ బ్రోలీ నుండి ఏఐ ద్వారా చేసే ఆటోమేటెడ్ కాల్. "
+    "నేను మా డిజిటల్ మార్కెటింగ్ కోర్సుల గురించి కాల్ చేస్తున్నాను. "
+    "మీకు ఏమైనా తెలుసుకోవాలని ఉంటే అడగండి."
+)
+
+# The same opening in the Tinglish register. Until 2026-09-01 there was only
+# the Telugu one, so a Tinglish campaign's first words were pure Telugu and
+# the only thing marking the register was the system prompt behind them.
+# Same shape as the Telugu: the disclosure sentence is IDENTICAL (it is the
+# one sentence India's rules require the lead to understand, and it carries
+# the recognised "ఆటోమేటెడ్ కాల్" marker rather than a Latin "AI" the
+# synthesiser would read as an English word); the English that follows is
+# limited to the everyday words languages.py's tinglish style keeps in
+# English, which Sarvam's TTS reads correctly as English words.
+DEFAULT_TWOWAY_TINGLISH = (
+    "ఇది డిజిటల్ బ్రోలీ నుండి ఏఐ ద్వారా చేసే ఆటోమేటెడ్ కాల్. "
+    "మా digital marketing courses గురించి కాల్ చేస్తున్నాను. "
+    "Course fees, batch timings, placement, ఏమైనా తెలుసుకోవాలంటే అడగండి."
+)
+
+
+def default_twoway_opening(language_style: str | None) -> str:
+    """The canned opening for a scriptless two-way call, in this call's
+    register. No style at all means pure Telugu — the same default every
+    other register-dependent rule in this module falls back to."""
+    if languages.is_code_mixed(language_style):
+        return DEFAULT_TWOWAY_TINGLISH
+    return DEFAULT_TWOWAY_TELUGU
+
 
 def _language_rule(language_style: str | None) -> str:
     """The LANGUAGE instruction for this call's register.
@@ -366,6 +588,23 @@ def render_instructions(script: str, *, language_style: str | None = None) -> st
     The operator may write in English; what the lead hears must be Telugu. The
     script is handed over as MEANING to convey, never as words to recite.
     """
+    mixed = languages.is_code_mixed(language_style)
+    if mixed:
+        framing = (
+            "MESSAGE TO CONVEY — this is the MEANING to express in natural "
+            "spoken Tinglish, Telugu mixed with everyday English the way "
+            "people in Hyderabad speak, not words to recite. It may be written "
+            "in English; if so, do not read it out as English sentences — say "
+            "it the way a Hyderabad Telugu speaker would, keeping only the "
+            "everyday English words the LANGUAGE rule names: "
+        )
+    else:
+        framing = (
+            "MESSAGE TO CONVEY — this is the MEANING to express in natural "
+            "spoken Telugu, not words to recite. It may be written in English; "
+            "if so, convey its meaning in Telugu and never read English text "
+            "aloud: "
+        )
     return "\n\n".join([
         "You write the words a voice assistant will speak on an outbound phone "
         "call for Digital Brolly, an education company in Hyderabad. The call "
@@ -373,23 +612,53 @@ def render_instructions(script: str, *, language_style: str | None = None) -> st
         "and does not wait for a reply.",
         _DISCLOSURE_RULE,
         _language_rule(language_style),
-        _OUTPUT_ONLY_RULE,
-        _TELUGU_SPELLING_RULE,
-        "MESSAGE TO CONVEY — this is the MEANING to express in natural spoken "
-        "Telugu, not words to recite. It may be written in English; if so, "
-        "convey its meaning in Telugu and never read English text aloud: "
-        f"{script.strip()}",
+        _output_only_rule(mixed),
+        _spelling_rule(mixed),
+        f"{framing}{script.strip()}",
     ])
 
 
+def _greeting_name(lead_name: str) -> str | None:
+    """The single token the greeting may address the lead by.
+
+    The greeting must stay a BARE greeting as disclosure.py defines one — at
+    most 3 words — and "నమస్తే {name} గారు" only holds that budget when
+    {name} is ONE word. A 'First Last' name from the sheet made it 4 words,
+    so has_ai_disclosure refused the roll-forward, ensure_disclosure prepended
+    a SECOND disclosure the lead then heard twice, and a spurious
+    [compliance] WARNING fired on every such call. A dot in the name
+    ("B. మౌళి") is worse still: it ends the greeting 'sentence' early.
+
+    So: first token, punctuation stripped, skipping bare Latin initials —
+    "రామ కృష్ణ" greets రామ, "B. మౌళి" greets మౌళి. Dots split exactly like
+    whitespace: "B.మౌళి" typed WITHOUT the space is common, and a kept
+    internal dot still ends the greeting 'sentence' early — the same double
+    disclosure by a glued spelling. None when nothing greetable remains;
+    the caller then skips the greeting entirely.
+    """
+    for token in re.split(r"[\s.]+", lead_name):
+        cleaned = token.strip(",!?;:'\"()")
+        if not cleaned:
+            continue
+        if len(cleaned) == 1 and cleaned.isascii():
+            continue  # an initial, not a name to address someone by
+        return cleaned
+    return None
+
+
 def greeting_line(lead_name: str) -> str:
-    """A short spoken greeting naming *lead_name*.
+    """A short spoken greeting naming *lead_name* — "" when the name has no
+    greetable token.
 
     Kept out of the rendered body so the body can be cached per campaign — an
     Indian name needs no translation, so splicing it in costs nothing and no
-    LLM call. See _GREETING_TEMPLATE for why it must stay this short.
+    LLM call. See _GREETING_TEMPLATE and _greeting_name for why it must stay
+    this short.
     """
-    return _GREETING_TEMPLATE.format(name=lead_name.strip())
+    name = _greeting_name(lead_name)
+    if name is None:
+        return ""
+    return _GREETING_TEMPLATE.format(name=name)
 
 
 def compose_spoken(body: str, *, lead_name: str | None) -> str:
@@ -400,7 +669,10 @@ def compose_spoken(body: str, *, lead_name: str | None) -> str:
     """
     if not lead_name or not lead_name.strip():
         return body
-    return f"{greeting_line(lead_name)} {body}"
+    line = greeting_line(lead_name)
+    if not line:
+        return body
+    return f"{line} {body}"
 
 
 # Earned on a live call on the OpenAI backend: asked who Virat Kohli was, the
@@ -416,19 +688,87 @@ _STAY_ON_TOPIC_RULE = (
     "unrelated it seems — even if you are completely certain of the answer. "
     "Not one fact, opinion, definition or piece of outside knowledge, ever. If "
     "the lead asks about anything else, say briefly that you can only help "
-    "with questions about the course, then return to why you called."
+    "with questions about the course, then return to why you called. "
+    "But a SHORT REPLY TO YOUR OWN QUESTION is never off-topic: if you just "
+    "asked which course or which fee they want and they answer with a bare "
+    "number like 25,000, a course code like BDLP, or a fragment, they are "
+    "ANSWERING you — treat it as naming that course and continue."
 )
+
+# Sarvam's Telugu STT garbles heavily on 8 kHz phone audio: one live call
+# produced "వాక్య తింగ ఏమేం కోషమ్స్", "స్కూట్స్ ప్లాంట్స్" and a bare "కో."
+# from a lead who was engaged throughout. Unclear input is therefore the
+# NORMAL case here, and on 2026-08-29 the model answered it in the two worst
+# possible ways — a scope refusal, and hanging up. Asking again is the only
+# honest response, and it costs one turn.
+_UNCLEAR_INPUT_RULE = (
+    "UNCLEAR SPEECH: The speech-to-text on this phone line is imperfect and "
+    "often returns garbled or truncated Telugu. When what you receive does "
+    "not make sense, is a stray fragment, or could mean several different "
+    "things, ask them politely to say it again — in Telugu, in one short "
+    "sentence. NEVER treat unclear text as a question about something "
+    "off-topic, and NEVER end the call because of it. Only unmistakable "
+    "words end a call."
+)
+_UNCLEAR_INPUT_RULE_MIXED = (
+    "UNCLEAR SPEECH: The speech-to-text on this phone line is imperfect and "
+    "often returns garbled or truncated text. When what you receive does "
+    "not make sense, is a stray fragment, or could mean several different "
+    "things, ask them politely to say it again — in the same natural mix of "
+    "Telugu and everyday English, in one short sentence. NEVER treat unclear "
+    "text as a question about something off-topic, and NEVER end the call "
+    "because of it. Only unmistakable words end a call."
+)
+
+
+def _unclear_input_rule(mixed: bool) -> str:
+    return _UNCLEAR_INPUT_RULE_MIXED if mixed else _UNCLEAR_INPUT_RULE
 
 # CLAUDE.md's hard rule, in the model's own terms. The danger is not that the
 # model refuses to answer — it is that it answers a fee or a date from memory
 # and sounds exactly as confident as it does when quoting a real document.
+# Two variants: with a pre-read facts digest in the prompt (the normal case
+# since 2026-08-29 — the owner's direction was "read and store my documents
+# BEFORE the call", after every common question paid a tool round-trip, a
+# spoken waiting line, and the fee question still missed to top-k crowd-out),
+# and without one, when the digest could not be built and the tool is all
+# there is. Neither variant may promise a callback: the model said "మా టీమ్
+# నుంచి ఎవరో తిరిగి కాల్ చేస్తారు" on two live calls, nothing schedules such
+# a call, and the source of that promise was THIS RULE's own old wording.
+_COURSE_FACTS_RULE_WITH_DIGEST = (
+    "COURSE FACTS: The KNOWN COURSE FACTS section below was read from "
+    "Digital Brolly's own course documents before this call. Answer "
+    "questions about courses, fees, timings, batches, dates or placement "
+    "from it DIRECTLY — immediately, with no tool call and no waiting line. "
+    "Use the search_course_material tool only for questions those facts do "
+    "not cover, and answer ONLY from what it returns. Never answer from "
+    "memory and never invent a number or a date. If neither the facts nor "
+    "the tool has it, say plainly that you do not have that information and "
+    "suggest they contact Digital Brolly directly — NEVER promise that "
+    "someone will call them back; nothing schedules such a call, so the "
+    "promise would be false."
+)
 _COURSE_FACTS_RULE = (
     "COURSE FACTS: Every question about courses, fees, timings, batches, "
     "dates or placement must be answered from the search_course_material "
     "tool, and ONLY from what it returns. Never answer them from memory and "
     "never invent a number or a date. If the tool returns nothing relevant, "
-    "say plainly that you do not have that information and offer to have a "
-    "person call back."
+    "say plainly that you do not have that information and suggest they "
+    "contact Digital Brolly directly — NEVER promise that someone will call "
+    "them back; nothing schedules such a call, so the promise would be "
+    "false."
+)
+
+# Live 2026-08-29: the agent asked "మీకు కోర్సు వ్యవధి చెప్పాలా?", the lead
+# said "ఓకే సార్" — accepting the offer — and the model called end_call and
+# hung up on her mid-conversation. An affirmation after an offer is consent
+# to CONTINUE; the same guard also lives in end_call's own tool description.
+_AFFIRMATION_RULE = (
+    "OFFERS AND AFFIRMATIONS: When you offer information — for example "
+    "'shall I tell you the fees?' — and the lead replies with an "
+    "affirmation such as 'ఓకే', 'సరే', 'అవును', 'ఊ' or 'okay', they are "
+    "ACCEPTING the offer: give that information in your next turn. An "
+    "affirmation is never a goodbye."
 )
 
 # A phone call, not a chat window. The lead cannot skim, and every extra
@@ -441,7 +781,8 @@ _BREVITY_RULE = (
 
 
 def two_way_instructions(lead_name: str | None, script: str | None,
-                         language_style: str | None = None) -> str:
+                         language_style: str | None = None,
+                         course_facts: str | None = None) -> str:
     """The persona for a call that holds a conversation.
 
     Differs from one_way_instructions in one structural way: the script is the
@@ -454,6 +795,7 @@ def two_way_instructions(lead_name: str | None, script: str | None,
     true — they are only easier to forget when writing a second prompt.
     """
     who = f"You are speaking with {lead_name}. " if lead_name else ""
+    mixed = languages.is_code_mixed(language_style)
     parts = [
         "You are a voice assistant on an outbound phone call for Digital "
         "Brolly, an education company in Hyderabad. "
@@ -462,11 +804,13 @@ def two_way_instructions(lead_name: str | None, script: str | None,
         "listen to what they say, answer it, and stop.",
         _DISCLOSURE_RULE,
         _language_rule(language_style),
-        _OUTPUT_ONLY_RULE,
-        _TELUGU_SPELLING_RULE,
+        _output_only_rule(mixed),
+        _spelling_rule(mixed),
         _BREVITY_RULE,
-        _COURSE_FACTS_RULE,
+        (_COURSE_FACTS_RULE_WITH_DIGEST
+         if course_facts and course_facts.strip() else _COURSE_FACTS_RULE),
         _STAY_ON_TOPIC_RULE,
+        _unclear_input_rule(mixed),
         # Observed on the live API: told to "say a short goodbye and call the
         # end_call tool", the model said the goodbye and did not call the tool.
         # Nothing then ends the call, so it runs to CALL_MAX_DURATION_S — five
@@ -475,16 +819,27 @@ def two_way_instructions(lead_name: str | None, script: str | None,
         # sentence containing both.
         "ENDING THE CALL: Saying goodbye and calling the end_call tool are the "
         "SAME action — never do one without the other. The moment the "
-        "conversation is finished (they say goodbye, ask not to be called "
-        "again, or have nothing further to ask), your reply must be a short "
-        "farewell AND a call to end_call in that same turn. A goodbye without "
-        "end_call leaves the lead holding a silent line.",
+        "conversation is EXPLICITLY finished (they say goodbye, ask not to be "
+        "called again, or clearly say they have nothing further to ask), your "
+        "reply must be a short farewell AND a call to end_call in that same "
+        "turn. A goodbye without end_call leaves the lead holding a silent "
+        "line — and an 'ఓకే' or 'సరే' after you offered information is "
+        "acceptance, never an ending.",
+        _AFFIRMATION_RULE,
     ]
+    if course_facts and course_facts.strip():
+        parts.append(
+            "KNOWN COURSE FACTS — read from Digital Brolly's course "
+            "documents before this call; answer from these directly: "
+            + course_facts.strip()
+        )
     if script and script.strip():
+        register = ("your own natural spoken Tinglish" if mixed
+                    else "your own spoken Telugu")
         parts.append(
             "GOAL OF THIS CALL — this is what you are trying to achieve, not a "
             "speech to read out. Work it into the conversation naturally, in "
-            "your own spoken Telugu, and never at the cost of ignoring what "
+            f"{register}, and never at the cost of ignoring what "
             f"the lead just said: {script.strip()}"
         )
     return "\n\n".join(parts)

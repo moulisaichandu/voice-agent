@@ -191,5 +191,12 @@ the only transcoding anywhere in the project. It is pure-Python on purpose —
 - Run: `docker compose up` (or `uvicorn app.main:app --reload` with the above running)
 - Test (no Docker needed): `pytest -q -m "not integration"`
 - Test (full, needs the profile-dev containers up): `pytest -q`
+  - Integration tests run against a SEPARATE `voiceagent_test` database, never
+    the `voiceagent` one the backend uses — they create and mutate campaigns
+    and leads, which against live data is indistinguishable from an operator's
+    own. Create it once; the exact commands are in `tests/conftest.py`'s
+    docstring. `tests/integration/conftest.py` refuses to run if `DATABASE_URL`
+    names a database not ending in `_test`. Never point it at the live DB "just
+    this once" — that is how every live campaign got deactivated on 2026-08-27.
 - Lint: `ruff check .`
 - Apply DB schema: `python scripts/apply_migrations.py`

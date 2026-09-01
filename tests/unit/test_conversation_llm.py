@@ -457,3 +457,34 @@ def test_the_default_reasoning_effort_is_one_the_api_accepts():
         f"default is {config.CONVERSATION_LLM_REASONING_EFFORT!r}, which the "
         "API rejects with HTTP 400 on every tool-calling turn"
     )
+
+
+def test_end_call_forbids_ending_on_an_affirmation():
+    """Live 2026-08-29: the lead's 'ఓకే సార్' — consent to the agent's own
+    offer of more information — made the model call end_call and hang up on
+    her mid-conversation. The tool description is the model's contract for
+    when ending is allowed, so the guard belongs there, not only in the
+    persona prompt."""
+    end_call = next(t for t in conversation_llm.TOOLS
+                    if t["function"]["name"] == conversation_llm.END_CALL_TOOL_NAME)
+    desc = end_call["function"]["description"]
+
+    assert "ఓకే" in desc
+    assert "EXPLICITLY" in desc or "explicitly" in desc
+    assert "never" in desc.lower()
+
+
+def test_the_search_tool_defers_to_the_facts_digest():
+    """Adversarial review, 2026-08-29: the tool description ordered a call
+    'for every question about ... fees ... duration' while the digest rule
+    says to answer covered questions with no tool call — no precedence
+    stated, nondeterministic routing at temperature 0.6, and when the tool
+    description won, the lead paid the round-trip and could replay the
+    documented top-k fee miss with the right fee sitting unused in the
+    prompt. The description must name the digest and yield to it."""
+    search = next(t for t in conversation_llm.TOOLS
+                  if t["function"]["name"] == conversation_llm.SEARCH_TOOL_NAME)
+    desc = search["function"]["description"]
+
+    assert "KNOWN COURSE FACTS" in desc
+    assert "not covered" in desc.lower()

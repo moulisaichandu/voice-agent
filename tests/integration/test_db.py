@@ -4,6 +4,7 @@ uses a unique random phone/name suffix so repeated runs against the same
 disposable dev database never collide on the leads/calls unique constraints.
 """
 
+import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -648,10 +649,52 @@ async def test_a_calling_lead_that_was_never_dialled_can_be_released(campaign):
     await leads_db.mark_queued(lead.lead_id)
     await leads_db.mark_calling(lead.lead_id)          # crash lands right here
 
-    assert await leads_db.release_undialed_calling_lead(lead.lead_id) is True
+    # settle_s=0 — this test is about the release itself; the settle window
+    # has its own test below.
+    assert await leads_db.release_undialed_calling_lead(
+        lead.lead_id, settle_s=0) is True
     assert (await leads_db.get_lead(lead.lead_id)).status == "pending"
     due = await leads_db.due_leads(limit=50, campaign_id=campaign.campaign_id)
     assert lead.lead_id in [x.lead_id for x in due], "still uncallable"
+
+
+async def test_a_dial_landing_during_the_settle_window_blocks_the_release(campaign):
+    """The two-consumer race from the 2026-08-27 audit (finding 11).
+
+    `status='calling' AND last_called_at IS NULL` is also true for the whole
+    live window between another worker's mark_calling and its
+    record_dial_attempt — a window that contains preflight's network
+    round-trips. A duplicate pop (reaper_sweep requeues the whole processing
+    list blindly) then released a lead whose dial was IN FLIGHT: the lead
+    went back to 'pending' during a real call, mark_result_if_calling no-oped
+    at call end, and the person was dialled again.
+
+    The release therefore waits out the longest plausible preflight window
+    and re-checks: a racing worker stamps last_called_at within seconds,
+    while a genuinely crashed reservation stays NULL forever."""
+    lead = await leads_db.upsert_lead(
+        sheet_row=None, name="racing", phone_e164=_uniq_phone(),
+        campaign_id=campaign.campaign_id, consent_basis="explicit",
+        consent_at=datetime.now(timezone.utc),
+    )
+    await leads_db.mark_queued(lead.lead_id)
+    await leads_db.mark_calling(lead.lead_id)   # worker A, entering preflight
+
+    async def worker_a_stamps_the_attempt():
+        await asyncio.sleep(0.1)                # ...preflight round-trips...
+        await leads_db.record_dial_attempt(lead.lead_id)
+
+    stamp = asyncio.create_task(worker_a_stamps_the_attempt())
+    try:
+        # Worker B's duplicate pop: mark_calling failed, so it asks for the
+        # release. The settle window comfortably covers the stamp above.
+        released = await leads_db.release_undialed_calling_lead(
+            lead.lead_id, settle_s=0.5)
+    finally:
+        await stamp
+
+    assert released is False, "released a lead whose dial was in flight"
+    assert (await leads_db.get_lead(lead.lead_id)).status == "calling"
 
 
 async def test_a_lead_with_a_real_call_in_flight_is_never_released(campaign):

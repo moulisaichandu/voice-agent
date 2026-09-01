@@ -211,3 +211,77 @@ def test_an_ordinary_window_is_left_alone():
     from app import config
 
     assert config._validated_hours(10, 19) == (10, 19)
+
+
+# ── _sheet_id ────────────────────────────────────────────────────────────────
+#
+# Observed live 2026-08-27: GOOGLE_SHEET_ID held the full Google Sheets URL,
+# so every sheets_sync and transcript_reconcile sweep skipped with the
+# open_by_key hint while 63 transcript write-backs sat queued in Redis. A
+# pasted URL is the single most likely malformed value for this variable —
+# the browser address bar is where the operator sees the sheet — so the
+# config boundary extracts the ID rather than punting to a .env edit,
+# following the same "malformed override → warn + degrade" rule as the
+# other helpers.
+
+def test_sheet_id_passes_a_bare_id_through(monkeypatch):
+    monkeypatch.setenv("SOME_SHEET", "1AbC-dEf_1234567890")
+    assert config._sheet_id("SOME_SHEET") == "1AbC-dEf_1234567890"
+
+
+def test_sheet_id_extracts_the_id_from_a_pasted_url(monkeypatch, caplog):
+    monkeypatch.setenv(
+        "SOME_SHEET",
+        "https://docs.google.com/spreadsheets/d/1AbC-dEf_1234567890/edit?gid=0#gid=0",
+    )
+    with caplog.at_level("WARNING"):
+        assert config._sheet_id("SOME_SHEET") == "1AbC-dEf_1234567890"
+    assert "SOME_SHEET" in caplog.text
+    # /admin/config hides this variable's value as sensitive; the extracted
+    # ID must not leak into the log line either.
+    assert "1AbC-dEf_1234567890" not in caplog.text
+
+
+def test_sheet_id_leaves_an_unrecognisable_url_alone(monkeypatch):
+    """A URL with no /d/<id> segment passes through unchanged so
+    sheets.client's unconfigured_reason can still explain it to the operator —
+    guessing an ID out of an arbitrary URL would hide the mistake instead."""
+    monkeypatch.setenv("SOME_SHEET", "https://example.com/not-a-sheet")
+    assert config._sheet_id("SOME_SHEET") == "https://example.com/not-a-sheet"
+
+
+def test_sheet_id_unset_or_blank_is_none(monkeypatch):
+    monkeypatch.delenv("SOME_SHEET", raising=False)
+    assert config._sheet_id("SOME_SHEET") is None
+    monkeypatch.setenv("SOME_SHEET", "   ")
+    assert config._sheet_id("SOME_SHEET") is None
+
+
+# ── how fast the agent speaks ────────────────────────────────────────────────
+
+def test_the_speaking_pace_is_faster_than_sarvams_default():
+    """The lead said so, on the call of 2026-08-31, in Telugu, to the agent
+    itself: "చాలా మెల్లగా మాట్లాడుతున్నాడు" — he is speaking very slowly.
+    The old comment here reasoned that telephony audio is hard to follow so
+    it should "err slow rather than fast"; a real listener on a real 8 kHz
+    call has now disagreed. Measured on that same sentence: pace 1.0 took
+    ~9.5s of audio, 1.2 took ~8.0s."""
+    from app import config
+
+    # The DEFAULT, not the resolved value: .env legitimately overrides this
+    # per deployment (and on the machine this was written on it pins 1.0),
+    # so asserting the live value would make this test a report on somebody's
+    # .env rather than on the shipped behaviour.
+    assert config._DEFAULT_TTS_PACE > 1.0, (
+        "still at Sarvam's neutral pace, which a live lead called too slow"
+    )
+    assert config._DEFAULT_TTS_PACE <= 1.4, (
+        "fast enough to lose a listener on a phone line"
+    )
+
+
+def test_the_pace_can_still_be_tuned_from_env(monkeypatch):
+    """It is a taste judgement on a real voice, so it stays an operator knob
+    rather than a constant — including back to 1.0."""
+    monkeypatch.setenv("SOME_PACE", "1.0")
+    assert config._float("SOME_PACE", 1.2) == 1.0

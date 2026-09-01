@@ -352,3 +352,43 @@ async def test_a_response_with_no_body_attribute_does_not_crash(llm, monkeypatch
 
     with pytest.raises(sarvam_llm.SarvamRenderFailed):
         await sarvam_llm.render(_SCRIPT, language_style=None)
+
+
+# ── the reasoning budget outgrew its ceiling ────────────────────────────────
+#
+# Measured against the LIVE API on 2026-08-27, on the exact default two-way
+# script, after two real calls were abandoned mid-dial:
+#   max_tokens=4096                -> 51.3s, finish_reason=length, content=''
+#                                     (14,447 chars of reasoning_content)
+#   max_tokens=4096  effort=low    -> 50.2s, finish_reason=length, content=''
+#   max_tokens=16384 effort=low    -> 93.1s, finish_reason=stop, real Telugu
+#   max_tokens=16384 no effort     -> 139.9s, finish_reason=stop, real Telugu
+# The 4096 ceiling was chosen when the reasoning spent 1493-2234 tokens; it
+# now spends the whole budget before writing a word, so every render of a
+# NEW campaign returned nothing and its first lead heard silence.
+
+async def test_the_completion_budget_clears_the_models_reasoning(llm):
+    llm()
+    await sarvam_llm.render("Course starts Monday.")
+
+    sent = _FakeAsyncClient.calls[-1]["json"]
+    assert sent["max_tokens"] >= 16384, (
+        "the reasoning spends the whole budget below this and returns no text"
+    )
+
+
+async def test_the_render_asks_for_the_least_reasoning_the_api_allows(llm):
+    """effort=low does not stop the reasoning (it still overran 4096), but it
+    measured 93s against 140s — the difference between a warm-up that lands
+    inside its timeout and one that does not."""
+    llm()
+    await sarvam_llm.render("Course starts Monday.")
+
+    assert _FakeAsyncClient.calls[-1]["json"]["reasoning_effort"] == "low"
+
+
+def test_the_http_timeout_outlasts_a_real_render():
+    """93.1s measured. A 60s timeout killed the warm-up before it could
+    finish, so the cache never filled and every call paid the failure
+    again — exactly what the log said would happen."""
+    assert sarvam_llm._TIMEOUT_S >= 150.0

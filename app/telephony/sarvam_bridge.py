@@ -41,6 +41,7 @@ import re
 
 from fastapi import WebSocket
 
+from app import redis_client
 from app.config import (
     ONEWAY_MAX_SILENT_S,
     RAG_VOICE_DEADLINE_S,
@@ -54,6 +55,7 @@ from app.db.models import TranscriptTurn
 from app.rag.search import NO_MATERIAL_NOTE, search_relevant
 from app.telephony import (
     conversation_llm,
+    lead_name,
     plivo_stream,
     sarvam_llm,
     sarvam_prompts,
@@ -92,6 +94,20 @@ _SENTENCE_END = re.compile(r"(?<=[.!?।])\s+")
 # hang up on someone.
 TWOWAY_MAX_SILENT_S = 20.0
 
+# How long the lead may hold the floor before watch_for_silence stops
+# treating "still speaking" as activity. Generous — a long question is a
+# normal thing to ask — but finite, because the flag is cleared by an
+# END_SPEECH that can be lost, and a stuck flag must not disable the
+# watchdog for the whole call.
+_MAX_LEAD_SPEECH_S = 45.0
+
+# How many times an end_call may be refused because the lead's own question
+# is still unanswered. Finite: a model that only ever wants to end must
+# eventually be allowed to, or a lead who asked something the agent cannot
+# answer is held on a line that will not close. Two attempts is enough for
+# the model to notice the tool result and answer instead.
+_MAX_END_CALL_REFUSALS = 2
+
 # How long the script render may take before the call is abandoned.
 #
 # render() runs AFTER Plivo has answered the leg but BEFORE PlivoCall.run()
@@ -110,8 +126,12 @@ RENDER_DEADLINE_S = float(ONEWAY_MAX_SILENT_S)
 # The lead's goodbye is a call-control signal, not a question for the model.
 # Relying on the end_call tool alone leaves the line open when the model says a
 # polite farewell but omits the tool (observed with the live Sarvam model).
+# Boundaries are LOOKAROUNDS, not consumed characters: _is_lead_goodbye
+# strips matches out and judges the remainder, and a consumed separator left
+# the second half of "bye bye" unmatchable. Longest alternative first, so
+# "bye bye" is one goodbye rather than one plus an unexplained word.
 _GOODBYE_RE = re.compile(
-    r"(?:^|\s)(?:bye|goodbye|good\s+bye|bye\s+bye|alvida)(?:[.!?,\s]|$)",
+    r"(?<![^\s])(?:good\s+bye|bye\s+bye|goodbye|bye|alvida)(?=[.!?,]|\s|$)",
     re.IGNORECASE,
 )
 _GOODBYE_PHRASES = (
@@ -142,6 +162,28 @@ _GOODBYE_PHRASE_TOKENS = tuple(
     _goodbye_tokens(phrase.casefold()) for phrase in _GOODBYE_PHRASES
 )
 
+# Pure agreement, and nothing else. An utterance made only of these is the
+# lead saying "yes, go on" — never a request to end the call, whatever the
+# model concludes. See _lead_only_agreed; a live call ended on "ఆ ఓకే".
+_AFFIRMATION_ONLY = frozenset({
+    "ఓకే", "సరే", "అవును", "ఊ", "ఆ", "ఉమ్", "హా", "అవునండి", "సరేనండి",
+    "ok", "okay", "yes", "yeah", "yep", "hmm", "hm", "uh",
+    "సార్", "గారు", "మేడమ్", "sir", "madam",
+})
+
+# Politeness that surrounds a goodbye without adding a request: "థ్యాంక్స్,
+# బై" and "సరే, ఇక అంతే" are goodbyes, while the same phrases followed by
+# anything substantive are not (see _is_lead_goodbye). Kept small on
+# purpose — every addition widens what can hang up on a live lead.
+_GOODBYE_FILLERS = frozenset({
+    "thanks", "thank", "you", "ok", "okay", "alright", "right", "sir",
+    "madam", "సరే", "ఓకే", "థ్యాంక్స్", "థాంక్స్", "ధన్యవాదాలు", "సార్",
+    "మేడమ్",
+})
+# Deliberately NOT a filler: "అంతే". Adding it would let the garbled
+# repetition this fix exists for — "ఇక అంతే అంతే అంతే" — consume itself
+# entirely and hang up again.
+
 # Spoken when the model calls end_call with no farewell text at all — not
 # suppressed (see _reply's ends_call handling), just never generated. Per
 # CLAUDE.md, measured against the live API: told to say goodbye AND call
@@ -166,6 +208,16 @@ _FALLBACK_FAREWELL = "ధన్యవాదాలు, శుభదినం."
 # system does NOT know the answer, and inventing one is the failure CLAUDE.md's
 # RAG rule exists to prevent. They ask the lead to repeat, or hand off.
 _FALLBACK_REPROMPT = "క్షమించండి, మళ్ళీ ఒకసారి చెప్పగలరా?"
+
+# Spoken once per turn, before a course-material lookup, so the lead hears an
+# acknowledgment about 1.5s in instead of the tool turn's full silent span —
+# measured 3.18-5.23s end to end on the 2026-08-27 live calls (round-1 LLM +
+# lookup + round-2 LLM), during which the first lead of the morning said
+# "హలో?" into the wait. Fixed and short on purpose: the model's own tool-call
+# text stays suppressed (see _reply — it verbosely announced lookups that
+# then failed), and its audio finishes playing at roughly the moment the
+# answer's first frame is ready. Pure Telugu, no course facts, no promises.
+_RAG_HOLDING_LINE = "ఒక్క క్షణం, చూసి చెప్తాను."
 _FALLBACK_HANDOFF = (
     "క్షమించండి, ఇప్పుడు సాంకేతిక సమస్య వస్తోంది. "
     "మా టీమ్ మిమ్మల్ని త్వరలో సంప్రదిస్తుంది."
@@ -183,17 +235,76 @@ def _is_lead_goodbye(text: str) -> bool:
     closers must still receive an answer. The LLM remains responsible for
     nuanced decisions; this is the reliable fast path for an unambiguous
     goodbye.
+
+    THE WHOLE utterance must be the goodbye. Matching a phrase anywhere
+    inside a longer transcript hung up on leads who were still talking —
+    reported live 2026-08-29 as "the call cuts in the middle of the
+    conversation" — because this path fires the instant a transcript
+    arrives, with no model turn to sanity-check it, and Sarvam's Telugu STT
+    garbles constantly on 8 kHz audio ("ఇక అంతే అంతే అంతే" from a lead who
+    was mid-question). Three other layers can still end a call, so a MISSED
+    goodbye costs one extra turn while a FALSE one hangs up on a customer.
     """
     normalized = " ".join(text.strip().split()).casefold()
-    if _GOODBYE_RE.search(normalized):
-        return True
-    tokens = _goodbye_tokens(normalized)
-    return any(
-        tokens[i:i + len(phrase)] == phrase
-        for phrase in _GOODBYE_PHRASE_TOKENS
-        if phrase
-        for i in range(len(tokens) - len(phrase) + 1)
-    )
+    if not normalized:
+        return False
+    # Cut the goodbyes out, then judge what is LEFT. Removing them first is
+    # what keeps the multi-word Latin spellings ("good bye") working, which
+    # a token-at-a-time walk cannot see.
+    remainder, latin_hits = _GOODBYE_RE.subn(" ", normalized)
+    tokens = _goodbye_tokens(remainder)
+    phrase_hits = 0
+    index = 0
+    kept: list[str] = []
+    while index < len(tokens):
+        for phrase in _GOODBYE_PHRASE_TOKENS:
+            if phrase and tokens[index:index + len(phrase)] == phrase:
+                index += len(phrase)
+                phrase_hits += 1
+                break
+        else:
+            kept.append(tokens[index])
+            index += 1
+    if not (latin_hits or phrase_hits):
+        return False
+    # Whatever survives must be politeness. A single leftover word means the
+    # lead was still saying something, and something is not a goodbye.
+    return all(token in _GOODBYE_FILLERS for token in kept)
+
+
+# Words a lead uses to PROMPT a reply rather than to ask anything: "hello?",
+# "go on", "can you hear me". They carry no question — the lead is filling a
+# silence they should not be sitting in.
+#
+# Measured on the 2026-08-27 live call: the lead asked for course details, the
+# reply took 7.5s (llm=6.01s over two tool rounds), and at about the 5s mark
+# they said "హలో". That landed after the second round's request was already
+# sent, so the missed-fragment follow-up correctly fired for it — and the model,
+# handed "హలో" with the freshly-spoken course list above it in history,
+# answered by reciting the course list a second time. The lead heard the same
+# answer twice.
+#
+# DELIBERATELY tiny, and every entry is a word that cannot be an answer to
+# anything the agent asks. "అవును"/"ఓకే" are excluded on purpose: the agent
+# really does ask yes/no questions ("shall I tell you the fee?"), and on the
+# same day's second call the lead answered exactly that with "అవును".
+_PROMPTING_TOKENS = frozenset({
+    "హలో", "హెలో", "హల్లో",          # hello
+    "చెప్పండి", "చెప్పు", "చెప్పండీ",   # go on / tell me
+    "ఉన్నారా", "వినిపిస్తోందా",        # are you there / can you hear me
+    "hello", "helo", "hallo",
+})
+
+
+def _is_only_prompting(text: str) -> bool:
+    """Whether *text* is nothing but a nudge for the agent to speak.
+
+    Whole-token matching, like the goodbye check and for the same reason:
+    "చెప్పండి" is a prompt on its own but the tail of a real question in
+    "కోర్స్ డీటెయిల్స్ చెప్పండి", and substring matching cannot tell those apart.
+    """
+    tokens = _goodbye_tokens(text.casefold())
+    return bool(tokens) and all(t in _PROMPTING_TOKENS for t in tokens)
 
 # How long to wait for the lead to finish before answering.
 #
@@ -240,13 +351,13 @@ class SpokenLedger:
     """
 
     def __init__(self) -> None:
-        # (text, cumulative_ms_at_end_of_this_text)
-        self._entries: list[tuple[str, int]] = []
+        # (text, cumulative_ms_at_end_of_this_text, this_text's_own_ms)
+        self._entries: list[tuple[str, int, int]] = []
         self._total_ms = 0
 
     def add(self, text: str, duration_ms: int) -> None:
         self._total_ms += duration_ms
-        self._entries.append((text, self._total_ms))
+        self._entries.append((text, self._total_ms, duration_ms))
 
     def reset(self) -> None:
         """Start a new agent turn. Playback is measured from each turn's own
@@ -259,7 +370,7 @@ class SpokenLedger:
         """Everything that was handed to the synthesiser. For logs and
         diagnostics — never for the conversation history, which must only ever
         contain what was heard."""
-        return " ".join(text for text, _ in self._entries)
+        return " ".join(text for text, *_ in self._entries)
 
     def heard_within(self, played_ms: int) -> str:
         """The part of this turn that finished playing by *played_ms*.
@@ -270,8 +381,17 @@ class SpokenLedger:
         repeating itself. Redundancy is a much cheaper failure than incoherence
         on a phone call.
         """
-        return " ".join(text for text, ends_at in self._entries
-                        if ends_at <= played_ms)
+        # `duration > 0` is not a nicety. Sarvam's TTS ends its stream on an
+        # error frame with ZERO yields and no exception (a rejected speaker, a
+        # config the server refuses, credits gone), so say() records the
+        # sentence at 0 ms. Without this guard those entries satisfied
+        # `ends_at <= played_ms` even at played_ms == 0, and a later barge-in
+        # truncate kept text the lead never heard a syllable of. The guard is
+        # the sentence's OWN duration, not the running total: an error frame
+        # AFTER a played sentence inherits a positive ends_at, and an
+        # ends_at > 0 check claimed that unplayed sentence too.
+        return " ".join(text for text, ends_at, duration in self._entries
+                        if ends_at <= played_ms and duration > 0)
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -327,6 +447,11 @@ class _Conversation:
         # Where that fragment landed in history, against what the last request
         # to the model actually carried — see _reply_when_they_stop's gate.
         self._missed_at = 0
+        # EVERY fragment missed by the committed round, not just the last.
+        # A single slot let a trailing "హలో" classify the whole round's
+        # follow-up as a nudge and silently drop a real question that arrived
+        # just before it (confirmed with an executed repro, 2026-08-27).
+        self._missed_texts: list[str] = []
         self._last_request_len = 0
         # Wall-clock of the last thing either side did. The silence watchdog
         # measures against this rather than against call start, so a lead who
@@ -336,11 +461,19 @@ class _Conversation:
         # Index into self.turns / self.history of the agent turn currently
         # being spoken, so a barge-in can rewrite exactly that one.
         self._agent_turn_index: int | None = None
+        # Whether the turn at _agent_turn_index also has a history entry.
+        # False for an ASIDE (the RAG holding line): truncate must then leave
+        # history entirely alone — the newest assistant message there is
+        # somebody else's (typically the tool_calls bookkeeping, whose
+        # deletion orphans its tool result and 400s every later completion).
+        self._agent_turn_in_history: bool = True
         # Sarvam's own view of whether the lead is mid-utterance, from its
         # START_SPEECH / END_SPEECH VAD signals. Read by _reply_when_they_stop
         # so a reply need not blind-wait the full ceiling once Sarvam has
         # already said the lead stopped.
         self._lead_speaking = False
+        self._speech_started_at: float | None = None
+        self._end_call_refusals = 0
         # Per-turn latency accounting — see _log_turn_latency. Measured from
         # the first thing the lead said that nobody had answered yet (a burst
         # is ONE turn, so later fragments deliberately do not reset it) to the
@@ -350,6 +483,11 @@ class _Conversation:
         # tell them apart.
         self._turn_opened_at: float | None = None
         self._turn_gate_done: float | None = None
+        # t0 -> t1: END_SPEECH to final transcript. The recogniser's
+        # own thinking time, which the lead waits through and which no
+        # other number here covers — `total` starts at the transcript.
+        self._speech_ended_at: float | None = None
+        self._turn_stt_s = 0.0
         self._turn_say_started: float | None = None
         self._turn_llm_s = 0.0
         self._turn_tool_s = 0.0
@@ -389,6 +527,7 @@ class _Conversation:
         speak = (now - self._turn_say_started) if self._turn_say_started else 0.0
         logger.info(
             f"[sarvam] lead={self.lead_id} turn latency: "
+            f"stt={self._turn_stt_s:.2f}s "
             f"gate={gate:.2f}s llm={self._turn_llm_s:.2f}s"
             f"({self._turn_llm_rounds} round"
             f"{'' if self._turn_llm_rounds == 1 else 's'}) "
@@ -402,6 +541,7 @@ class _Conversation:
         self._turn_opened_at = None
         self._turn_gate_done = None
         self._turn_say_started = None
+        self._turn_stt_s = 0.0
         self._turn_llm_s = 0.0
         self._turn_tool_s = 0.0
         self._turn_llm_rounds = 0
@@ -433,16 +573,52 @@ class _Conversation:
 
     # ── speaking ─────────────────────────────────────────────────────────────
 
-    async def say(self, tts: sarvam_tts.SarvamTTS, text: str) -> None:
+    async def say(self, tts: sarvam_tts.SarvamTTS, text: str, *,
+                  aside: bool = False) -> None:
         """Speak *text*, recording what actually reached the lead.
 
         Each sentence is synthesised, played, and logged to the ledger with its
         audio duration. If the generation changes mid-way the lead has
         interrupted, so the rest is abandoned unplayed.
+
+        *aside* is True only for the RAG holding line, and bundles three
+        deliberate exclusions (2026-08-27, the second and third confirmed by
+        an adversarial review after the first shipped alone):
+          1. It does not set _heard_something_this_turn or fire the
+             turn-latency log — that flag means "an ANSWER reached the lead"
+             and gates the failed-turn counter reset, _say_fallback's early
+             return and the nudge suppression. A holding line that set it
+             would disarm all three: a call whose every answer failed would
+             say "ఒక్క క్షణం" forever and grade as a clean success.
+          2. It is NOT appended to the model history. It carries nothing the
+             model needs, and as an assistant-with-content message it made
+             _awaiting_answer report a cancelled lookup's question as
+             answered — the cough-repair then never re-asked, the call went
+             silent, and graded done.
+          3. _agent_turn_in_history is set False so a barge-in's truncate
+             leaves history alone — the newest assistant message there is
+             the tool_calls bookkeeping, whose deletion orphans its tool
+             result and 400s every later completion.
+        The ledger/transcript recording is unconditional either way: the
+        line WAS spoken, and the record says what the lead heard.
         """
         # This is the last boundary before Sarvam TTS. Keep every fallback,
         # tool farewell, opening, and normal reply safe even if it bypassed
         # the renderer or came from a cached/third-party model response.
+        #
+        # normalize_spoken_telugu drops words in scripts the synthesiser
+        # cannot speak, which rescues the sentence for the lead but hides a
+        # real quality signal — so it is reported here before it disappears.
+        # Live 2026-09-01: the model slipped the Armenian "պահին" into a
+        # Telugu sentence and TTS read it aloud; the same check catches the
+        # Hindi drift CLAUDE.md documents.
+        unspeakable = sarvam_prompts.foreign_script_tokens(text)
+        if unspeakable:
+            logger.warning(
+                f"[sarvam] lead={self.lead_id} the model emitted words that "
+                f"are not Telugu or English and cannot be spoken — dropping "
+                f"{unspeakable!r}. Check the language rule in the prompt."
+            )
         text = sarvam_prompts.normalize_spoken_telugu(text)
         sentences = _split_sentences(text)
         if not sentences:
@@ -455,8 +631,10 @@ class _Conversation:
         self.call.mark_response_boundary()
 
         self._agent_turn_index = len(self.turns)
+        self._agent_turn_in_history = not aside
         self.turns.append(TranscriptTurn(role="agent", text=text))
-        self.history.append({"role": "assistant", "content": text})
+        if not aside:
+            self.history.append({"role": "assistant", "content": text})
 
         self._turn_say_started = self._loop.time()
         spoke_a_frame = False
@@ -504,8 +682,9 @@ class _Conversation:
                         # The lead's wait ends HERE, at the first frame — not
                         # when the whole answer has been sent.
                         spoke_a_frame = True
-                        self._heard_something_this_turn = True
-                        self._log_turn_latency(spoke=True)
+                        if not aside:
+                            self._heard_something_this_turn = True
+                            self._log_turn_latency(spoke=True)
                     spoken_ms += duration_ms
                 self.ledger.add(sentence, spoken_ms)
                 self.note_activity()
@@ -521,6 +700,25 @@ class _Conversation:
             # something to report.
             if spoke_a_frame:
                 self._log_playback_gaps(gap_total_ms, gap_max_ms, sentences_started)
+            else:
+                # NOT ONE FRAME reached the lead, so this turn did not happen.
+                # say() appends to turns/history BEFORE synthesising, which is
+                # what lets a barge-in truncate mid-sentence — but it also
+                # means a speak() that raises, or one that ends on an error
+                # frame with zero yields, leaves a turn nobody heard sitting in
+                # the record. truncate_to_what_was_heard cannot clean that up
+                # on the raise path: converse() catches the error and
+                # _cancel_reply early-returns with no reply task in flight.
+                #
+                # It matters most on the OPENING. The stored transcript would
+                # certify an AI disclosure that was never played, and
+                # call_routes' post-call [compliance] check reads that same
+                # transcript and passes on it.
+                #
+                # Reuses the ledger's own "nothing played" branch, which drops
+                # the turn rather than leaving an empty one, and is idempotent
+                # (it clears _agent_turn_index on first use).
+                self.truncate_to_what_was_heard()
 
     async def deliver_opening(self, tts: sarvam_tts.SarvamTTS,
                               opening: str) -> None:
@@ -574,13 +772,51 @@ class _Conversation:
             if self.reply_task is not None and not self.reply_task.done():
                 self.note_activity()
                 continue
+            # And so does the lead's own voice. Sarvam emits speech_started
+            # ONCE and then nothing until the transcript, so a lead in the
+            # middle of a long question looked identical to a dead line and
+            # was hung up on mid-sentence — reported live 2026-08-29.
+            # Bounded by _MAX_LEAD_SPEECH_S: a lost END_SPEECH must not
+            # disable the watchdog for the rest of the call.
+            if (self._lead_speaking and self._speech_started_at is not None
+                    and self._loop.time() - self._speech_started_at
+                    < _MAX_LEAD_SPEECH_S):
+                self.note_activity()
+                continue
             quiet_since = max(self.last_activity, self.call.play_end)
             if self._loop.time() - quiet_since >= TWOWAY_MAX_SILENT_S:
                 logger.info(
                     f"[sarvam] lead={self.lead_id} ending a conversation that "
                     f"has been silent for {TWOWAY_MAX_SILENT_S:.0f}s."
                 )
-                self.call.note_exit("twoway_silence")
+                # A conversation that ended in silence and one where the
+                # agent was never audible AT ALL are different events. The
+                # second is a TTS outage: grading it a clean finish marked the
+                # lead done and retried nobody, so a campaign of totally
+                # silent calls looked like a campaign of good ones. Mirrors
+                # the one-way path's own no-audio distinction.
+                # Three different endings wear the same silence:
+                #   - a real conversation that finished        -> clean
+                #   - the agent was never audible at all       -> TTS outage
+                #   - the agent was audible but only apologised, and ended on
+                #     the handoff line promising a callback nothing schedules
+                #                                              -> brain outage
+                # Grading the last two 'done' marked the lead done, retried
+                # nobody, and showed the operator a campaign of successful
+                # calls while every lead heard an apology and a promise no one
+                # will keep.
+                if not self.call.audio_seen:
+                    reason = "twoway_no_audio"
+                elif self._failed_turns >= _MAX_FAILED_TURNS:
+                    logger.error(
+                        f"[sarvam] lead={self.lead_id} ending a call that never "
+                        "answered anything — the lead heard only apologies and "
+                        "the handoff promise. Check the conversation provider."
+                    )
+                    reason = "twoway_never_answered"
+                else:
+                    reason = "twoway_silence"
+                self.call.note_exit(reason)
                 break
         self.call.stop.set()
 
@@ -596,12 +832,24 @@ class _Conversation:
         index = self._agent_turn_index
         self._agent_turn_index = None
 
+        # An aside (the RAG holding line) has NO history entry, so both
+        # branches below must leave history alone for it: the newest
+        # assistant message in history is then someone else's — typically
+        # the tool_calls bookkeeping, and rewriting or deleting THAT orphans
+        # its tool result, which OpenAI rejects on every later completion.
+        # The walks also skip tool_calls messages outright as defence in
+        # depth: they are bookkeeping, never the spoken turn.
+        in_history = self._agent_turn_in_history
+        self._agent_turn_in_history = True
+
         if heard:
             self.turns[index] = TranscriptTurn(role="agent", text=heard)
-            for message in reversed(self.history):
-                if message.get("role") == "assistant":
-                    message["content"] = heard
-                    break
+            if in_history:
+                for message in reversed(self.history):
+                    if (message.get("role") == "assistant"
+                            and not message.get("tool_calls")):
+                        message["content"] = heard
+                        break
             return
 
         # Nothing played at all: as far as the conversation is concerned the
@@ -609,10 +857,13 @@ class _Conversation:
         # which would read as the agent having said nothing on purpose.
         if index < len(self.turns):
             del self.turns[index]
-        for position in range(len(self.history) - 1, 0, -1):
-            if self.history[position].get("role") == "assistant":
-                del self.history[position]
-                break
+        if in_history:
+            for position in range(len(self.history) - 1, 0, -1):
+                message = self.history[position]
+                if (message.get("role") == "assistant"
+                        and not message.get("tool_calls")):
+                    del self.history[position]
+                    break
 
     # ── listening ────────────────────────────────────────────────────────────
 
@@ -623,6 +874,7 @@ class _Conversation:
         # _reply_when_they_stop polls, so a reply gated on it must not depend
         # on whether the agent happened to be talking at the same moment.
         self._lead_speaking = True
+        self._speech_started_at = self._loop.time()
         if not await self.call.interrupt():
             # Inside the opening-disclosure guard or the greeting grace window.
             # PlivoCall said no, and it owns that decision.
@@ -652,10 +904,75 @@ class _Conversation:
         the interrupting sound is over and the line is genuinely quiet again.
         """
         self._lead_speaking = False
+        self._speech_started_at = None
+        self._speech_ended_at = self._loop.time()
         if self.reply_task is not None and not self.reply_task.done():
             return  # already armed — the wait it's polling will now unblock
         if self._awaiting_answer():
             self.reply_task = asyncio.create_task(self._reply_when_they_stop(tts))
+
+    def _lead_has_open_question(self) -> bool:
+        """The lead's last utterance is a question nobody has answered yet.
+
+        Walks back to whichever comes first: an assistant turn WITH WORDS
+        (something was answered since, so nothing is outstanding) or the
+        lead's own last message. Tool bookkeeping is skipped, exactly as in
+        _awaiting_answer — a lookup in flight has answered nothing.
+        """
+        for message in reversed(self.history):
+            role = message.get("role")
+            if role == "assistant" and message.get("content"):
+                return False
+            if role == "user":
+                text = (message.get("content") or "").strip()
+                return bool(text) and text.endswith(("?", "？")) \
+                    and not _is_lead_goodbye(text)
+        return False
+
+    def _lead_only_agreed(self) -> bool:
+        """Whether the lead's last words were a bare "yes" and nothing else.
+
+        The observed failure, 2026-09-01: a call ended on "ఆ ఓకే." An
+        affirmation is the lead AGREEING with the agent — it is never a
+        request to hang up, and the owner's rule is that the call ends when
+        they say goodbye.
+
+        Deliberately narrow. "సరే బాయ్" carries బాయ్, "Okay, thank you"
+        carries thanks — both are wrap-ups the model should still be trusted
+        to end on, and Sarvam's STT spells a spoken "bye" in ways no token
+        list reliably catches (బాయ్ was transcribed on a live call and is
+        not in _GOODBYE_PHRASES). So this refuses ONLY an utterance that is
+        pure agreement, and leaves every richer ending to the model.
+        """
+        for message in reversed(self.history):
+            if message.get("role") != "user":
+                continue
+            tokens = _goodbye_tokens((message.get("content") or "").casefold())
+            return bool(tokens) and all(t in _AFFIRMATION_ONLY for t in tokens)
+        return False
+
+    def _should_refuse_end_call(self) -> bool:
+        """Whether an end_call right now would hang up on a live lead.
+
+        The rule the owner asked for on 2026-09-01, after a call ended on a
+        bare "ఆ ఓకే": the call ends when the LEAD says goodbye, and not
+        before. An earlier version refused only when the lead's last words
+        were a QUESTION, which let an affirmation through — and an
+        affirmation is the lead agreeing with the agent, never asking to
+        leave.
+
+        Refusing is safe: watch_for_silence still ends a call nobody is
+        speaking on, so a lead who simply stops talking is never trapped,
+        and the refusal count is capped besides.
+
+        PURE — _reply consults it to decide whether to speak the farewell,
+        and _run_tools consults it again to decide whether to end; both must
+        get the same answer for one reply, so the counter is incremented by
+        _run_tools alone.
+        """
+        if self._end_call_refusals >= _MAX_END_CALL_REFUSALS:
+            return False
+        return self._lead_only_agreed() or self._lead_has_open_question()
 
     def _awaiting_answer(self) -> bool:
         """Whether the lead has said something the agent has not yet answered.
@@ -704,6 +1021,13 @@ class _Conversation:
         # its first use, so on_barge_in's own call stays harmless.
         self.truncate_to_what_was_heard()
         self._discard_incomplete_tool_turn()
+        # Fragments flagged for the round just cancelled are consumed by no
+        # one — but they are already in history, and the REPLACEMENT round
+        # re-reads the whole history, so they still get answered. Leaving
+        # them flagged let a stale real question from a dead round defeat a
+        # LATER round's lone-nudge suppression and re-recite an answer.
+        self._missed_while_committed = False
+        self._missed_texts = []
 
     def _discard_incomplete_tool_turn(self) -> None:
         """Remove a tool-call turn interrupted by barge-in/cancellation.
@@ -754,6 +1078,12 @@ class _Conversation:
             self.call.note_exit("sarvam_lead_goodbye")
             self.call.stop.set()
             return
+        if self._speech_ended_at is not None:
+            # Only when END_SPEECH actually preceded the transcript. Sarvam
+            # delivers the two in either order, and a transcript that beat
+            # the signal must report nothing rather than a negative wait.
+            self._turn_stt_s = max(0.0, self._loop.time() - self._speech_ended_at)
+            self._speech_ended_at = None
         if self._turn_opened_at is None:
             # First unanswered thing the lead has said. A burst is ONE turn
             # from their point of view — they have been waiting since this
@@ -776,6 +1106,7 @@ class _Conversation:
             # a second task racing the first.
             self._missed_while_committed = True
             self._missed_at = len(self.history)
+            self._missed_texts.append(text)
             return
         self.reply_task = asyncio.create_task(self._reply_when_they_stop(tts))
 
@@ -829,7 +1160,29 @@ class _Conversation:
             # "answered" even for a round that never saw it. Comparing the last
             # request's history length against where the fragment landed is the
             # question actually being asked.
-            if self._last_request_len < self._missed_at:
+            #
+            # ...and not when the fragments were only the lead nudging us to
+            # speak. Answering "హలో" once the answer they were waiting for has
+            # just played makes the model recite it again — see
+            # _PROMPTING_TOKENS for the call this was measured on. The nudge is
+            # already satisfied by the turn that just spoke, so the honest
+            # response to it is nothing. Gated on that turn HAVING spoken:
+            # if it produced no audio, the lead's "hello?" is still unanswered
+            # and deserves the follow-up. EVERY missed fragment must be a
+            # nudge for the suppression to apply — judging only the last one
+            # let a trailing "హలో" silently cancel the follow-up owed to a
+            # real question that arrived just before it in the same round.
+            missed_texts = self._missed_texts
+            self._missed_texts = []
+            prompting = (self._heard_something_this_turn
+                         and bool(missed_texts)
+                         and all(_is_only_prompting(t) for t in missed_texts))
+            if prompting:
+                logger.info(
+                    f"[sarvam] lead={self.lead_id} dropping follow-up for "
+                    f"{missed_texts!r} — the turn it was nudging already spoke"
+                )
+            if self._last_request_len < self._missed_at and not prompting:
                 if self._turn_opened_at is None:
                     self._turn_opened_at = self._loop.time()
                 self.reply_task = asyncio.create_task(
@@ -904,14 +1257,34 @@ class _Conversation:
                         reply_text = sarvam_prompts.normalize_spoken_telugu(
                             reply.text)
                         await self.say(tts, reply_text)
-                        self._failed_turns = 0
+                        # say() returning is not evidence the lead HEARD
+                        # anything: an error frame from Sarvam ends the stream
+                        # with zero yields and no exception. Resetting the
+                        # counter there let a total TTS outage look like a
+                        # healthy conversation, turn after turn, and the
+                        # reprompt built for this symptom never fired.
+                        if self._heard_something_this_turn:
+                            self._failed_turns = 0
+                        elif (self.generation == generation
+                              and not self.call.stop.is_set()):
+                            logger.error(
+                                f"[sarvam] lead={self.lead_id} the synthesiser "
+                                "produced no audio for this turn — the lead "
+                                "heard nothing. Treating it as a failed turn."
+                            )
+                            await self._say_fallback(tts, generation)
                     return
                 # Text that arrives WITH a tool call is usually filler — "let
                 # me look that up for you". On a real call the agent
                 # announced its own lookup twice and then reported failure,
-                # which is three synthesised turns to deliver nothing. A
-                # search takes about a second; silence is shorter than saying
-                # so. The answer that follows is what the lead wants.
+                # which is three synthesised turns to deliver nothing — so
+                # the MODEL's text stays suppressed. But "silence is shorter
+                # than saying so" undercounted the silence: the lead's wait
+                # is round-1 LLM + lookup + round-2 LLM, measured 3.18-5.23s
+                # on the 2026-08-27 live calls, and the lead talked into it.
+                # A FIXED holding line (below, after the ends_call branch)
+                # covers that window instead: one short canned sentence, not
+                # the model's variable announcement.
                 #
                 # end_call is the one exception: the tool's own description
                 # tells the model to send its farewell "together with"
@@ -924,6 +1297,12 @@ class _Conversation:
                 # answering."
                 ends_call = any(tc.name == conversation_llm.END_CALL_TOOL_NAME
                                 for tc in reply.tool_calls)
+                if ends_call and self._should_refuse_end_call():
+                    # The lead asked something and it has not been answered.
+                    # Speaking the farewell here would say goodbye to a
+                    # question — _run_tools refuses the ending itself and
+                    # tells the model to answer instead.
+                    ends_call = False
                 if ends_call:
                     # No next round for this text to arrive in, so speak
                     # whatever the model wrote — or, if it wrote nothing at
@@ -935,9 +1314,28 @@ class _Conversation:
                             reply.text or _FALLBACK_FAREWELL
                         ),
                     )
-                elif reply.text:
-                    logger.debug(f"[sarvam] lead={self.lead_id} not speaking "
-                                 f"tool-call filler: {reply.text[:60]!r}")
+                else:
+                    if reply.text:
+                        logger.debug(
+                            f"[sarvam] lead={self.lead_id} not speaking "
+                            f"tool-call filler: {reply.text[:60]!r}")
+                    # Before _run_tools on purpose: its ~1.5s of audio plays
+                    # while the lookup and the next round compute. Spoken as
+                    # an ASIDE — see say(): it stays out of the model
+                    # history entirely, so it can never displace the
+                    # tool_calls/tool pairing or convince _awaiting_answer
+                    # that a cancelled lookup's question was answered. First
+                    # round only — a chained lookup already has it playing —
+                    # and never as the call's first spoken agent turn:
+                    # call_routes re-checks that turn for the AI disclosure
+                    # at ERROR level, and if the opening never played, a
+                    # holding line must not become the evidence.
+                    searching = any(
+                        tc.name == conversation_llm.SEARCH_TOOL_NAME
+                        for tc in reply.tool_calls)
+                    if (_round == 0 and searching
+                            and any(t.role == "agent" for t in self.turns)):
+                        await self.say(tts, _RAG_HOLDING_LINE, aside=True)
                 if await self._run_tools(reply):
                     return  # end_call: nothing further to say
             logger.warning(
@@ -979,6 +1377,30 @@ class _Conversation:
 
         for tool_call in reply.tool_calls:
             if tool_call.name == conversation_llm.END_CALL_TOOL_NAME:
+                if self._should_refuse_end_call():
+                    # Instructions alone did not hold: across three live
+                    # calls the model ended on an affirmation, on garbled
+                    # speech, and finally on a plain question ("will you
+                    # tell me class timings?"). The rule is enforced here
+                    # instead, where it cannot be talked out of.
+                    self._end_call_refusals += 1
+                    logger.warning(
+                        f"[sarvam] lead={self.lead_id} refused end_call — the "
+                        "lead has not said goodbye "
+                        f"({self._end_call_refusals}/{_MAX_END_CALL_REFUSALS})."
+                    )
+                    self.history.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.call_id,
+                        "content": ("The call was NOT ended: the lead has "
+                                    "not said goodbye. An 'okay' or a nod is "
+                                    "not a farewell. Continue the "
+                                    "conversation in Telugu — answer what "
+                                    "they said, or ask what else they would "
+                                    "like to know — and do not call end_call "
+                                    "again until they actually say goodbye."),
+                    })
+                    continue
                 # A conversation the agent ended cleanly, not a dropped call.
                 # 'sarvam_end_call' is in plivo_stream._CLEAN_EXITS for this.
                 self.call.note_exit("sarvam_end_call")
@@ -1041,6 +1463,210 @@ class _Conversation:
                 "content": answer,
             })
         return False
+
+
+# The documents, read BEFORE the call — the owner's direction after the
+# 2026-08-29 test round, where every common question paid a tool round-trip
+# and a spoken waiting line, and the fee question STILL missed (top-k
+# crowd-out needs no conjunction: "SEO course fees" drowns the fee chunk in
+# SEO-syllabus matches with nothing for the query splitter to split). These
+# fixed English queries sweep the topics every call asks about; the digest
+# rides in the system prompt so the model answers them in ONE round, and
+# the search tool remains for the long tail.
+#
+# search_relevant, never search_permissive: the digest feeds live calls, so
+# the relevance floor applies to it exactly as to the tool (CLAUDE.md).
+_FACTS_QUERIES = (
+    "course fees and complete price structure for all programs",
+    "digital marketing course programs and levels overview",
+    "course duration batches and timings",
+    "placement internship and job support",
+)
+_FACTS_CACHE_KEY = "sarvam:course_facts:v1"
+_FACTS_TTL_S = 3600          # re-ingested documents propagate within the hour
+# Paid on EVERY request, so it is a latency knob as much as a size one:
+# measured 2026-08-29, a 6.9k digest cost ~0.6s per turn against no digest
+# at all. 4500 is the smallest value that still carried every fact once the
+# budget was shared per topic and the curriculum noise was filtered out —
+# below ~3000 the fee table itself starts falling off. Re-measure with the
+# cap sweep in this file's tests if the documents grow substantially.
+_FACTS_MAX_CHARS = 4500
+# One failed build arms this instead of every call re-paying the stall for
+# the whole outage — an answered lead in silence each time, per the review.
+_FACTS_COOLDOWN_KEY = "sarvam:course_facts:cooldown"
+_FACTS_COOLDOWN_S = 120
+# The fetch sits between Plivo answering and the opening being spoken, and a
+# HANG (a slow-but-alive embeddings endpoint, a wedged pool) is not an
+# exception — neither degrade layer fires on it. Deadline-bounded at the
+# call site exactly like the render (RENDER_DEADLINE_S) and the in-call
+# lookups (RAG_VOICE_DEADLINE_S): a cold cache may cost this much silence
+# once, never more.
+FACTS_DEADLINE_S = 3.0
+
+
+# Lines the digest carries no benefit from, dropped before it is measured
+# against the cap. The retrieval pulls whole document regions, so a query
+# about programs drags in the numbered curriculum index behind it — measured
+# 2026-08-29 as 38% of a 6.8k-char digest, paid on EVERY request (~0.6s per
+# turn). None of it answers the fee/duration/placement questions the digest
+# exists for, and the search tool still covers it for the long tail.
+_DIGEST_NOISE = (
+    re.compile(r"^\s*-?\s*\d+\.\s"),          # "- 113. What is SEO?"
+    re.compile(r"^\s*www\.|@|\[URL"),          # contact/footer lines
+)
+
+
+def _useful_facts(block: str) -> str:
+    """*block* with curriculum-index and contact noise removed."""
+    kept = [line for line in block.splitlines()
+            if line.strip() and not any(p.search(line) for p in _DIGEST_NOISE)]
+    return "\n".join(kept).strip()
+
+
+async def _course_facts() -> str:
+    """The course-facts digest, cached per corpus. Never raises: the digest
+    is an optimisation, and RAG being down must not stop a call — the tool
+    path still covers every question, just slower."""
+    r = None
+    try:
+        r = redis_client.get_redis()
+        cached = await r.get(_FACTS_CACHE_KEY)
+        if cached:
+            return cached.decode() if isinstance(cached, bytes) else str(cached)
+        if await r.get(_FACTS_COOLDOWN_KEY):
+            return ""    # a recent build failed; don't stall this call too
+    except Exception:  # noqa: BLE001 - cache is best-effort
+        pass
+    try:
+        results = await asyncio.gather(
+            *(search_relevant(q) for q in _FACTS_QUERIES))
+    except Exception as exc:  # noqa: BLE001 - degrade to tool-only behaviour
+        logger.warning(
+            f"[sarvam] course-facts digest unavailable "
+            f"({type(exc).__name__}: {exc}) — the search tool still covers "
+            "questions, at a round-trip per answer."
+        )
+        if r is not None:
+            with contextlib.suppress(Exception):
+                await r.set(_FACTS_COOLDOWN_KEY, "1", ex=_FACTS_COOLDOWN_S)
+        return ""
+    # A share of the budget per TOPIC, not first-come-first-served. The fee
+    # query returns the most verbose chunks, so greedily filling from it ate
+    # the whole cap and the duration/mode facts fell off the end entirely —
+    # measured 2026-08-29 at every cap below 7000, while the agent was
+    # simultaneously being asked those exact questions on live calls.
+    # Unspent budget rolls forward, so a quiet topic never wastes the room a
+    # verbose one could have used.
+    share = max(1, _FACTS_MAX_CHARS // max(1, len(results)))
+    seen: set[str] = set()
+    blocks: list[str] = []
+    total = 0
+    allowance = 0
+    for result in results:
+        allowance += share
+        if not result or result == NO_MATERIAL_NOTE:
+            continue
+        for raw_block in result.split("\n\n---\n\n"):
+            block = _useful_facts(raw_block)
+            if not block or block in seen:
+                continue
+            # Whole blocks only. A raw character slice could land inside a
+            # figure — "Total Fee: ₹1,5" — and the prompt presents this text
+            # as fact to answer from directly, with no fresh lookup to
+            # correct it. The straddling block is dropped, never halved.
+            cost = len(block) + (2 if blocks else 0)
+            if total + cost > min(allowance, _FACTS_MAX_CHARS):
+                continue
+            seen.add(block)
+            blocks.append(block)
+            total += cost
+    digest = "\n\n".join(blocks)
+    if digest and r is not None:
+        with contextlib.suppress(Exception):
+            await r.set(_FACTS_CACHE_KEY, digest, ex=_FACTS_TTL_S)
+    return digest
+
+
+# Strong references to rebuilds that outlived their caller's patience. Without
+# these the task is only weakly referenced and may be garbage collected
+# mid-flight, which is the difference between "the next call has the facts"
+# and "every call rebuilds them".
+_BACKGROUND_REBUILDS: set[asyncio.Task] = set()
+
+
+async def _spoken_name(lead_id: str, raw_name: str | None) -> str:
+    """*raw_name* in Telugu script, or as written if that cannot be had.
+
+    Sarvam's Telugu TTS reads a Latin run with English phonetics — the owner
+    heard "Mouli గారు" come out wrong on a live call. Bounded and degrading on
+    purpose: a mispronounced name is a blemish, a delayed or missing greeting
+    is a broken call.
+
+    Shared by both modes. It lived inside _prepare_opening (two-way only) and
+    every one-way transcript still shows "నమస్తే Mouli గారు" as late as
+    2026-08-18 — same synthesiser, same mispronunciation, so the same fix.
+    """
+    if not raw_name:
+        return ""
+    try:
+        return await asyncio.wait_for(
+            lead_name.telugu_name(raw_name), FACTS_DEADLINE_S)
+    except Exception as exc:  # noqa: BLE001 - incl. TimeoutError
+        logger.warning(
+            f"[sarvam] lead={lead_id} could not render the name "
+            f"{raw_name!r} in Telugu ({type(exc).__name__}) — greeting "
+            "with it as written."
+        )
+        return raw_name
+
+
+async def _prepare_opening(lead_id: str, raw_name: str | None):
+    """(spoken name, course-facts digest) — fetched concurrently, each on its
+    OWN deadline.
+
+    Everything a two-way call needs BEFORE the lead hears anything, so both
+    are bounded and both degrade to something harmless: the name to its
+    written form (a mispronounced name is a blemish, a missing greeting is a
+    broken call), the digest to "" (the search tool still answers every
+    question, one round-trip slower).
+
+    SEPARATE deadlines, not one around both. Live 2026-08-31: the digest
+    cache expired at the minute of a call, its rebuild blew a shared
+    deadline, and the single wait_for cancelled the name lookup with it — so
+    a lead heard their own name in English letters because something
+    OPTIONAL was slow. Independent work gets independent bounds.
+
+    A digest that misses its deadline is not abandoned, only stopped being
+    waited on: the rebuild is shielded so it runs to completion and fills the
+    cache, and an hourly expiry then costs ONE call its facts instead of
+    every call until someone warms it by hand.
+    """
+    async def name() -> str:
+        return await _spoken_name(lead_id, raw_name)
+
+    async def facts() -> str:
+        rebuild = asyncio.ensure_future(_course_facts())
+        _BACKGROUND_REBUILDS.add(rebuild)
+        rebuild.add_done_callback(_BACKGROUND_REBUILDS.discard)
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(rebuild), FACTS_DEADLINE_S)
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[sarvam] lead={lead_id} course-facts fetch exceeded "
+                f"{FACTS_DEADLINE_S:.0f}s — answering from the search tool "
+                "this call; the rebuild continues and will be cached."
+            )
+            return ""
+        except Exception as exc:  # noqa: BLE001 - the tool still covers it
+            logger.warning(
+                f"[sarvam] lead={lead_id} course-facts fetch failed "
+                f"({type(exc).__name__}) — continuing with the search tool."
+            )
+            return ""
+
+    resolved, digest = await asyncio.gather(name(), facts())
+    return (resolved or raw_name), digest
 
 
 async def _run_two_way(call: plivo_stream.PlivoCall, *, lead_id: str,
@@ -1148,25 +1774,35 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
             # case. Without a fallback the render is empty and the opening
             # collapses to the bare name greeting, which is exactly what a real
             # lead heard on 2026-07-27: a call with no AI disclosure at all.
-            script = sarvam_prompts.DEFAULT_TWOWAY_SCRIPT
-
-        try:
-            body = await asyncio.wait_for(
-                sarvam_llm.render(
-                    script, language_style=variables.get("language_style"),
-                ),
-                RENDER_DEADLINE_S,
-            )
-        except asyncio.TimeoutError:
-            logger.error(
-                f"[sarvam] lead={lead_id} script render did not finish inside "
-                f"{RENDER_DEADLINE_S:.0f}s — abandoning the call rather than "
-                "holding an answered lead in silence. Check Sarvam's status; "
-                "the render cache is per campaign, so the next lead pays this "
-                "again until it succeeds once."
-            )
-            outcome["note"] = "sarvam_render_timeout"
-            return outcome
+            #
+            # Served from a CONSTANT, not the renderer: this script is itself a
+            # constant, so its Telugu cannot differ between calls, and paying a
+            # model for it cost two live calls on 2026-08-27 when Sarvam's
+            # reasoning outgrew its token budget and returned nothing. See
+            # sarvam_prompts.DEFAULT_TWOWAY_TELUGU. The normal two-way call now
+            # has no dependency on the renderer at all. Chosen by register:
+            # a Tinglish campaign used to open in pure Telugu because there
+            # was only the one constant.
+            body = sarvam_prompts.default_twoway_opening(
+                variables.get("language_style"))
+        else:
+            try:
+                body = await asyncio.wait_for(
+                    sarvam_llm.render(
+                        script, language_style=variables.get("language_style"),
+                    ),
+                    RENDER_DEADLINE_S,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"[sarvam] lead={lead_id} script render did not finish inside "
+                    f"{RENDER_DEADLINE_S:.0f}s — abandoning the call rather than "
+                    "holding an answered lead in silence. Check Sarvam's status; "
+                    "the render cache is per campaign, so the next lead pays this "
+                    "again until it succeeds once."
+                )
+                outcome["note"] = "sarvam_render_timeout"
+                return outcome
         if not body.strip():
             # Checked on the BODY, not on the composed line. compose_spoken()
             # prepends a name greeting, so a lead called "Mouli" turned an empty
@@ -1182,11 +1818,30 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
         # Last line of defence before a real person hears this. render() already
         # repairs a dropped disclosure, but the greeting is spliced in AFTER
         # that, and only the composed text is what the lead actually hears.
+        # The lead's own name, in a script the synthesiser can pronounce.
+        # It arrives from the console or the sheet in Latin letters, and
+        # Sarvam's Telugu TTS reads a Latin run with English phonetics — the
+        # owner heard "Mouli గారు" come out wrong on a live call. Bounded and
+        # degrading exactly like the digest below it: a mispronounced name is
+        # a blemish, a delayed or missing greeting is a broken call.
+        raw_name = variables.get("lead_name")
+        if one_way:
+            # The name ALONE. The course-facts digest exists to answer
+            # questions and a one-way call takes none, so fetching it would
+            # spend FACTS_DEADLINE_S of the lead's silence on something
+            # nothing in this mode can read.
+            spoken_name, course_facts = await _spoken_name(lead_id, raw_name), ""
+        else:
+            # TOGETHER, under ONE deadline. Both finish before the lead hears
+            # a word, and both are independent, so awaiting them in sequence
+            # would stack two deadlines' worth of silence onto a cold start
+            # (a Redis flush, or simply a name never dialled before).
+            spoken_name, course_facts = await _prepare_opening(
+                lead_id, raw_name)
+
         spoken = sarvam_llm.ensure_disclosure(
             sarvam_prompts.normalize_spoken_telugu(
-                sarvam_prompts.compose_spoken(
-                    body, lead_name=variables.get("lead_name"),
-                )
+                sarvam_prompts.compose_spoken(body, lead_name=spoken_name)
             )
         )
 
@@ -1197,6 +1852,7 @@ async def bridge(plivo_ws: WebSocket, *, agent_id: str, lead_id: str,
                     variables.get("lead_name"),
                     variables.get("script"),
                     language_style=variables.get("language_style"),
+                    course_facts=course_facts,
                 ),
                 turns=turns,
             )

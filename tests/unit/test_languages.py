@@ -367,3 +367,20 @@ def test_every_backend_has_a_name_an_operator_can_act_on():
             languages.SARVAM: "Sarvam",
         }[backend]
     assert languages.backend_for_iso(None) == languages.ELEVENLABS
+
+
+def test_code_mixed_registers_are_recognised_from_their_own_style_text():
+    """The style text is the only register signal that crosses the
+    dynamic_variables boundary into a backend, so the backend has to be
+    able to read the register back off it. Matched exactly against the
+    catalogue: a substring test would misfire in both directions ("English"
+    appears in the pure-Telugu style too), and a placeholder string that is
+    not a catalogue style is pure by default — a caller that bypasses
+    resolution must never be handed permission to mix in English."""
+    assert languages.is_code_mixed(languages.style("tinglish"))
+    assert languages.is_code_mixed(languages.style("hinglish"))
+    assert not languages.is_code_mixed(languages.style("te"))
+    assert not languages.is_code_mixed(languages.style("hi"))
+    assert not languages.is_code_mixed(languages.style("en"))
+    assert not languages.is_code_mixed(None)
+    assert not languages.is_code_mixed("Mix in English words.")

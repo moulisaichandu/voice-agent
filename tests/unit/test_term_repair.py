@@ -158,3 +158,76 @@ def test_the_repair_is_reported(caplog):
     with caplog.at_level("INFO"):
         term_repair.repair(_REAL_BROWNIE)
     assert "బ్రౌనీలో" in caplog.text and "బ్రోలీలో" in caplog.text
+
+
+# ── the following-word anchor, for mis-hearings of డిజిటల్ itself ────────────
+#
+# Heard live 2026-08-27: the lead said "డిజిటల్ మార్కెటింగ్ కోర్సెస్ గురించి"
+# and Sarvam returned "క్రిస్టల్ మార్కెటింగ్ ..." — the FIRST word of the
+# brand collocation garbled, with nothing in front of it to anchor on. The
+# word BEHIND it is the anchor this time: క్రిస్టల్ ("crystal") is a real
+# word, so it is only trusted when మార్కెటింగ్ follows.
+
+def test_a_misheard_digital_is_repaired_when_marketing_follows():
+    out = term_repair.repair("క్రిస్టల్ మార్కెటింగ్ కోర్సెస్ గురించి చెప్పండి")
+
+    assert out.startswith("డిజిటల్ మార్కెటింగ్"), out
+
+
+def test_crystal_alone_is_left_alone():
+    """క్రిస్టల్ is a real word; with no anchor it stays the lead's word."""
+    assert term_repair.repair("క్రిస్టల్") == "క్రిస్టల్"
+
+
+def test_crystal_before_an_unrelated_word_is_left_alone():
+    text = "క్రిస్టల్ షాప్ ఎక్కడ ఉంది"
+    assert term_repair.repair(text) == text
+
+
+# ── the డిజిటల్ term must not reach beyond its exact alias ──────────────────
+#
+# CONFIRMED by adversarial review, all reproduced by execution: unlike
+# బ్రోలీ — which has no real Telugu word near it — డిజిటల్ heads a populated
+# loanword neighbourhood, so the fuzzy path was pure liability. The one
+# observed mis-hearing (క్రిస్టల్) is FIVE edits away and only ever reachable
+# through the exact alias, so nothing is lost by switching the fuzzy matcher
+# off for this term.
+
+def test_a_digit_is_not_rewritten_as_digital():
+    """డిజిట్ (digit) is one edit from డిజిటల్ — inside the UNANCHORED
+    threshold, so it was rewritten with no anchor at all."""
+    text = "లాస్ట్ డిజిట్ ఐదు"
+    assert term_repair.repair(text) == text
+
+
+def test_digitalization_is_not_spliced_into_malformed_telugu():
+    """డిజిటలైజేషన్ became డిజిటల్ైజేషన్ — a virama immediately followed by a
+    dependent vowel sign, which is not writable Telugu and which the
+    synthesiser then reads aloud."""
+    text = "డిజిటలైజేషన్ గురించి చెప్పండి"
+    assert term_repair.repair(text) == text
+
+
+def test_physical_marketing_is_not_turned_into_digital_marketing():
+    """The anchored distance-2 path rewrote ఫిజికల్ before మార్కెటింగ్,
+    collapsing "is digital marketing better than physical marketing?" — the
+    offline-vs-digital comparison this business's leads actually ask — into
+    a question comparing digital marketing with itself."""
+    out = term_repair.repair(
+        "ఫిజికల్ మార్కెటింగ్ కంటే డిజిటల్ మార్కెటింగ్ బెటరా")
+
+    assert out.startswith("ఫిజికల్ మార్కెటింగ్"), out
+
+
+def test_diesel_before_marketing_is_left_alone():
+    text = "డీజిల్ మార్కెటింగ్ ఉందా"
+    assert term_repair.repair(text) == text
+
+
+def test_an_anchor_does_not_vouch_across_a_sentence_boundary():
+    """Neighbours come from a word scan that skips punctuation, so a full
+    stop between them still anchored — the lead's sentence-final "crystal"
+    was rewritten because the NEXT sentence happened to open with
+    మార్కెటింగ్."""
+    text = "ఇది క్రిస్టల్. మార్కెటింగ్ గురించి చెప్పండి"
+    assert term_repair.repair(text) == text

@@ -22,6 +22,7 @@ rather than leaking ElevenLabs' terminology into stored data.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 
 from elevenlabs.errors import BadRequestError
@@ -31,6 +32,7 @@ from app import redis_client
 from app.config import ELEVENLABS_WEBHOOK_SECRET
 from app.db import calls as calls_db
 from app.db.models import TranscriptTurn
+from app.sheets import writeback as sheets_writeback
 from app.telephony.elevenlabs_client import construct_webhook_event
 
 router = APIRouter(tags=["Webhooks"])
@@ -137,6 +139,24 @@ async def _handle_post_call_transcription(data: dict) -> None:
     # consumes this list.
     if call.lead_id:
         try:
+            # The row now carries the CANONICAL transcript, replacing the
+            # bridge-collected version the stream teardown queued. A
+            # reconcile sweep may have drained that earlier push already and
+            # set the per-call exported marker — cleared here so the
+            # re-export below carries the canonical version instead of being
+            # skipped forever. Best-effort, two accepted degradations: a
+            # failed delete, and a delete that lands while a reconcile
+            # export is mid-flight (the sweep then sets the marker AFTER
+            # this clears it). Both leave the sheet holding the teardown
+            # version of this one call; the DB row is canonical either way.
+            # Side effect on the module comment's "harmlessly reprocessed"
+            # claim below: a MANUAL webhook replay after the idempotency TTL
+            # now also re-appends this call's transcript to the sheet —
+            # writeback.py's documented duplicate-beats-a-loss trade.
+            call_id = getattr(call, "call_id", None)
+            if call_id:
+                with contextlib.suppress(Exception):
+                    await r.delete(sheets_writeback.exported_marker_key(call_id))
             await r.lpush("sheets:writeback:queue", str(call.lead_id))
         except Exception:
             # Do not leave a successful idempotency claim hiding a failed

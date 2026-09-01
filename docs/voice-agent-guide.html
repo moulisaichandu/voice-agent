@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Digital Brolly Voice Agent — Operator Guide &amp; Build Report</title>
+<style>
+  @page { size: A4; margin: 18mm 16mm 20mm 16mm; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: "Segoe UI", "Nirmala UI", "Noto Sans Telugu", Arial, sans-serif;
+    font-size: 10.5pt; line-height: 1.45; color: #1a1a1a; margin: 0;
+  }
+  h1 { font-size: 22pt; margin: 0 0 4pt; letter-spacing: -0.3pt; }
+  h2 { font-size: 15pt; margin: 22pt 0 8pt; padding-bottom: 4pt; border-bottom: 2px solid #1a1a1a; page-break-after: avoid; }
+  h3 { font-size: 12pt; margin: 16pt 0 6pt; page-break-after: avoid; }
+  p { margin: 0 0 8pt; }
+  .subtitle { color: #555; font-size: 11pt; margin-bottom: 14pt; }
+  .meta { font-size: 9pt; color: #666; margin-bottom: 18pt; }
+  table { border-collapse: collapse; width: 100%; margin: 6pt 0 12pt; font-size: 9.5pt; page-break-inside: avoid; }
+  th, td { border: 1px solid #bbb; padding: 4pt 6pt; text-align: left; vertical-align: top; }
+  th { background: #efefef; font-weight: 600; }
+  code, pre { font-family: Consolas, "Courier New", monospace; font-size: 9pt; }
+  code { background: #f2f2f2; padding: 0 3pt; border-radius: 2pt; }
+  pre { background: #f6f6f6; border: 1px solid #ddd; padding: 8pt; overflow-x: auto; white-space: pre-wrap; page-break-inside: avoid; }
+  .box { border: 1px solid #999; border-left: 4px solid #1a1a1a; padding: 8pt 10pt; margin: 10pt 0; page-break-inside: avoid; }
+  .box.warn { border-left-color: #b45309; background: #fffbeb; }
+  .box.ok { border-left-color: #15803d; background: #f0fdf4; }
+  .box.bad { border-left-color: #b91c1c; background: #fef2f2; }
+  .box strong:first-child { display: block; margin-bottom: 3pt; }
+  ol, ul { margin: 0 0 8pt 18pt; padding: 0; }
+  li { margin-bottom: 3pt; }
+  .te { font-family: "Nirmala UI", "Noto Sans Telugu", "Gautami", sans-serif; }
+  .pagebreak { page-break-before: always; }
+  .small { font-size: 9pt; color: #555; }
+  .cols { display: flex; gap: 14pt; }
+  .cols > div { flex: 1; }
+  .kv td:first-child { width: 32%; font-weight: 600; background: #fafafa; }
+  .toc { columns: 2; column-gap: 20pt; font-size: 9.5pt; }
+  .toc li { margin-bottom: 2pt; }
+</style>
+</head>
+<body>
+
+<h1>Digital Brolly Voice Agent</h1>
+<div class="subtitle">Operator Guide &amp; Build Report</div>
+<div class="meta">Prepared 1 September 2026 · Telugu / Tinglish outbound calling · Sarvam voice backend</div>
+
+<div class="box">
+  <strong>What this system does</strong>
+  It reads leads from your Google Sheet, calls each one in Telugu (or Tinglish, Hindi, English), either
+  <b>delivers a message and hangs up (one-way)</b> or <b>holds a conversation about the courses (two-way)</b>,
+  and writes the transcript and outcome back to the Sheet. Every call opens with an AI disclosure, respects
+  DND, and uses the registered 140-series caller ID.
+</div>
+
+<h3>Contents</h3>
+<ol class="toc">
+  <li>Part 1 — Operator guide
+    <ul>
+      <li>1.1 Starting the system</li>
+      <li>1.2 Preparing the Google Sheet</li>
+      <li>1.3 Creating a campaign</li>
+      <li>1.4 Loading leads</li>
+      <li>1.5 Launching and watching calls</li>
+      <li>1.6 Reading results</li>
+      <li>1.7 Stopping</li>
+      <li>1.8 Daily checklist</li>
+    </ul>
+  </li>
+  <li>Part 2 — Build report (1 Sep 2026)
+    <ul>
+      <li>2.1 What was found broken</li>
+      <li>2.2 What was changed</li>
+      <li>2.3 How it was verified</li>
+      <li>2.4 What remains</li>
+      <li>2.5 Risks you are carrying</li>
+    </ul>
+  </li>
+</ol>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2 class="pagebreak">Part 1 — Operator guide</h2>
+
+<h3>1.1 Starting the system</h3>
+<p>Everything runs in Docker. From the project folder:</p>
+<pre>docker compose up -d --build</pre>
+<p>This starts five services:</p>
+<table>
+  <tr><th>Service</th><th>What it is</th><th>Where</th></tr>
+  <tr><td><b>backend</b></td><td>The calling engine (FastAPI). Dials, talks, records, syncs the Sheet.</td><td><code>http://localhost:8091</code></td></tr>
+  <tr><td><b>console</b></td><td>The web console you operate from.</td><td><code>http://localhost:3200</code></td></tr>
+  <tr><td><b>cloudflared</b></td><td>The public tunnel Plivo uses to reach the backend during a call.</td><td>automatic</td></tr>
+  <tr><td><b>redis</b></td><td>The call queue. Safe to flush; everything rebuilds from the database.</td><td>internal</td></tr>
+  <tr><td><b>postgres</b></td><td>The database — the single source of truth for leads, campaigns and calls.</td><td>internal</td></tr>
+</table>
+
+<div class="box warn">
+  <strong>After changing code, always rebuild</strong>
+  <code>docker compose restart</code> and <code>--force-recreate</code> silently keep running the <i>old</i> image.
+  Only <code>docker compose up -d --build</code> picks up code changes. Changes to <code>.env</code> do apply on a plain restart.
+</div>
+
+<p>Open the console and check the <b>Readiness</b> strip at the top of the home page. Every item must be green before you dial.
+It checks the Plivo number, the tunnel, the Sarvam key, the database, Redis, and — for two-way Telugu — that the feature flag is on.</p>
+
+<h3>1.2 Preparing the Google Sheet</h3>
+<p>The Sheet is connected through the Apps Script already deployed against it (the <code>/exec</code> URL in <code>.env</code>).
+The backend reads leads from a tab named <b><code>Leads</code></b> every 10 minutes, and writes transcripts to a tab named <b><code>Transcripts</code></b>.</p>
+
+<div class="box bad">
+  <strong>The Leads tab did not exist — this is why no lead was ever called from the Sheet</strong>
+  Until 1 September the Sheet had no <code>Leads</code> tab. The script answered a missing tab exactly like an empty one,
+  so the backend reported "synced 0, no error" every ten minutes for weeks. Create the tab as below, then apply the
+  one-line script patch in section 2.2 so this can never be silent again.
+</div>
+
+<p>Create a worksheet named exactly <code>Leads</code>. Row 1 is the header:</p>
+<table>
+  <tr><th>Name</th><th>Phone</th><th>Campaign</th><th>Language</th><th>Consent Basis</th><th>Consent At</th><th>Status</th><th>Notes</th></tr>
+  <tr><td>Mouli</td><td>7993399336</td><td>Demo Class Outreach</td><td>te</td><td>explicit</td><td>2026-09-01</td><td></td><td></td></tr>
+</table>
+
+<table>
+  <tr><th style="width:18%">Column</th><th style="width:12%">Required</th><th>Rules</th></tr>
+  <tr><td><b>Phone</b></td><td>yes</td><td>Any Indian format. Normalised to +91. A row without a valid number is skipped.</td></tr>
+  <tr><td><b>Campaign</b></td><td>yes</td><td>Must name a campaign that already exists in the console. Capitals and spaces don't matter. Unknown name → row skipped.</td></tr>
+  <tr><td><b>Consent Basis</b></td><td>to dial</td><td><code>explicit</code> or <code>inferred</code>. Anything else, and the lead imports but is <b>never called</b>.</td></tr>
+  <tr><td><b>Consent At</b></td><td>to dial</td><td>A date such as <code>2026-09-01</code>. A future date is rejected.</td></tr>
+  <tr><td>Name</td><td>no</td><td>Spoken in the greeting. English-letter names are converted to Telugu script so the voice pronounces them correctly (<span class="te">Mouli → మౌలి</span>).</td></tr>
+  <tr><td>Language</td><td>no</td><td><code>te</code>, <code>tinglish</code>, <code>en</code>, <code>hi</code>, <code>hinglish</code>, or blank.</td></tr>
+  <tr><td>Status / Notes</td><td>no</td><td>Written by the agent after each call. Create the columns if you want that.</td></tr>
+</table>
+
+<div class="box warn">
+  <strong>Consent decides whether a lead is dialled</strong>
+  Both <b>Consent Basis</b> and <b>Consent At</b> must be present and valid. A sheet without them imports every row and calls nobody.
+  The console's Settings page now says this in plain words: <i>"No imported lead can be dialled — check the Consent columns."</i>
+</div>
+
+<p>Header names are matched loosely (<code>Mobile</code>, <code>Contact</code>, <code>Phone Number</code> all work for the phone). Only row 1 is read as the header.</p>
+
+<h3>1.3 Creating a campaign</h3>
+<p>Console → <b>Campaigns</b> → <b>New campaign</b>. Three choices matter, and none of them can be changed by the AI during a call:</p>
+<table>
+  <tr><th style="width:18%">Setting</th><th>Options</th><th>What it decides</th></tr>
+  <tr><td><b>Language</b></td><td><code>te</code> Telugu · <code>tinglish</code> Telugu+English · <code>hi</code> · <code>hinglish</code> · <code>en</code> · <code>auto</code></td>
+      <td>Which voice engine runs. Telugu and Tinglish use <b>Sarvam</b> (Indian voices, Indian telephony STT). Hindi/English/Hinglish use ElevenLabs. ElevenLabs cannot speak Telugu at all — this is not configurable.</td></tr>
+  <tr><td><b>Mode</b></td><td><code>oneway</code> · <code>twoway</code></td>
+      <td><b>One-way:</b> speaks the script and hangs up; the lead's voice is never listened to. <b>Two-way:</b> a real conversation — the lead asks about fees, duration, batches, and the agent answers from your course documents. When unsure, choose two-way.</td></tr>
+  <tr><td><b>Script</b></td><td>English text</td>
+      <td><b>Required for one-way.</b> Written in English; the system renders it into natural Telugu once per campaign. For two-way it is optional — leave it blank and the agent opens with a standard greeting <b>in the campaign's register</b> (Telugu, or Tinglish with <i>course fees, batch timings, placement</i> in English) and takes questions.</td></tr>
+</table>
+<p>The AI disclosure is enforced automatically. If a script lacks one, the system prepends
+<span class="te">"ఇది డిజిటల్ బ్రోలీ నుండి ఏఐ ద్వారా చేసే ఆటోమేటెడ్ కాల్"</span> and logs a warning; after every call it re-checks what was actually spoken.</p>
+
+<h3>1.4 Loading leads</h3>
+<p>Three ways, all ending in the same place:</p>
+<table>
+  <tr><th style="width:22%">Method</th><th>How</th><th>Best for</th></tr>
+  <tr><td><b>Google Sheet</b></td><td>Fill the <code>Leads</code> tab. Sync runs every 10 minutes, or press <b>Sync now</b> on the Settings page.</td><td>Your normal daily flow.</td></tr>
+  <tr><td><b>CSV upload</b></td><td>Campaigns → open a campaign → <b>Upload leads</b>. Same columns as the Sheet.</td><td>A one-off list from another source.</td></tr>
+  <tr><td><b>Single lead</b></td><td>Campaign page → <b>Add lead</b>.</td><td>A test call to your own number.</td></tr>
+</table>
+<p>After a Sheet sync, read the two numbers on the Settings page: <b>imported</b> (rows written) and <b>dialable</b> (rows the dialer will actually call).
+If dialable is 0 and imported is not, the consent columns are the reason.</p>
+
+<h3>1.5 Launching and watching calls</h3>
+<ol>
+  <li>Campaign is <b>Active</b> (toggle on the campaign page).</li>
+  <li>Leads are <b>pending</b> with valid consent.</li>
+  <li>The scheduler dials automatically every minute during calling hours. Press <b>Dial now</b> on the campaign page to start immediately.</li>
+</ol>
+<p>Watch progress on <b>Calls</b>. Each row shows the lead, status, duration and turn count; click through for the full transcript.</p>
+<table>
+  <tr><th style="width:22%">Lead status</th><th>Meaning</th></tr>
+  <tr><td><code>pending</code></td><td>Waiting to be dialled.</td></tr>
+  <tr><td><code>queued</code> / <code>calling</code></td><td>Picked up by the dialer / on the phone right now.</td></tr>
+  <tr><td><code>done</code></td><td>Call completed. Transcript stored.</td></tr>
+  <tr><td><code>failed</code></td><td>Not connected (no answer, busy, network). Retried up to <b>max attempts</b> (default 2).</td></tr>
+  <tr><td><code>dnd</code></td><td>On the Do-Not-Disturb registry. Never dialled.</td></tr>
+</table>
+
+<div class="box warn">
+  <strong>Calling hours are set fully open (00:00–24:00) on the owner's instruction</strong>
+  India's TCCCPR generally restricts promotional calls to about 09:00–21:00, and penalties attach to the Plivo number and its DLT
+  registration — a blacklisted number stops every campaign at once. Restoring a 10:00–19:00 window is one line in <code>.env</code>
+  (<code>CALLING_HOURS_START</code> / <code>CALLING_HOURS_END</code>) and a restart.
+</div>
+
+<h3>1.6 Reading results</h3>
+<ul>
+  <li><b>Console → Calls</b>: the authoritative record. Transcript, duration, turns, outcome.</li>
+  <li><b>Sheet → Transcripts tab</b>: a copy of every transcript, written within 30 minutes of the call. The Leads tab's <code>Status</code> and <code>Notes</code> columns are updated for the matching phone number.</li>
+  <li><b>Test-call checklist</b> for a two-way Telugu call to your own number:
+    <ol>
+      <li>Say <span class="te">"ఓకే"</span> mid-conversation — the call must <b>continue</b>.</li>
+      <li>Ask a fee question — the agent must answer from the documents, not promise a callback.</li>
+      <li>Say <span class="te">"బై"</span> — the call must end <b>with a spoken goodbye</b>.</li>
+    </ol>
+  </li>
+</ul>
+
+<h3>1.7 Stopping</h3>
+<table>
+  <tr><th style="width:30%">To…</th><th>Do</th></tr>
+  <tr><td>Stop one campaign</td><td>Toggle it <b>Inactive</b>. Calls in progress finish; nothing new is dialled.</td></tr>
+  <tr><td>Stop everything now</td><td><code>docker compose stop backend</code>. Leads mid-call are released back to <code>pending</code> automatically.</td></tr>
+  <tr><td>Never call a number again</td><td>Leads → the lead → <b>Do not call</b>.</td></tr>
+</table>
+
+<h3>1.8 Daily checklist</h3>
+<ol>
+  <li>Readiness strip all green.</li>
+  <li>Settings → Sheets sync: last sync recent, <b>no error</b>, dialable &gt; 0.</li>
+  <li>Campaign active, script correct, mode correct.</li>
+  <li>One test call to your own number before real leads.</li>
+  <li>Check the log for <code>[compliance]</code> — any ERROR there is a <b>stop-dialling</b> event.</li>
+</ol>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2 class="pagebreak">Part 2 — Build report, 1 September 2026</h2>
+
+<h3>2.1 What was found broken</h3>
+<table>
+  <tr><th style="width:4%">#</th><th style="width:28%">Problem</th><th>Evidence</th></tr>
+  <tr><td>1</td><td><b>The Sheet fed no leads</b></td>
+      <td><code>/admin/sheets-status</code> reported <code>synced 0, error null</code> every 10 minutes. The container log held the real cause:
+      <code>update_lead error: 'Leads sheet not found.'</code> The spreadsheet had no <code>Leads</code> tab, and the script reported a
+      missing tab exactly like an empty one.</td></tr>
+  <tr><td>2</td><td><b>The last word of sentences was deleted</b></td>
+      <td>A guard that strips unpronounceable scripts (Armenian, Hindi) judged whole words by every character. The Telugu sentence mark
+      <span class="te">।</span> was not on its allowed list, so <span class="te">ఉన్నాయి।</span> became nothing. The codebase's own
+      sentence splitter treats <span class="te">।</span> as normal — the two rules contradicted each other. This was the "words breaking in the middle" you heard.</td></tr>
+  <tr><td>3</td><td><b>Calls hung up on "okay"</b></td>
+      <td>The model called <code>end_call</code> when the lead said <span class="te">"ఆ ఓకే"</span> — agreement, not goodbye.</td></tr>
+  <tr><td>4</td><td><b>One-way calls mispronounced names</b></td>
+      <td>Transcripts show <span class="te">నమస్తే Mouli గారు</span> — the English spelling reached the Telugu voice. The fix existed only on the two-way path.</td></tr>
+  <tr><td>5</td><td><b>Consent column collision</b></td>
+      <td>A sheet with only a "Consent At" column matched it as the consent <i>basis</i> too, filing a date where "explicit" belongs — leads permanently undialable, nothing logged. The CSV importer already guarded this; the Sheet path did not.</td></tr>
+  <tr><td>6</td><td><b>Sync reported the wrong number</b></td>
+      <td>It counted rows written, not rows the dialer would call. With no consent columns those are "40" and "0" — and it showed 40.</td></tr>
+  <tr><td>7</td><td><b>No manual sync</b></td>
+      <td>The only trigger was the 10-minute timer. After fixing a sheet, you waited to find out.</td></tr>
+  <tr><td>8</td><td><b>Campaign names matched exactly</b></td>
+      <td>"demo class" in the Sheet did not match "Demo Class" in the console — row silently skipped.</td></tr>
+  <tr><td>9</td><td><b>Sheet leads dialled last</b></td>
+      <td>They carried no dial order, so every uploaded lead was called before any Sheet lead.</td></tr>
+  <tr><td>10</td><td><b>Tinglish contradicted itself</b> (fixed, rows 14–16)</td>
+      <td>Tinglish differs from Telugu by one instruction ("keep course, fees, batch… in English"), but three later rules order the model to reply in Telugu script and to spell <i>course</i>, <i>fees</i>, <i>placement</i> in Telugu. Tinglish two-way has never been run: 2 campaigns, 1 lead, one-way only.</td></tr>
+</table>
+
+<h3>2.2 What was changed</h3>
+<table>
+  <tr><th style="width:4%">#</th><th style="width:30%">Change</th><th>Where</th></tr>
+  <tr><td>1</td><td>Missing Leads tab is now an <b>error</b>, not a healthy zero</td>
+      <td>Backend: <code>app/sheets/apps_script.py</code> raises on it. <b>Script side needs your one-line patch</b> — see box below.</td></tr>
+  <tr><td>2</td><td>Script guard judges <b>letters only</b>; punctuation never disqualifies a word</td><td><code>app/telephony/sarvam_prompts.py</code> <code>_is_speakable()</code></td></tr>
+  <tr><td>3</td><td><code>end_call</code> refused when the lead's last words are pure agreement (<span class="te">ఓకే / సరే / అవును</span>); real goodbyes — including STT's <span class="te">"బాయ్"</span> spelling — still end the call with a farewell. Capped at 2 refusals.</td>
+      <td><code>app/telephony/sarvam_bridge.py</code> <code>_AFFIRMATION_ONLY</code>, <code>_lead_only_agreed()</code></td></tr>
+  <tr><td>4</td><td>One-way greeting resolves the name to Telugu script via the same <code>telugu_name()</code> the two-way path uses</td><td><code>sarvam_bridge.py</code> <code>_spoken_name()</code></td></tr>
+  <tr><td>5</td><td>Consent-column collision guard, copied from the CSV importer</td><td><code>app/sheets/sync.py</code></td></tr>
+  <tr><td>6</td><td>Sync returns <code>received / imported / dialable / skips</code>; the console shows all four and warns when dialable is 0</td><td><code>sync.py</code> <code>SyncResult</code>, <code>app/admin/system.py</code>, <code>frontend/app/settings/page.tsx</code></td></tr>
+  <tr><td>7</td><td><b>Sync now</b> button and <code>POST /admin/sheets/sync</code></td><td><code>app/admin/system.py</code>, settings page</td></tr>
+  <tr><td>8</td><td>Campaign name matched ignoring case and spaces</td><td><code>app/db/campaigns.py</code></td></tr>
+  <tr><td>9</td><td>Sheet row number becomes the dial order</td><td><code>sync.py</code></td></tr>
+  <tr><td>10</td><td>Consent basis lowercased on import ("Explicit" now works)</td><td><code>sync.py</code></td></tr>
+  <tr><td>11</td><td><code>/admin/sheets-status</code> answers "can the sync run" instead of "is the env var non-empty"</td><td><code>app/admin/system.py</code></td></tr>
+  <tr><td>12</td><td>Console added to <code>docker compose</code> (port configurable via <code>CONSOLE_PORT</code>)</td><td><code>docker-compose.yml</code>, <code>frontend/Dockerfile</code></td></tr>
+  <tr><td>13</td><td>Voice speed raised 1.0 → 1.2 (about 25% shorter agent turns)</td><td><code>.env</code> <code>SARVAM_TTS_PACE</code></td></tr>
+  <tr><td>14</td><td><b>Tinglish prompt no longer contradicts itself.</b> The OUTPUT FORMAT, TELUGU SPELLING and UNCLEAR SPEECH rules and both script framings are now chosen by register: for Tinglish they no longer demand "Telugu script" or mandate Telugu spellings for <i>course</i>, <i>fees</i>, <i>placement</i>. Pure Telugu is unchanged. The register is read back off the style text with <code>languages.is_code_mixed()</code> — exact match against the catalogue, so a placeholder or a missing style is always pure Telugu.</td>
+      <td><code>app/languages.py</code>, <code>app/telephony/sarvam_prompts.py</code></td></tr>
+  <tr><td>15</td><td><b>A Tinglish opening.</b> Scriptless two-way calls had one Telugu constant for both registers. <code>DEFAULT_TWOWAY_TINGLISH</code> keeps the identical disclosure sentence (<span class="te">ఆటోమేటెడ్ కాల్</span>, never a Latin "AI") and then <i>"మా digital marketing courses గురించి… Course fees, batch timings, placement…"</i>. Chosen per call by <code>default_twoway_opening()</code>.</td>
+      <td><code>sarvam_prompts.py</code>, <code>sarvam_bridge.py</code></td></tr>
+  <tr><td>16</td><td><b>Tests on the real catalogue text.</b> The Sarvam prompt tests had used hand-written placeholder styles, which is why the contradiction survived. 15 new tests use <code>languages.style("tinglish")</code> / <code>("te")</code> directly and assert each register's prompt is internally consistent.</td>
+      <td><code>tests/unit/test_sarvam_prompts.py</code>, <code>test_sarvam_bridge.py</code>, <code>test_languages.py</code></td></tr>
+</table>
+
+<div class="box">
+  <strong>Three deliberate non-changes in the Tinglish work</strong>
+  <ul>
+    <li><b>Speech recognition stays pinned to <code>te-IN</code></b> for both registers. Sarvam auto-detection mis-hears Telugu as Croatian/Urdu; the register lives in the prompt, not the transport, and <code>te</code>/<code>tinglish</code> must share one backend switch (<code>_TELUGU_TOKENS</code>) or preflight breaks.</li>
+    <li><b>The short canned lines</b> — farewell, "say that again", "one moment", the disclosure prefix — stay in Telugu. A Hyderabad Tinglish speaker says every one of them exactly so, and the disclosure prefix must stay in Telugu for compliance.</li>
+    <li><b>"SEO" is still spoken as <span class="te">ఎస్ఈఓ</span></b> in both registers: an acronym is pronounced by its letter names in any language, and Latin "SEO" would be read by the synthesiser as a word.</li>
+  </ul>
+</div>
+
+<div class="box bad">
+  <strong>One action for you: patch the Apps Script (2 minutes)</strong>
+  In the Sheet: <b>Extensions → Apps Script</b>, find <code>_getLeads</code>, and replace
+  <pre>if (!sheet) return _json({ status: "ok", leads: [] });</pre>
+  with
+  <pre>if (!sheet) return _json({ status: "error", message: "Leads sheet not found: " + name });</pre>
+  Then <b>Deploy → Manage deployments → ✎ → Deploy</b>. The URL does not change. Full instructions: <code>docs/sheet-setup.md</code>.
+</div>
+
+<h3>2.3 How it was verified</h3>
+<ul>
+  <li><b>1,196 unit tests pass</b>, <code>ruff</code> clean. Every change above has a test that fails without it.</li>
+  <li>Danda bug: proven with the exact deployed regex — <span class="te">ఉన్నాయి।</span>, <span class="te">ఉంటుంది॥</span>, <span class="te">ఫీజు…</span> all DROPPED before, all kept after; Armenian and Hindi still dropped.</li>
+  <li>Manual sync exercised live against the backend: <code>{"synced":0,"received":0,"dialable":0,"error":null}</code> — correct until the tab exists.</li>
+  <li>Console container exercised live: serves the page and proxies to the backend with auth through the compose network.</li>
+  <li><b>Tinglish two-way proven on a live call, 1 Sep 17:01 IST</b> (9 turns, 49 s): the opening was spoken exactly as designed — <span class="te">…మా</span> digital marketing courses <span class="te">గురించి కాల్ చేస్తున్నాను. </span>Course fees, batch timings, placement<span class="te">, ఏమైనా తెలుసుకోవాలంటే అడగండి</span> — and the reply to "what courses are there?" came back as natural Hyderabad Tinglish: <span class="te">డిజిటల్ బ్రోలీ లో</span> BDLP, BDCP, BDDP, BDMP courses <span class="te">ఉన్నాయి. మీరు ఏ</span> course <span class="te">గురించి</span> details <span class="te">కావాలనుకుంటున్నారు?</span> Disclosure first, name correct, no compliance warning.</li>
+  <li><b>Telugu two-way proven on a live call, 1 Sep 16:21 IST</b> (13 turns, 1 m 40 s, owner and team lead listening): name spoken as <span class="te">మౌలి గారు</span>, disclosure first, an off-topic question (sports) refused politely, the <b>fee question answered directly from the documents</b> — <span class="te">యాభై వేల రూపాయలు</span>, 25 k training + 25 k placement — and a clean <code>end_call</code> exit with a spoken farewell. Per-turn: LLM 1.0–2.1 s, TTS 0.24 s, total 1.4–2.4 s.</li>
+  <li>Live two-way call today opened <span class="te">"నమస్తే మౌలి గారు"</span> with the disclosure first, and hung up cleanly when it reached voicemail rather than talking into it for five billed minutes.</li>
+  <li>Latency measured on real turns: STT ≈ 0.0 s, gate 0.12 s, <b>LLM 0.8–2.9 s</b>, TTS 0.24–0.34 s. The model is 74–89% of the wait.</li>
+</ul>
+
+<h3>2.4 What remains</h3>
+<table>
+  <tr><th style="width:26%">Item</th><th>Plan</th></tr>
+  <tr><td><b>Background-speech hallucination</b></td><td>Found on the Tinglish test call (two people in the room): Sarvam's STT produced three long, meaningless "lead" utterances before the real question, while its own audio-health line reported <code>speech_rms=0.0</code> — no speech energy in that window. The agent began replying to each and was interrupted by the next, costing about ten seconds before the real question was answered. Next fix: refuse a transcript whose audio window carried no speech energy. Real leads on a quiet phone are unaffected; a speakerphone in a busy room is the risk.</td></tr>
+  <tr><td><b>Latency</b></td><td>The LLM is the wait. Next steps in order of value: trim the system prompt and course digest, then cache answers to the handful of repeated questions (fees, duration, timings). Sentence-by-sentence streaming was built and removed twice — it breaks the one-turn-at-a-time invariant the barge-in handling depends on.</td></tr>
+  <tr><td><b>Document gaps</b></td><td>Demo classes, batch timings and eligibility are not in the three ingested documents, so the agent promises a callback. Add them and re-run <code>scripts/ingest_docs.py</code>. Also: the BDCP document says "3 Months. Includes a 4 Months Internship" — a data error in the source.</td></tr>
+  <tr><td><b>Second test number</b></td><td>Gayathri's number (+91 77299 74373) was dialled twice at 16:21 and 16:28 IST and rang out both times (<code>NO_ANSWER</code>); the lead is back to <code>pending</code> and has used its 2 attempts. If that was the team lead's phone, re-add the lead or raise the campaign's max attempts.</td></tr>
+</table>
+
+<h3>2.5 Risks you are carrying</h3>
+<table>
+  <tr><th style="width:26%">Risk</th><th>Detail</th></tr>
+  <tr><td><b>Public Sheet endpoint</b></td><td>The Apps Script <code>/exec</code> URL accepts writes from anyone who has it — no token is set on either side. Before the Sheet holds a real lead list, set a <code>SHEETS_TOKEN</code> script property and the matching <code>.env</code> value.</td></tr>
+  <tr><td><b>Calling hours open 24h</b></td><td>Owner's decision, 22 July 2026. Regulatory exposure attaches to the Plivo number. One-line revert.</td></tr>
+  <tr><td><b>Nothing committed</b></td><td>All of today's changes are in the working tree, uncommitted, on branch <code>dev1</code>. Commit when you are satisfied with the live test.</td></tr>
+  <tr><td><b>212 stale test campaigns</b></td><td>The database holds 212 <code>auto</code>-language campaigns from earlier testing. Harmless, but they clutter the console. Deactivate or delete when convenient.</td></tr>
+</table>
+
+<p class="small" style="margin-top:24pt">Source of truth for all behaviour: the repository's <code>CLAUDE.md</code>, <code>docs/sheet-setup.md</code>, and the test suite under <code>tests/unit/</code>.</p>
+
+</body>
+</html>

@@ -4,6 +4,7 @@ tracks batch_update calls; all Worksheet methods run through asyncio.to_thread
 exactly like the real gspread client, so this exercises the same code path.
 """
 
+from datetime import datetime
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -11,6 +12,150 @@ import gspread.utils as gsutils
 
 from app.db.models import TranscriptTurn
 from app.sheets import writeback
+
+# ── the Apps Script transport ───────────────────────────────────────────────
+
+def _script_call():
+    return SimpleNamespace(
+        call_id=uuid4(), status="done", turns=2,
+        ended_at=datetime(2026, 8, 27, 13, 0, 0),
+        transcript=[TranscriptTurn(role="agent", text="నమస్తే."),
+                    TranscriptTurn(role="lead", text="హలో.")],
+        summary=None,
+    )
+
+
+def _patch_script_branch(monkeypatch, lead, call, *, export_ok=True):
+    monkeypatch.setattr(writeback, "GOOGLE_SHEET_ID",
+                        "https://script.google.com/macros/s/x/exec")
+
+    async def fake_get_lead(lead_id):
+        return lead
+
+    async def fake_latest(lead_id):
+        return call
+
+    monkeypatch.setattr(writeback.leads_db, "get_lead", fake_get_lead)
+    monkeypatch.setattr(writeback.calls_db, "get_latest_call_for_lead", fake_latest)
+
+    async def never_gspread():
+        raise AssertionError("gspread must not run for a script URL")
+
+    monkeypatch.setattr(writeback, "get_worksheet", never_gspread)
+    exported, updated = [], []
+
+    async def fake_export(*, session, turns, timestamp):
+        exported.append((session, list(turns or []), timestamp))
+        return export_ok
+
+    async def fake_update(*, phone, status, notes=""):
+        updated.append((phone, status, notes))
+        return True
+
+    monkeypatch.setattr(writeback.apps_script, "export_transcript", fake_export)
+    monkeypatch.setattr(writeback.apps_script, "update_lead_status", fake_update)
+    return exported, updated
+
+
+async def test_write_back_speaks_the_apps_script_protocol(monkeypatch):
+    """Script URL configured: the transcript exports to the Transcripts tab
+    keyed by the call id, the Leads-tab status update rides along
+    best-effort, and gspread is never touched."""
+    lead = _lead()
+    call = _script_call()
+    exported, updated = _patch_script_branch(monkeypatch, lead, call)
+
+    ok = await writeback.write_back_lead(lead.lead_id)
+
+    assert ok is True
+    session, turns, timestamp = exported[0]
+    assert session == str(call.call_id)[:8]
+    assert turns == call.transcript
+    assert timestamp == "2026-08-27 13:00:00"
+    assert updated and updated[0][0] == lead.phone_e164
+    assert updated[0][1] == "done"
+
+
+async def test_a_failed_export_requests_a_retry_and_skips_the_status(monkeypatch):
+    """Only the export's failure may request a retry: export_session appends
+    blindly, so retrying after a SUCCESSFUL export would write the whole
+    transcript into the sheet twice."""
+    lead = _lead()
+    exported, updated = _patch_script_branch(
+        monkeypatch, lead, _script_call(), export_ok=False)
+
+    ok = await writeback.write_back_lead(lead.lead_id)
+
+    assert ok is False, "a failed export must be retried by the next sweep"
+    assert updated == [], "no status write for a transcript that never landed"
+
+
+class _FakeRedis:
+    """Just the two calls the exported-marker needs."""
+
+    def __init__(self):
+        self.store: dict[str, str] = {}
+
+    async def exists(self, key):
+        return 1 if key in self.store else 0
+
+    async def set(self, key, value, ex=None, nx=False):
+        if nx and key in self.store:
+            return None
+        self.store[key] = value
+        return True
+
+
+async def test_an_aware_timestamp_lands_in_the_operators_timezone(monkeypatch):
+    """calls.ended_at is a UTC timestamptz; the sheet's timezone is the
+    operator's (Asia/Kolkata). Sending the UTC wall time verbatim showed
+    every call 5½ hours early in the Timestamp column (verified on the live
+    sheet 2026-08-27)."""
+    from datetime import timezone
+
+    lead = _lead()
+    call = _script_call()
+    call.ended_at = datetime(2026, 8, 27, 7, 19, 9, tzinfo=timezone.utc)
+    exported, _updated = _patch_script_branch(monkeypatch, lead, call)
+
+    await writeback.write_back_lead(lead.lead_id)
+
+    assert exported[0][2] == "2026-08-27 12:49:09", (
+        f"UTC leaked into the sheet: {exported[0][2]!r}"
+    )
+
+
+async def test_the_same_call_is_never_exported_twice(monkeypatch):
+    """transcript_reconcile is at-least-once BY DESIGN (reserve-then-ack, and
+    the queue can hold the same lead twice for one call). The gspread path
+    overwrote cells, so re-runs were harmless; export_session APPENDS, so
+    without a marker every re-run pastes the whole transcript into the sheet
+    again. The marker is per call_id and set only after a successful export."""
+    lead = _lead()
+    call = _script_call()
+    exported, updated = _patch_script_branch(monkeypatch, lead, call)
+    fake = _FakeRedis()
+    monkeypatch.setattr(writeback.redis_client, "get_redis", lambda: fake)
+
+    assert await writeback.write_back_lead(lead.lead_id) is True
+    assert await writeback.write_back_lead(lead.lead_id) is True
+
+    assert len(exported) == 1, "the second drain re-appended the transcript"
+
+
+async def test_a_failed_export_does_not_mark_the_call_as_done(monkeypatch):
+    """The marker lands AFTER success — a marker set before the export would
+    turn one transient failure into a transcript that never reaches the
+    sheet at all."""
+    lead = _lead()
+    call = _script_call()
+    exported, _updated = _patch_script_branch(
+        monkeypatch, lead, call, export_ok=False)
+    fake = _FakeRedis()
+    monkeypatch.setattr(writeback.redis_client, "get_redis", lambda: fake)
+
+    assert await writeback.write_back_lead(lead.lead_id) is False
+    assert fake.store == {}, "a failed export left a marker behind"
 
 
 class _StubWorksheet:

@@ -430,8 +430,17 @@ async def _finalise_call(lead, outcome: dict, *, campaign=None) -> None:
             provider_call_id = outcome.get("provider_call_id")
             if not provider_call_id:
                 try:
+                    # CALL_UUID_KEY_FMT, NOT CALL_PLIVO_UUID_KEY_FMT. These
+                    # hold two DIFFERENT Plivo identifiers: the worker records
+                    # the request_uuid here and writes the SAME value into the
+                    # row's provider_call_id, while /calls/answer records the
+                    # CallUUID under the plivo_uuid key for force-hangup. The
+                    # guard below looks the row up by provider_call_id, so
+                    # reading the CallUUID could never match and the guard
+                    # degraded straight back into creating the duplicate it
+                    # exists to prevent.
                     provider_call_id = await redis_client.get_redis().get(
-                        CALL_PLIVO_UUID_KEY_FMT.format(lead_id=lead.lead_id)
+                        CALL_UUID_KEY_FMT.format(lead_id=lead.lead_id)
                     )
                 except Exception:
                     provider_call_id = None

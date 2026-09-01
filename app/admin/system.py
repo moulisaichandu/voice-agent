@@ -33,6 +33,7 @@ from app.db import calls as calls_db
 from app.db import campaigns as campaigns_db
 from app.db import leads as leads_db
 from app.db.pool import get_pool
+from app.sheets import client as sheets_client
 from app.telephony import elevenlabs_client, public_url, sarvam_circuit_breaker
 from app.telephony import preflight as preflight_module
 from app.telephony import worker as worker_module
@@ -677,17 +678,54 @@ class SheetsStatusResponse(BaseModel):
     last_sync_at: str | None = None
     last_synced_count: int | None = None
     last_error: str | None = None
+    # Of the rows imported, how many the dialer will actually call. Reported
+    # separately because a sheet with no consent columns imports every row and
+    # dials none — for weeks that was indistinguishable from a healthy sync.
+    last_dialable_count: int | None = None
+    last_skips: dict[str, int] | None = None
+
+
+class SheetsSyncResponse(BaseModel):
+    """What one hand-triggered sync did. Mirrors the record the scheduled job
+    stamps into Redis, so the console shows the same numbers either way."""
+
+    at: str
+    synced: int | None = None
+    received: int | None = None
+    dialable: int | None = None
+    skips: dict[str, int] | None = None
+    error: str | None = None
+
+
+@router.post("/sheets/sync", response_model=SheetsSyncResponse)
+async def trigger_sheets_sync() -> SheetsSyncResponse:
+    """Run the Google Sheet sync now instead of waiting for the next sweep.
+
+    Delegates to the scheduled job itself rather than calling sheets_sync()
+    directly, so the Redis status record is written in exactly one place and
+    a manual run and a scheduled one can never report different things.
+    That job already turns a Sheets outage into a recorded error rather than
+    an exception, which is why this returns 200 with `error` set instead of
+    surfacing a 5xx: the operator needs to read the reason.
+    """
+    record = await scheduler_module.sheets_sync()
+    return SheetsSyncResponse(**record)
 
 
 @router.get("/sheets-status", response_model=SheetsStatusResponse)
 async def sheets_status() -> SheetsStatusResponse:
-    configured = bool(getattr(app_config, "GOOGLE_SHEET_ID", None))
+    # unconfigured_reason() is the same check the scheduler gates on, so a
+    # sheet ID that is set but unusable (no service account, a URL that is
+    # neither a spreadsheet nor a script) reports as unconfigured HERE rather
+    # than reading as healthy until the next sweep happens to fail.
+    reason = sheets_client.unconfigured_reason()
+    configured = reason is None
     try:
         raw = await redis_client.get_redis().get(scheduler_module.SHEETS_LAST_SYNC_KEY)
     except Exception:
         raw = None
     if not raw:
-        return SheetsStatusResponse(configured=configured)
+        return SheetsStatusResponse(configured=configured, last_error=reason)
     try:
         data = json.loads(raw)
     except (TypeError, ValueError):
@@ -706,5 +744,7 @@ async def sheets_status() -> SheetsStatusResponse:
         configured=configured,
         last_sync_at=data.get("at"),
         last_synced_count=data.get("synced"),
-        last_error=data.get("error"),
+        last_error=data.get("error") or reason,
+        last_dialable_count=data.get("dialable"),
+        last_skips=data.get("skips") or None,
     )

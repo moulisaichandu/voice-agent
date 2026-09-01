@@ -43,6 +43,24 @@ def test_a_missing_file_with_no_inline_json_still_explains_both_routes(monkeypat
     )
 
 
+def test_an_apps_script_url_is_a_valid_transport_not_an_error(monkeypatch):
+    """Observed live 2026-08-27: GOOGLE_SHEET_ID held a script.google.com
+    /macros/.../exec deployment URL — the sibling project's transcript-logger
+    web app, already wired to the operator's sheet. That is a working
+    transport of its own (app/sheets/apps_script.py), needing no service
+    account and no bare sheet ID — so it must not be reported as a
+    misconfiguration, or every sync/write-back sweep skips a Sheet that is
+    perfectly reachable."""
+    monkeypatch.setattr(client, "GOOGLE_SHEET_ID",
+                        "https://script.google.com/macros/s/AKfycb_x123/exec")
+    # No service-account credential on purpose: the script transport does not
+    # use one, so its absence must not be a reason either.
+    monkeypatch.setattr(client, "GOOGLE_SERVICE_ACCOUNT_JSON", "")
+    monkeypatch.setattr(client, "GOOGLE_SERVICE_ACCOUNT_FILE", "definitely-absent.json")
+
+    assert client.unconfigured_reason() is None
+
+
 def test_malformed_inline_json_is_reported_as_a_settings_problem(monkeypatch):
     monkeypatch.setattr(client, "GOOGLE_SHEET_ID", "1AbC_sheet_id")
     monkeypatch.setattr(client, "GOOGLE_SERVICE_ACCOUNT_FILE", "definitely-absent.json")

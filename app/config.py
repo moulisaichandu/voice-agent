@@ -6,6 +6,7 @@ All other modules import from here; nothing else reads os.environ directly.
 import logging
 import math
 import os
+import re
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -83,6 +84,35 @@ def _list(name: str, default: tuple[str, ...] = ()) -> list[str]:
     if raw is None or not raw.strip():
         return list(default)
     return [p.strip() for p in raw.split(",") if p.strip()]
+
+
+def _sheet_id(name: str) -> str | None:
+    """A Google spreadsheet ID, extracted when a full URL was pasted instead.
+
+    The browser address bar is where an operator sees their sheet, so the
+    full URL is the single most likely malformed value here — and it broke
+    silently: gspread.open_by_key wants the bare ID, so every sheets_sync and
+    transcript_reconcile sweep skipped (observed live 2026-08-27, with the
+    write-back queue accumulating meanwhile). A URL with a /d/<id> segment
+    yields that ID with a warning; a URL without one passes through unchanged
+    so app/sheets/client.py's unconfigured_reason can explain it rather than
+    this module guessing. The ID itself stays out of the log line — /admin
+    /config already treats this variable's value as sensitive.
+    """
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    value = raw.strip()
+    if value.lower().startswith(("http://", "https://")):
+        match = re.search(r"/d/([A-Za-z0-9_-]+)", value)
+        if match:
+            logger.warning(
+                f"{name} is a full Google Sheets URL — using the spreadsheet "
+                "ID between /d/ and /edit extracted from it. Set the bare ID "
+                "in .env to silence this."
+            )
+            return match.group(1)
+    return value
 
 
 def _choice(name: str, default: str, allowed: tuple[str, ...]) -> str:
@@ -265,9 +295,20 @@ SARVAM_TTS_MODEL = os.getenv("SARVAM_TTS_MODEL", "bulbul:v3")
 # default for te-IN; judge it on a real 8 kHz call before dialling a list, and
 # change it here rather than in code.
 SARVAM_TTS_SPEAKER = os.getenv("SARVAM_TTS_SPEAKER", "priya")
-# 0.5-2.0 on bulbul:v3. Below 1.0 is slower. Telephony audio is already hard to
-# follow; err slow rather than fast.
-SARVAM_TTS_PACE = _float("SARVAM_TTS_PACE", 1.0)
+# 0.5-2.0 on bulbul:v3. Below 1.0 is slower.
+#
+# This used to say "telephony audio is already hard to follow; err slow rather
+# than fast", and sat at Sarvam's neutral 1.0. A real lead disagreed, out loud,
+# mid-call on 2026-08-31: "చాలా మెల్లగా మాట్లాడుతున్నాడు" — he is speaking very
+# slowly. Measured on one of that call's own answers, 1.0 produced ~9.5s of
+# audio and 1.2 produced ~8.0s. Left as an operator knob rather than a constant
+# because it is a taste judgement about a real voice: turn it back down here if
+# a listener ever finds it rushed.
+#
+# NOTE for this deployment: .env sets SARVAM_TTS_PACE=1.0 explicitly, so this
+# default does not apply here — change the .env line to take the new pace.
+_DEFAULT_TTS_PACE = 1.2
+SARVAM_TTS_PACE = _float("SARVAM_TTS_PACE", _DEFAULT_TTS_PACE)
 # saaras:v3 is the telephony-tuned model. saarika is NOT — it is trained on
 # clean audio and degrades on 8 kHz call quality.
 SARVAM_STT_MODEL = os.getenv("SARVAM_STT_MODEL", "saaras:v3")
@@ -447,8 +488,14 @@ GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "sa.json"
 # .env, which is where CLAUDE.md says secrets live anyway. The file still wins
 # when it exists, so running uvicorn directly on the host is unchanged.
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-GOOGLE_SHEET_ID: str | None = os.getenv("GOOGLE_SHEET_ID")
+GOOGLE_SHEET_ID: str | None = _sheet_id("GOOGLE_SHEET_ID")
 LEADS_WORKSHEET_NAME = os.getenv("LEADS_WORKSHEET_NAME", "Leads")
+# Shared secret for the Apps Script transport (app/sheets/apps_script.py) —
+# the same SHEETS_TOKEN the script validates from its Script Properties.
+# Optional: the deployed script accepts unauthenticated POSTs while its
+# property is unset, but that makes the /exec URL a PUBLIC write endpoint, so
+# setting both sides is strongly recommended once things work.
+SHEETS_TOKEN = os.getenv("SHEETS_TOKEN", "")
 
 # ── PUBLIC URL / WEBHOOKS ─────────────────────────────────────────────────────
 PUBLIC_BASE_URL: str | None = os.getenv("PUBLIC_BASE_URL")

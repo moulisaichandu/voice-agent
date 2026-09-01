@@ -5,6 +5,7 @@ specific safety issues fixed vs. the blueprint's original worker sketch (see
 worker.py's module docstring).
 """
 
+import asyncio
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -533,6 +534,9 @@ async def test_a_never_dialled_calling_lead_is_released_rather_than_dropped(
     monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
 
     await worker.process_one(str(mocks.lead.lead_id))
+    # The release runs detached so it cannot stall the loop for its settle
+    # window, so it has not necessarily finished when process_one returns.
+    await worker.drain_background()
 
     assert released == [mocks.lead.lead_id], "the stranded lead was dropped again"
     assert mocks.calls["record_dial_attempt"] == []   # still never dialled
@@ -611,3 +615,109 @@ async def test_a_retried_call_row_does_not_create_a_duplicate(monkeypatch):
         f"insert was attempted {len(inserted)} times — the second one is a "
         "duplicate calls row for one call"
     )
+
+
+async def test_releasing_a_crashed_reservation_does_not_stall_the_worker_loop(
+    mocks, monkeypatch,
+):
+    """release_undialed_calling_lead waits out the preflight window (60s by
+    default) before it dares free a lead, which is right — a racing worker's
+    record_dial_attempt must get the chance to block it.
+
+    But process_one runs INSIDE the worker loop, so awaiting that inline stops
+    every other lead being dequeued for a minute. The scenario that strands
+    reservations is a deploy killing the process mid-dial, which strands SEVERAL
+    at once: ten of them would serialise into ten minutes of dead dialler. The
+    lead is acked on this path either way, so the release does not have to
+    finish before the loop moves on.
+    """
+    import time
+
+    started = asyncio.Event()
+
+    async def reject(lead_id):
+        return False
+
+    async def slow_release(lead_id, **kw):
+        started.set()
+        await asyncio.sleep(30)          # stands in for settle_s
+        return True
+
+    monkeypatch.setattr(worker.leads_db, "mark_calling", reject)
+    monkeypatch.setattr(worker.leads_db, "release_undialed_calling_lead", slow_release)
+    monkeypatch.setattr(worker.redis_client, "get_redis", lambda: _FakeRedis())
+
+    began = time.perf_counter()
+    await asyncio.wait_for(worker.process_one(str(mocks.lead.lead_id)), timeout=5)
+    elapsed = time.perf_counter() - began
+
+    assert elapsed < 2, (
+        f"process_one blocked the worker loop for {elapsed:.1f}s waiting on a "
+        "release that could have run in the background"
+    )
+    await asyncio.wait_for(started.wait(), timeout=2)   # it really was started
+
+
+async def test_the_undialed_calling_sweep_releases_stranded_leads(monkeypatch):
+    """CONFIRMED by the 2026-08-27 adversarial review: the detached
+    crashed-reservation release sleeps out a 60s settle, drain_background
+    abandons it after 5s at shutdown, and the lead is by then acked out of
+    both Redis lists — leaving status='calling' with last_called_at NULL, a
+    state NO existing sweep scans (stale_calling_leads requires a timestamp,
+    the orphan reaper scans 'queued' only). This DB-membership sweep is the
+    durable owner: it re-finds such leads on every retry sweep and re-runs
+    the settle-checked release, so a strand lasts one sweep interval, not
+    forever."""
+    import uuid as _uuid
+
+    stranded = _uuid.uuid4()
+    released = []
+
+    async def fake_ids(limit=50):
+        return [stranded]
+
+    async def fake_release(lead_id):
+        released.append(lead_id)
+
+    monkeypatch.setattr(worker.leads_db, "undialed_calling_lead_ids", fake_ids)
+    monkeypatch.setattr(worker, "_release_crashed_reservation", fake_release)
+
+    spawned = await worker.reap_undialed_calling_leads()
+    await worker.drain_background(1.0)
+
+    assert spawned == 1
+    assert released == [stranded]
+
+
+async def test_back_to_back_sweeps_do_not_stack_sleepers_for_one_lead(monkeypatch):
+    """The sweep's safety currently rests on RETRY_SWEEP_MINUTES (900s) being
+    far longer than the release settle (180s) — an operator shortening the
+    sweep or lengthening the settle past it would stack detached sleepers on
+    every lead that legitimately sits in 'calling'+NULL. The margin should
+    not be load-bearing: a lead with a release already in flight is skipped."""
+    import uuid as _uuid
+
+    stranded = _uuid.uuid4()
+    started = []
+
+    async def fake_ids(limit=50):
+        return [stranded]
+
+    release_gate = asyncio.Event()
+
+    async def slow_release(lead_id):
+        started.append(lead_id)
+        await release_gate.wait()
+
+    monkeypatch.setattr(worker.leads_db, "undialed_calling_lead_ids", fake_ids)
+    monkeypatch.setattr(worker, "_release_crashed_reservation", slow_release)
+
+    first = await worker.reap_undialed_calling_leads()
+    await asyncio.sleep(0)
+    second = await worker.reap_undialed_calling_leads()   # settle still running
+    release_gate.set()
+    await worker.drain_background(1.0)
+
+    assert first == 1
+    assert second == 0, "a second sweep stacked another sleeper on the same lead"
+    assert started == [stranded]

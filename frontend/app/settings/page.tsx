@@ -1,7 +1,13 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { api, errorMessage, type ConfigVar, type SheetsStatus } from "@/lib/api";
+import {
+  api,
+  errorMessage,
+  type ConfigVar,
+  type SheetsStatus,
+  type SheetsSyncResult,
+} from "@/lib/api";
 import { Button } from "@/components/ui/Button";
 import { Card } from "@/components/ui/Card";
 import { StatusBadge } from "@/components/ui/StatusBadge";
@@ -13,6 +19,24 @@ export default function SettingsPage() {
   const [sheets, setSheets] = useState<SheetsStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [syncing, setSyncing] = useState(false);
+  const [syncResult, setSyncResult] = useState<SheetsSyncResult | null>(null);
+
+  async function syncNow() {
+    setSyncing(true);
+    setSyncResult(null);
+    try {
+      const result = await api.syncSheets();
+      setSyncResult(result);
+      // Re-read the status so the badge and "last sync" line agree with the
+      // run that just happened rather than the previous sweep.
+      setSheets(await api.sheetsStatus());
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setSyncing(false);
+    }
+  }
 
   async function refresh() {
     setLoading(true);
@@ -61,7 +85,28 @@ export default function SettingsPage() {
                   Last sync: {formatDateTime(sheets.last_sync_at)}
                   {sheets.last_synced_count !== null &&
                     ` — ${sheets.last_synced_count} row(s) written`}
+                  {sheets.last_dialable_count !== null &&
+                    `, ${sheets.last_dialable_count} dialable`}
                 </p>
+                {/* Imported but undialable is the quiet failure: the rows are
+                    there, the dialer refuses every one of them for want of
+                    consent, and the sync still reads as successful. */}
+                {sheets.last_synced_count !== null &&
+                  sheets.last_synced_count > 0 &&
+                  sheets.last_dialable_count === 0 && (
+                    <p className="text-status-warning">
+                      No imported lead can be dialled — check the Consent Basis and
+                      Consent At columns.
+                    </p>
+                  )}
+                {sheets.last_skips && Object.keys(sheets.last_skips).length > 0 && (
+                  <p className="text-neutral-500 dark:text-neutral-400">
+                    Skipped:{" "}
+                    {Object.entries(sheets.last_skips)
+                      .map(([reason, n]) => `${n} ${reason}`)
+                      .join(", ")}
+                  </p>
+                )}
                 {sheets.last_error && (
                   <p className="text-status-critical">{sheets.last_error}</p>
                 )}
@@ -74,6 +119,23 @@ export default function SettingsPage() {
                 a human-friendly mirror.
               </p>
             )}
+
+            <div className="flex items-center gap-3 pt-1">
+              <Button onClick={syncNow} disabled={syncing || !sheets.configured}>
+                {syncing ? "Syncing…" : "Sync now"}
+              </Button>
+              {syncResult && (
+                <span
+                  className={
+                    syncResult.error ? "text-status-critical" : "text-neutral-600 dark:text-neutral-400"
+                  }
+                >
+                  {syncResult.error
+                    ? syncResult.error
+                    : `${syncResult.synced ?? 0} imported, ${syncResult.dialable ?? 0} dialable`}
+                </span>
+              )}
+            </div>
           </div>
         )}
       </Card>

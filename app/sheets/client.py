@@ -20,6 +20,7 @@ from app.config import (
     GOOGLE_SHEET_ID,
     LEADS_WORKSHEET_NAME,
 )
+from app.sheets import apps_script
 
 _SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -31,6 +32,13 @@ def _sheet_id_reason() -> str | None:
         return ("GOOGLE_SHEET_ID is not set, so there is no Sheet to read or "
                 "write. Set it in .env.")
     if GOOGLE_SHEET_ID.lower().startswith(("http://", "https://")):
+        # app/config.py's _sheet_id already extracts the ID from a pasted
+        # docs.google.com/spreadsheets/d/<id>/... link, so a URL surviving to
+        # here has no recognisable /d/<id> segment in it at all.
+        #
+        # An Apps Script /exec URL never reaches this function: it selects
+        # the apps_script transport in unconfigured_reason below, which needs
+        # neither a sheet ID nor a service account.
         return (
             "GOOGLE_SHEET_ID contains a URL, but gspread.open_by_key needs the "
             "spreadsheet ID only. Copy the ID between /d/ and /edit in the "
@@ -53,6 +61,11 @@ def unconfigured_reason() -> str | None:
     not a probe of the API. It runs on every sweep and must never itself be the
     slow or failing thing.
     """
+    if apps_script.is_apps_script(GOOGLE_SHEET_ID):
+        # The Apps Script transport (app/sheets/apps_script.py): the deployed
+        # web app owns the spreadsheet binding and the write access, so
+        # neither a sheet ID nor a service-account credential is needed here.
+        return None
     sheet_id_reason = _sheet_id_reason()
     if sheet_id_reason:
         return sheet_id_reason

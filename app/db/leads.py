@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from uuid import UUID
 
@@ -224,7 +225,8 @@ async def release_orphaned_queued_lead(lead_id) -> bool:
     return result.endswith("1")
 
 
-async def release_undialed_calling_lead(lead_id: UUID) -> bool:
+async def release_undialed_calling_lead(lead_id: UUID, *,
+                                        settle_s: float = 180.0) -> bool:
     """Return a lead reserved for a call that was never actually placed.
 
     The crashed-reservation case. worker.process_one moves a lead to 'calling'
@@ -235,19 +237,72 @@ async def release_undialed_calling_lead(lead_id: UUID) -> bool:
     requeue is rejected by mark_calling's `where status='queued'` guard, so the
     lead was acked away into no queue and no processing list.
 
-    `last_called_at is null` is the safety guard, not an optimisation: that
-    column is written by record_dial_attempt, which runs BEFORE placement, so a
-    NULL there means no call can possibly be in flight. A lead whose attempt was
-    really placed stays 'calling' and is left to reap_stranded_calls, which is
-    bounded by CALL_MAX_DURATION_S and is the right owner for it.
+    `last_called_at is null` is necessary but NOT sufficient evidence (2026-08
+    audit, finding 11): it is also true for the whole live window between
+    ANOTHER worker's mark_calling and its record_dial_attempt — a window that
+    contains preflight's network round-trips. Under the two-consumer
+    deployment worker.py describes, reaper_sweep's blind requeue of the
+    processing list manufactures exactly that duplicate pop, and an immediate
+    release put a lead back to 'pending' while its dial was in flight — so
+    the finished call was never recorded on the lead and the person was
+    dialled again.
+
+    Hence *settle_s*: when the lead currently looks releasable, wait out the
+    longest plausible preflight-and-stamp window and re-check atomically. A
+    racing worker stamps last_called_at within seconds; a genuinely crashed
+    reservation stays NULL forever, so waiting costs the crash case nothing
+    (it already waited up to a reaper sweep to be noticed — and the caller
+    runs this DETACHED, so the wait blocks no loop). 180s, not 60: an
+    ElevenLabs-language preflight can stack several HTTP timeouts, and the
+    settle must dominate the worst realistic stack, not the typical one. A
+    lead whose attempt was really placed stays 'calling' and is left to
+    reap_stranded_calls, which is bounded by CALL_MAX_DURATION_S and is the
+    right owner for it.
+
+    Residual, sized and accepted (adversarial review 2026-08-27): the final
+    guarded UPDATE re-checks only calling+NULL, which is also the fingerprint
+    of a BRAND-NEW reservation — so two concurrent settle-sleepers for one
+    lead plus a re-reservation landing in the sub-second gap between them
+    could release a live mid-preflight reservation (one extra call, transient
+    slot-accounting skew, self-healing). Closing it needs a row-epoch token
+    in the WHERE; not worth that machinery against a window this narrow.
     """
     pool = await get_pool()
+    looks_releasable = await pool.fetchrow(
+        "select 1 from leads "
+        "where lead_id = $1 and status = 'calling' and last_called_at is null",
+        lead_id,
+    )
+    if looks_releasable is None:
+        return False
+    if settle_s > 0:
+        await asyncio.sleep(settle_s)
     result = await pool.execute(
         "update leads set status = 'pending' "
         "where lead_id = $1 and status = 'calling' and last_called_at is null",
         lead_id,
     )
     return result.endswith("1")
+
+
+async def undialed_calling_lead_ids(limit: int = 50) -> list[UUID]:
+    """Leads reserved as 'calling' whose dial attempt was never recorded.
+
+    The crashed-reservation state, found by DB membership rather than by a
+    Redis carrier or a timestamp — a lead abandoned mid-settle by a worker
+    shutdown is in neither Redis list and has last_called_at NULL, so every
+    other sweep is blind to it. Feeds worker.reap_undialed_calling_leads,
+    whose release re-checks after the settle window, so merely APPEARING
+    here is not yet evidence of a crash — a lead mid-preflight also
+    qualifies briefly, and the settle sorts the two out.
+    """
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "select lead_id from leads "
+        "where status = 'calling' and last_called_at is null limit $1",
+        limit,
+    )
+    return [r["lead_id"] for r in rows]
 
 
 async def requeue_failed_leads(*, cooldown_s: int) -> list[UUID]:

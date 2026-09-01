@@ -33,6 +33,14 @@ class _FakeRedis:
     async def lpush(self, key, value):
         self.lists.setdefault(key, []).insert(0, value)
 
+    async def delete(self, *keys):
+        removed = 0
+        for key in keys:
+            if key in self.store:
+                del self.store[key]
+                removed += 1
+        return removed
+
     async def eval(self, script, numkeys, *keys_and_args):
         self.eval_calls.append((script, numkeys, keys_and_args))
         return 1
@@ -88,6 +96,34 @@ async def test_handle_post_call_transcription_maps_roles_and_records(fake_redis,
     # placing the call: this webhook still fires for the same conversation,
     # so releasing here too would double-release and break the concurrency cap.
     assert fake_redis.eval_calls == []
+
+
+async def test_the_canonical_transcript_clears_the_exported_marker(fake_redis, monkeypatch):
+    """Every ElevenLabs call queues its write-back twice: the stream teardown
+    pushes the bridge-collected transcript, and this webhook pushes again
+    after overwriting the row with the CANONICAL version. If a reconcile
+    sweep drained between the two, the first export set the per-call marker
+    and the canonical re-export was skipped forever — first-version-wins.
+    Recording the canonical transcript must clear the marker."""
+    from uuid import uuid4
+
+    from app.sheets import writeback
+
+    call_id = uuid4()
+
+    async def fake_record_transcript(**kwargs):
+        return SimpleNamespace(lead_id="lead_xyz", call_id=call_id)
+
+    monkeypatch.setattr(wh.calls_db, "record_transcript", fake_record_transcript)
+    marker = writeback.exported_marker_key(call_id)
+    fake_redis.store[marker] = "1"
+
+    await wh._handle_post_call_transcription(_transcription_payload()["data"])
+
+    assert marker not in fake_redis.store, (
+        "the stale marker will suppress the canonical transcript's export"
+    )
+    assert fake_redis.lists["sheets:writeback:queue"] == ["lead_xyz"]
 
 
 async def test_call_initiation_failure_releases_slot_and_records_failure(fake_redis, monkeypatch):

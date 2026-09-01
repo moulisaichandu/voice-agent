@@ -71,12 +71,23 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": SEARCH_TOOL_NAME,
+            # Digest-aware since 2026-08-29: a KNOWN COURSE FACTS section in
+            # the system prompt now carries the corpus's core facts, and this
+            # description used to order a call "for every question about ...
+            # fees ... duration" — a direct contradiction with no stated
+            # precedence, so at temperature 0.6 the routing was a coin flip
+            # and the losing side paid the round-trip the digest exists to
+            # remove (or replayed the top-k fee miss with the right fee
+            # sitting unused in the prompt).
             "description": (
                 "Search Digital Brolly's course documents for material "
-                "relevant to the lead's question. Call this for every question "
-                "about courses, fees, timings, batches, duration, syllabus or "
-                "placement — never answer those from memory. The `query` MUST "
-                "be in English, whatever language the lead is speaking."
+                "relevant to the lead's question. Call this for questions "
+                "about courses, fees, timings, batches, duration, syllabus "
+                "or placement that are NOT covered by the KNOWN COURSE FACTS "
+                "section of your instructions (when present) — facts covered "
+                "there are answered directly, without this tool. Never "
+                "answer course questions from your own memory. The `query` "
+                "MUST be in English, whatever language the lead is speaking."
             ),
             "parameters": {
                 "type": "object",
@@ -102,10 +113,17 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": END_CALL_TOOL_NAME,
+            # "ONLY ... EXPLICITLY", with the affirmations named: on a live
+            # call (2026-08-29) the model hung up on a lead whose "ఓకే సార్"
+            # was her ACCEPTING its own offer of more information.
             "description": (
-                "End the call. Use this together with your farewell the moment "
-                "the conversation has finished — the lead has said goodbye, "
-                "asked not to be called, or has nothing further to ask."
+                "End the call. Use this together with your farewell ONLY "
+                "when the lead has EXPLICITLY finished: they said goodbye, "
+                "asked not to be called, or clearly said they have nothing "
+                "further to ask. An affirmation such as okay, ఓకే, సరే or "
+                "అవును — especially in reply to a question YOU asked — is "
+                "the lead AGREEING to hear more, never a reason to end the "
+                "call."
             ),
             # A required argument, not {}. Measured against the live API: with
             # an empty schema this tool fired 0 times out of 3 on an explicit

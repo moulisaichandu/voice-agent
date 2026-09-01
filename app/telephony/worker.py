@@ -169,6 +169,50 @@ async def reaper_sweep(timeout_s: int) -> int:
     return n
 
 
+async def reap_undialed_calling_leads() -> int:
+    """Recover leads stuck in 'calling' with no dial attempt recorded.
+
+    The state _release_crashed_reservation exists for — but that release is
+    a DETACHED task sleeping out a 180s settle, drain_background abandons it
+    after 5s at shutdown (Docker SIGKILLs at ten), and by then process_one
+    has acked the lead out of both Redis lists. Nothing else can see the
+    result: reap_stranded_calls requires last_called_at IS NOT NULL, the
+    orphan reaper scans status='queued', and due_leads selects 'pending' —
+    confirmed by the 2026-08-27 adversarial review as a permanent strand.
+
+    DB membership is the durable carrier instead: every retry sweep re-finds
+    such leads and re-runs the settle-checked release (spawned detached so N
+    concurrent settles cost the sweep nothing). Safe against a lead that is
+    merely mid-preflight — the release itself waits out the settle window
+    and re-checks before touching anything — and idempotent across sweeps,
+    since a released lead leaves the result set.
+    """
+    # One live sleeper per lead, ever. Without this the design silently
+    # depends on RETRY_SWEEP_MINUTES (900s) dominating the release settle
+    # (180s) — true today, but an operator shortening the sweep or
+    # lengthening the settle past it would stack a new detached sleeper on
+    # every lead legitimately mid-settle, and that margin should not be
+    # load-bearing. The task NAME is the dedupe key, shared DELIBERATELY
+    # with process_one's own spawn site (release-{lead_id}) so this sweep
+    # also never doubles a release already in flight from a duplicate pop —
+    # the exact two-sleeper setup the settle-ABA residual needs.
+    # _BACKGROUND holds strong refs until each task completes.
+    in_flight = {t.get_name() for t in _BACKGROUND if not t.done()}
+    spawned = 0
+    for lead_id in await leads_db.undialed_calling_lead_ids():
+        name = f"release-{lead_id}"
+        if name in in_flight:
+            continue
+        _spawn_background(_release_crashed_reservation(lead_id), name=name)
+        spawned += 1
+    if spawned:
+        logger.warning(
+            f"[worker] found {spawned} lead(s) in 'calling' with no dial "
+            "attempt recorded — running the settle-checked release for each."
+        )
+    return spawned
+
+
 async def reap_orphaned_queued_leads() -> int:
     """Return leads that are 'queued' in Postgres but present in neither Redis list.
 
@@ -304,6 +348,78 @@ async def _ack(lead_id: str) -> None:
     await r.lrem(PROCESSING_KEY, 1, lead_id)
 
 
+# asyncio only holds a weak reference to a running task, so a fire-and-forget
+# task can be garbage-collected mid-await and vanish silently. Holding a strong
+# reference until it finishes is the documented fix.
+_BACKGROUND: set[asyncio.Task] = set()
+
+
+def _spawn_background(coro, *, name: str) -> asyncio.Task:
+    """Run *coro* detached from the worker loop, logging anything it raises.
+
+    An exception in a task nobody awaits is otherwise reported only when the
+    task is collected, as an "exception was never retrieved" warning with no
+    surrounding context.
+    """
+    task = asyncio.create_task(coro, name=name)
+    _BACKGROUND.add(task)
+    task.add_done_callback(_BACKGROUND.discard)
+
+    def _report(t: asyncio.Task) -> None:
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.error(f"[worker] background task {name} failed: {exc!r}")
+
+    task.add_done_callback(_report)
+    return task
+
+
+async def drain_background(timeout_s: float = 5.0) -> None:
+    """Give detached tasks a bounded chance to finish before the loop exits.
+
+    Deliberately short: the longest of these waits out a settle window of a
+    few minutes, and Docker SIGKILLs a container that ignores SIGTERM for ten
+    seconds. Anything still unfinished is abandoned — safe ONLY because
+    reap_undialed_calling_leads re-finds an abandoned release's lead by DB
+    membership ('calling' + last_called_at NULL) on every retry sweep and
+    runs the release again. No other sweep can see that state: the orphan
+    reaper scans status='queued', reap_stranded_calls requires a recorded
+    dial attempt, and the lead was already acked out of both Redis lists.
+    (An earlier version of this docstring claimed reap_orphaned_queued_leads
+    covered it — confirmed false by the 2026-08-27 adversarial review; the
+    strand was permanent until that sweep existed.)
+    """
+    pending = list(_BACKGROUND)
+    if not pending:
+        return
+    logger.info(f"[worker] waiting up to {timeout_s}s for {len(pending)} background task(s)")
+    done, still_running = await asyncio.wait(pending, timeout=timeout_s)
+    for task in still_running:
+        task.cancel()
+    if still_running:
+        logger.info(
+            f"[worker] {len(still_running)} background task(s) abandoned at shutdown "
+            "— reap_undialed_calling_leads re-finds their leads on the next sweep"
+        )
+
+
+async def _release_crashed_reservation(lead_id: UUID) -> None:
+    """Free a lead stuck in 'calling' with no dial attempt, or say why not.
+
+    Split out only so it can run detached — see the call site in process_one.
+    """
+    if await leads_db.release_undialed_calling_lead(lead_id):
+        logger.warning(
+            f"[worker] lead {lead_id} was stuck in 'calling' with no "
+            "dial attempt recorded — a reservation whose process died. "
+            "Released back to 'pending'."
+        )
+    else:
+        logger.info(f"[worker] lead {lead_id} already left 'queued' — skipping")
+
+
 async def process_one(lead_id: str) -> None:
     """The full reserve -> dial -> record sequence for one lead_id already
     popped into calls:processing. See module docstring points 6 and 7."""
@@ -372,14 +488,21 @@ async def process_one(lead_id: str) -> None:
             # guard then rejects, acking it away into no queue and no
             # processing list. release_undialed_calling_lead can tell the two
             # apart (see its docstring) and only ever frees the crashed one.
-            if await leads_db.release_undialed_calling_lead(lead.lead_id):
-                logger.warning(
-                    f"[worker] lead {lead_id} was stuck in 'calling' with no "
-                    "dial attempt recorded — a reservation whose process died. "
-                    "Released back to 'pending'."
-                )
-            else:
-                logger.info(f"[worker] lead {lead_id} already left 'queued' — skipping")
+            #
+            # Backgrounded, because that telling-apart is not instant: the
+            # release waits out a settle window (a minute by default) so a
+            # racing worker's record_dial_attempt gets its chance to veto.
+            # process_one runs inside the worker loop, so awaiting it here
+            # would stop every OTHER lead being dequeued for that minute — and
+            # the situation that strands reservations is a process dying
+            # mid-dial, which strands them in batches, serialising into
+            # minutes of dead dialler. Nothing below depends on the outcome:
+            # this lead is done being processed either way, and the release
+            # only ever moves it 'calling' -> 'pending' under its own guard.
+            _spawn_background(
+                _release_crashed_reservation(lead.lead_id),
+                name=f"release-{lead_id}",
+            )
             return
         reserved = True
 
@@ -497,8 +620,13 @@ async def process_one(lead_id: str) -> None:
         # el_conversation_id is NULL here on purpose: with Plivo placing the
         # call there is no ElevenLabs conversation yet — one is created when
         # the audio bridge connects, and call_routes.py fills it in then.
+        # attempt_id, not result.call_uuid: they are the same value whenever
+        # Plivo returned one, and when it did not this keeps the row and the
+        # call:uuid:{lead} key AGREEING on a per-attempt identifier. The
+        # duplicate-row guard in call_routes._finalise_call looks the row up by
+        # exactly that key, so a disagreement there silently disables it.
         await _create_call_with_retry(
-            lead=lead, campaign=campaign, provider_call_id=result.call_uuid,
+            lead=lead, campaign=campaign, provider_call_id=attempt_id,
         )
         # The slot is now owned by the call routes, released when the call
         # actually ends (stream closes, or Plivo posts the hangup) — not here.
@@ -631,6 +759,7 @@ async def run_worker(stop_event: asyncio.Event) -> None:
             # Back off so a sustained outage doesn't spin the CPU or flood the
             # log, while a one-off blip still recovers within seconds.
             await asyncio.sleep(backoff)
+    await drain_background()
     logger.info("[worker] stopped")
 
 
@@ -638,8 +767,22 @@ if __name__ == "__main__":  # pragma: no cover - manual/standalone entrypoint
     # For running the worker as its own process/container instead of
     # in-process with the API — see the commented-out `worker` service in
     # docker-compose.yml. Set WORKER_ENABLED=false on the `backend` service
-    # if you do this, to avoid two redundant (harmless, just wasteful)
-    # consumers of calls:queue.
+    # if you do this. Two consumers of calls:queue used to be described here as
+    # harmless and merely wasteful, on the grounds that BLMOVE hands each lead
+    # to exactly one of them. That is still true of the queue itself, but it is
+    # no longer the whole story: a lead is 'calling' with no last_called_at for
+    # the whole of preflight, and in that window it is indistinguishable from a
+    # reservation whose process died. One consumer cannot act on that — it is
+    # busy being the reservation. A second one can: the reaper requeues the
+    # lead, the second consumer's mark_calling is rejected, and it starts a
+    # release that can hand a lead back to 'pending' while the first consumer
+    # is still working on it.
+    #
+    # It does NOT dial anyone twice — release_undialed_calling_lead waits out a
+    # settle window and re-checks last_called_at, and the per-number dialing
+    # lock is held across that whole window, so a re-dial attempt is refused.
+    # What it costs is coherent status and attempt accounting. That is a real
+    # cost, and it is unnecessary: run one consumer.
     import signal
 
     async def _standalone() -> None:

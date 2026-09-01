@@ -242,6 +242,116 @@ async def test_translation_retry_still_returns_the_note_when_nothing_matches(mon
     assert await search.search_relevant("ఈరోజు వాతావరణం ఎలా ఉంది?") == search.NO_MATERIAL_NOTE
 
 
+# ── multi-intent queries: every named topic must be retrieved ────────────────
+# Measured on the live index after the 2026-08-27 two-way call: for
+# "SEO details and fee structure" the SEO syllabus fills ranks 1-10
+# (0.43-0.52 — the corpus is SEO-dense) and the first fee-bearing chunk sits
+# at rank 11 with 0.402: comfortably relevant, but invisible at RAG_TOP_K=4.
+# The tool therefore returned SEO material only, and the agent — correctly
+# refusing to invent fees — told the lead fee details were unavailable and
+# promised a callback, ONE TURN after it had quoted the starting fee.
+# The fix splits explicit conjunctions into sub-queries retrieved
+# concurrently under the SAME threshold, then interleaves the pools.
+
+COMBINED_QUERY = "SEO details and fee structure"
+
+_SEO_POOL = [
+    {"content": f"SEO syllabus item {i}", "section": "seo", "score": 0.52 - i / 100}
+    for i in range(4)
+]
+_FEE_CHUNK = {"content": "Total Fee: 1,50,000 rupees.", "section": "fees", "score": 0.55}
+
+
+def _embed_as_text(text):
+    """Embedding stub that lets fake stores key off the exact query."""
+    return text
+
+
+async def test_a_two_intent_query_retrieves_both_topics(monkeypatch):
+    monkeypatch.setattr(search, "embed_text", _embed_as_text)
+
+    async def fake_match_chunks(embedding, *, match_count, min_score):
+        assert min_score == 0.30  # sub-queries face the same bar, never looser
+        if embedding == "fee structure":
+            return [_FEE_CHUNK]
+        if embedding in (COMBINED_QUERY, "SEO details"):
+            return list(_SEO_POOL)  # SEO crowds out everything else
+        return []
+
+    monkeypatch.setattr("app.db.rag_store.match_chunks", fake_match_chunks)
+
+    result = await search.search_relevant(COMBINED_QUERY)
+
+    assert "1,50,000" in result, (
+        "the fee intent was crowded out of top-k by the SEO-dense corpus"
+    )
+    assert "SEO syllabus item 0" in result, "the first intent must survive too"
+
+
+async def test_split_sub_queries_are_deduplicated(monkeypatch):
+    """A chunk matching two sub-queries must be spoken about once, not twice."""
+    monkeypatch.setattr(search, "embed_text", _embed_as_text)
+
+    async def fake_match_chunks(embedding, *, match_count, min_score):
+        if embedding == COMBINED_QUERY:
+            return list(_SEO_POOL)
+        return [_FEE_CHUNK, _SEO_POOL[0]]  # both parts return the same chunks
+
+    monkeypatch.setattr("app.db.rag_store.match_chunks", fake_match_chunks)
+
+    result = await search.search_relevant(COMBINED_QUERY)
+
+    assert result.count("Total Fee: 1,50,000 rupees.") == 1
+    assert result.count("SEO syllabus item 0") == 1
+
+
+async def test_an_off_topic_half_contributes_nothing(monkeypatch):
+    """The split must not weaken relevance: a sub-query that clears nothing
+    returns nothing — the threshold guards each part independently, so the
+    split can never leak below-threshold material into the live tool."""
+    monkeypatch.setattr(search, "embed_text", _embed_as_text)
+
+    async def fake_match_chunks(embedding, *, match_count, min_score):
+        if embedding == "fee structure":
+            return [_FEE_CHUNK]
+        return []  # "the weather today" clears nothing anywhere
+
+    monkeypatch.setattr("app.db.rag_store.match_chunks", fake_match_chunks)
+
+    result = await search.search_relevant("the weather today and fee structure")
+
+    assert "1,50,000" in result
+    assert "weather" not in result
+
+
+async def test_the_translated_retry_is_also_split(monkeypatch):
+    """A Telugu two-intent question misses in Telugu (scores ~0.1-0.19 against
+    the English-only docs), gets translated — and the translation carries the
+    same 'and', so it must get the same split or it hits the same rank-11
+    wall the original fix exists for."""
+    monkeypatch.setattr(search, "RAG_TRANSLATE_ON_MISS", True)
+    monkeypatch.setattr(search, "embed_text", _embed_as_text)
+
+    async def fake_translate(q):
+        return COMBINED_QUERY
+
+    async def fake_match_chunks(embedding, *, match_count, min_score):
+        if embedding == "fee structure":
+            return [_FEE_CHUNK]
+        if embedding == "SEO details":
+            return list(_SEO_POOL)
+        return []  # every Telugu-script embedding misses
+
+    monkeypatch.setattr(search, "translate_to_english", fake_translate)
+    monkeypatch.setattr("app.db.rag_store.match_chunks", fake_match_chunks)
+
+    result = await search.search_relevant(
+        "ఎస్ఈఓ గురించి చెప్పండి మరియు ఫీజు స్ట్రక్చర్ చెప్పండి")
+
+    assert "1,50,000" in result
+    assert "SEO syllabus item 0" in result
+
+
 # ── Pinning test: the live tool endpoint must never reach search_permissive ────
 
 async def test_rag_endpoint_uses_filtered_search(monkeypatch):

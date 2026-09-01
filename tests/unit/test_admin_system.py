@@ -712,6 +712,8 @@ def test_sheets_status_reads_the_last_sync_from_redis(client, monkeypatch):
     redis = _FakeRedis({admin_system.scheduler_module.SHEETS_LAST_SYNC_KEY: json.dumps(record)})
     monkeypatch.setattr(admin_system.redis_client, "get_redis", lambda: redis)
 
+    monkeypatch.setattr(admin_system.sheets_client, "unconfigured_reason", lambda: None)
+
     r = client.get("/admin/sheets-status")
     body = r.json()
     assert body["configured"] is True
@@ -731,12 +733,47 @@ def test_sheets_status_reports_the_last_sync_error(client, monkeypatch):
 
 def test_sheets_status_handles_no_sync_having_run_yet(client, monkeypatch):
     monkeypatch.setattr(admin_system.app_config, "GOOGLE_SHEET_ID", "sheet-123")
+    monkeypatch.setattr(admin_system.sheets_client, "unconfigured_reason", lambda: None)
     monkeypatch.setattr(admin_system.redis_client, "get_redis", lambda: _FakeRedis())
 
     r = client.get("/admin/sheets-status")
     body = r.json()
     assert body["configured"] is True
     assert body["last_sync_at"] is None
+
+
+def test_a_sheet_id_that_cannot_actually_be_used_is_not_reported_as_configured(
+        client, monkeypatch):
+    """`configured` used to be `bool(GOOGLE_SHEET_ID)`, so a sheet ID with no
+    service account behind it — the state this deployment ran in — reported as
+    configured and healthy until a sweep happened to fail. It now answers the
+    question the operator is actually asking: can this sync run at all."""
+    monkeypatch.setattr(admin_system.app_config, "GOOGLE_SHEET_ID", "sheet-123")
+    monkeypatch.setattr(admin_system.sheets_client, "unconfigured_reason",
+                        lambda: "no Google service account configured")
+    monkeypatch.setattr(admin_system.redis_client, "get_redis", lambda: _FakeRedis())
+
+    body = client.get("/admin/sheets-status").json()
+
+    assert body["configured"] is False
+    assert "service account" in body["last_error"]
+
+
+def test_sheets_status_surfaces_how_many_leads_can_actually_dial(client, monkeypatch):
+    """"40 rows synced" and "40 rows that will never be called" were the same
+    number whenever the sheet carried no consent columns."""
+    monkeypatch.setattr(admin_system.app_config, "GOOGLE_SHEET_ID", "sheet-123")
+    monkeypatch.setattr(admin_system.sheets_client, "unconfigured_reason", lambda: None)
+    record = {"at": "2026-01-01T00:00:00+00:00", "synced": 40, "error": None,
+              "received": 42, "dialable": 0, "skips": {"no phone": 2}}
+    redis = _FakeRedis({admin_system.scheduler_module.SHEETS_LAST_SYNC_KEY: json.dumps(record)})
+    monkeypatch.setattr(admin_system.redis_client, "get_redis", lambda: redis)
+
+    body = client.get("/admin/sheets-status").json()
+
+    assert body["last_synced_count"] == 40
+    assert body["last_dialable_count"] == 0
+    assert body["last_skips"] == {"no phone": 2}
 
 
 def test_sheets_status_does_not_500_on_malformed_cache(client, monkeypatch):
@@ -977,3 +1014,47 @@ async def test_a_reachable_unchanged_tunnel_is_good(monkeypatch):
     monkeypatch.setattr(sys_mod.httpx, "AsyncClient", lambda **kw: _Client())
 
     assert (await sys_mod._check_public_url())["status"] == "good"
+
+
+# ── the manual sheets sync trigger ───────────────────────────────────────────
+
+def test_sheets_sync_can_be_triggered_by_hand(client, monkeypatch):
+    """Until now the only trigger was the 10-minute APScheduler job, so an
+    operator who had just fixed their sheet had no way to find out whether it
+    worked except to wait. The response carries the same counts the file
+    upload has always reported."""
+    called = []
+
+    async def fake_scheduled_sync():
+        called.append(True)
+        return {"at": "2026-01-01T00:00:00+00:00", "synced": 2, "error": None,
+                "received": 3, "dialable": 2, "skips": {"no phone": 1}}
+
+    monkeypatch.setattr(admin_system.scheduler_module, "sheets_sync", fake_scheduled_sync)
+
+    body = client.post("/admin/sheets/sync").json()
+
+    assert called, "the sync never ran"
+    assert body["synced"] == 2
+    assert body["dialable"] == 2
+    assert body["received"] == 3
+    assert body["skips"] == {"no phone": 1}
+    assert body["error"] is None
+
+
+def test_a_failing_manual_sync_reports_the_reason_rather_than_500ing(
+        client, monkeypatch):
+    """The scheduler wrapper already turns a Sheets outage into a recorded
+    error rather than a crash; triggering the same job by hand must behave the
+    same way, so the operator reads the reason instead of a stack trace."""
+    async def fake_scheduled_sync():
+        return {"at": "2026-01-01T00:00:00+00:00", "synced": None,
+                "error": "RuntimeError: Leads sheet not found."}
+
+    monkeypatch.setattr(admin_system.scheduler_module, "sheets_sync", fake_scheduled_sync)
+
+    r = client.post("/admin/sheets/sync")
+
+    assert r.status_code == 200
+    assert "Leads sheet not found" in r.json()["error"]
+    assert r.json()["synced"] is None

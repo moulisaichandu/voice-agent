@@ -152,6 +152,11 @@ async def retry_sweeper() -> None:
     #    (a flush, a recreated container, an eviction). Nothing else looks at
     #    that status, so without this they wait forever.
     await worker.reap_orphaned_queued_leads()
+    # 6. Reservation recovery — leads stuck in 'calling' with no dial attempt
+    #    recorded, whose detached settle-release was abandoned by a shutdown.
+    #    Steps 3 and 5 structurally cannot see them (no timestamp, wrong
+    #    status), so without this they were stranded permanently.
+    await worker.reap_undialed_calling_leads()
 
 
 async def dnd_refresh() -> None:
@@ -178,7 +183,13 @@ async def dnd_refresh() -> None:
         await r.sadd(worker.DND_SET_KEY, *phone_list)
 
 
-async def sheets_sync() -> None:
+async def sheets_sync() -> dict:
+    """The scheduled sync, and the one /admin/sheets/sync triggers by hand.
+
+    Returns the record it stamps into Redis so the manual trigger can report
+    what happened without a second read — and so the two paths can never
+    disagree about what "the last sync" was.
+    """
     r = redis_client.get_redis()
     now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -194,11 +205,17 @@ async def sheets_sync() -> None:
             await r.set(SHEETS_LAST_SYNC_KEY, json.dumps(record))
         except Exception:
             pass
-        return
+        return record
 
     try:
-        synced = await sheets_sync_module.sheets_sync()
-        record = {"at": now_iso, "synced": synced, "error": None}
+        outcome = await sheets_sync_module.sheets_sync()
+        # `dialable` is carried separately from `synced` because they answer
+        # different questions and were the same number for weeks: a sheet with
+        # no consent columns imports every row and the dialer refuses all of
+        # them, which read as a healthy sync.
+        record = {"at": now_iso, "synced": outcome.imported, "error": None,
+                  "received": outcome.received, "dialable": outcome.dialable,
+                  "skips": outcome.skips}
     except Exception as exc:
         # A Sheets outage/misconfiguration must not crash the scheduler loop
         # (which also runs campaign_tick/retry_sweeper/dnd_refresh) — log and
@@ -210,6 +227,7 @@ async def sheets_sync() -> None:
         await r.set(SHEETS_LAST_SYNC_KEY, json.dumps(record))
     except Exception:
         pass  # Redis itself may be what's down; the log line above still landed
+    return record
 
 
 # How long past a call's maximum duration before it is certainly over. Slack

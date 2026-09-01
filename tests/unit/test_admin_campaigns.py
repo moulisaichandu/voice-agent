@@ -718,11 +718,15 @@ def test_a_campaign_with_no_script_warms_nothing(client, monkeypatch):
     assert r.status_code == 201
 
 
-def test_a_scriptless_two_way_campaign_warms_its_default_opening(client, monkeypatch):
-    """A two-way campaign needs no script, and the bridge falls back to
-    DEFAULT_TWOWAY_SCRIPT. Warming only campaign.script therefore warmed
-    nothing at all for the commonest two-way case, and the first lead after a
-    Redis flush would answer to ~20s of silence while it rendered."""
+def test_a_scriptless_two_way_campaign_needs_no_warm_up(client, monkeypatch):
+    """SUPERSEDED BEHAVIOUR, kept as a test because the reason matters.
+
+    This used to warm DEFAULT_TWOWAY_SCRIPT, because the bridge rendered that
+    fallback and the first lead after a Redis flush would otherwise answer to
+    ~20s of silence. The bridge no longer renders it at all — a scriptless
+    two-way call speaks the DEFAULT_TWOWAY_TELUGU constant — so the warm-up
+    became ~93s of Sarvam reasoning, and a false [compliance] warning,
+    for a render nothing reads."""
     warmed = {}
 
     async def fake_create(**kwargs):
@@ -744,4 +748,76 @@ def test_a_scriptless_two_way_campaign_warms_its_default_opening(client, monkeyp
     })
 
     assert r.status_code == 201
-    assert warmed.get("script") == admin_campaigns.sarvam_prompts.DEFAULT_TWOWAY_SCRIPT
+    assert warmed == {}, "rendered a script the call path never reads"
+
+
+async def test_a_scriptless_two_way_campaign_is_not_rendered_at_all(monkeypatch):
+    """Observed live 2026-08-31, seconds after creating a scriptless Telugu
+    campaign: a [compliance] WARNING that the rendered Telugu had dropped the
+    disclosure — from a render nothing would ever read.
+
+    A scriptless two-way call now speaks sarvam_prompts.DEFAULT_TWOWAY_TELUGU,
+    a constant, and never calls the renderer (see sarvam_bridge). Warming
+    DEFAULT_TWOWAY_SCRIPT therefore buys nothing and costs plenty: ~93s of
+    Sarvam reasoning per campaign, the credits for it, and a false compliance
+    alarm of exactly the kind CLAUDE.md says must stay rare enough to be
+    believed."""
+    warmed = {}
+
+    async def fake_create(**kwargs):
+        return _campaign(mode="twoway", language="te", script=None)
+
+    async def fake_render(script, *, language_style=None):
+        warmed["script"] = script
+        return "rendered"
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
+    monkeypatch.setattr(admin_campaigns.sarvam_llm, "render", fake_render)
+    monkeypatch.setattr(admin_campaigns.languages_module, "twoway_enabled",
+                        lambda backend: True)
+    tasks = BackgroundTasks()
+
+    await admin_campaigns.create_campaign(
+        admin_campaigns.CampaignCreate(
+            name="Scriptless", mode="twoway", language="te",
+            agent_id="agent_1", script=None,
+        ),
+        tasks,
+    )
+    await tasks()
+
+    assert warmed == {}, (
+        "rendered a script the call path never reads — 93s and a false "
+        "[compliance] warning for nothing"
+    )
+
+
+async def test_a_two_way_campaign_with_a_script_is_still_warmed(monkeypatch):
+    """The skip is for the SCRIPTLESS case only: an operator's own script
+    still has to be translated, and still off the call path."""
+    warmed = {}
+    script = "This is an automated AI call. Our course starts Monday."
+
+    async def fake_create(**kwargs):
+        return _campaign(mode="twoway", language="te", script=script)
+
+    async def fake_render(s, *, language_style=None):
+        warmed["script"] = s
+        return "rendered"
+
+    monkeypatch.setattr(admin_campaigns.campaigns_db, "create_campaign", fake_create)
+    monkeypatch.setattr(admin_campaigns.sarvam_llm, "render", fake_render)
+    monkeypatch.setattr(admin_campaigns.languages_module, "twoway_enabled",
+                        lambda backend: True)
+    tasks = BackgroundTasks()
+
+    await admin_campaigns.create_campaign(
+        admin_campaigns.CampaignCreate(
+            name="Scripted", mode="twoway", language="te",
+            agent_id="agent_1", script=script,
+        ),
+        tasks,
+    )
+    await tasks()
+
+    assert warmed["script"] == script

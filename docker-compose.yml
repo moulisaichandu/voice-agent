@@ -51,6 +51,32 @@ services:
     # Single worker keeps APScheduler single-instance.
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
 
+  # The operator console: campaigns, leads, calls, settings.
+  #
+  # Added 2026-09-01. frontend/ had been a complete Next app that was never
+  # run — it was absent from this file, so every campaign was created by hand
+  # with curl against /admin. The browser never talks to FastAPI directly; it
+  # calls this server's /api/backend/* proxy, which is why the token below is
+  # server-side only and never reaches the page.
+  console:
+    build: ./frontend
+    environment:
+      # Container-to-container, so the compose service name and the INTERNAL
+      # port — not the 8091 the host sees.
+      BACKEND_URL: http://backend:8000
+      # The same secret the admin routes check. Held by the Next server, not
+      # the browser: app/api/backend/[...path]/route.ts strips any inbound
+      # Authorization header and attaches this one itself.
+      BACKEND_AUTH_TOKEN: ${APP_AUTH_TOKEN:-}
+    # Host port is overridable because a developer may already be running
+    # `npm run dev` on 3200; the container would then fail to bind and take
+    # `docker compose up` down with it. Set CONSOLE_PORT to run both.
+    ports: ["${CONSOLE_PORT:-3200}:3200"]
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
   # The public tunnel Plivo needs to reach /calls/answer and /calls/stream.
   #
   # Runs HERE rather than in a terminal someone has to remember to keep open:
