@@ -914,3 +914,13 @@ def test_background_speech_and_garbled_course_questions_are_covered(token):
 
     assert "recorded announcement" in prompt
     assert "never call such a question off-topic" in prompt
+
+
+def test_the_digest_rule_names_what_is_covered_and_makes_the_tool_the_exception():
+    prompt = sarvam_prompts.two_way_instructions(
+        "మౌలి", None, language_style=languages.style("te"),
+        course_facts="BDLP fee 50,000.")
+    lowered = prompt.lower()
+    assert "directly and immediately" in lowered
+    assert "'what do you teach'" in lowered
+    assert "only when the question is about something those facts say nothing about" in lowered

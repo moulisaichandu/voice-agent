@@ -81,13 +81,15 @@ TOOLS: list[dict] = [
             # sitting unused in the prompt).
             "description": (
                 "Search Digital Brolly's course documents for material "
-                "relevant to the lead's question. Call this for questions "
-                "about courses, fees, timings, batches, duration, syllabus "
-                "or placement that are NOT covered by the KNOWN COURSE FACTS "
-                "section of your instructions (when present) — facts covered "
-                "there are answered directly, without this tool. Never "
-                "answer course questions from your own memory. The `query` "
-                "MUST be in English, whatever language the lead is speaking."
+                "relevant to the lead's question. Use this ONLY for a "
+                "question the KNOWN COURSE FACTS section of your "
+                "instructions (when present) says nothing about at all — "
+                "everything those facts mention (programs, fees, durations, "
+                "modes, curriculum modules and topics, placement, "
+                "eligibility, location) is answered directly from them, "
+                "without this tool. Never answer course questions from your "
+                "own memory. The `query` MUST be in English, whatever "
+                "language the lead is speaking."
             ),
             "parameters": {
                 "type": "object",

@@ -165,6 +165,16 @@ async def lifespan(app: FastAPI):
     elif SCHEDULER_ENABLED:
         logger.warning("[startup] SCHEDULER_ENABLED but Redis is down — not starting it.")
 
+    # Read and store the course documents NOW, before any lead answers. The
+    # digest used to be built lazily by the first call after its cache
+    # expired, under a 3 s deadline it could not meet, so that call ran
+    # tool-only ("ఒక్క క్షణం, చూసి చెప్తాను" on every question). Background
+    # task: startup must not wait on the embeddings API.
+    if redis_ok:
+        from app.telephony import sarvam_bridge
+        warm = asyncio.create_task(sarvam_bridge.refresh_course_facts())
+        app.state.course_facts_warm = warm  # keep a reference; see _BACKGROUND_REBUILDS
+
     # Rebuild the dial-time DND set NOW rather than waiting for dnd_refresh's
     # 06:00 cron. CLAUDE.md calls Redis ephemeral and safe to flush, but the
     # DND set was written by that cron alone — so a flush, a recreated volume,

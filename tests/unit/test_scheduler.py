@@ -552,3 +552,25 @@ async def test_a_transient_failure_is_still_retried(monkeypatch):
 
     assert r.lpush_calls == [flaky]
     assert flaky not in r.listed(scheduler._WRITEBACK_DEAD)
+
+
+async def test_course_facts_refresh_job_delegates_and_survives_failure(monkeypatch):
+    """The digest is kept warm by this job; a failed rebuild is logged, never
+    raised into the scheduler loop that also runs campaign_tick."""
+    from app.telephony import sarvam_bridge
+
+    calls = []
+
+    async def fake_refresh():
+        calls.append(True)
+        return 123
+
+    monkeypatch.setattr(sarvam_bridge, "refresh_course_facts", fake_refresh)
+    await scheduler.course_facts_refresh()
+    assert calls == [True]
+
+    async def boom():
+        raise RuntimeError("embeddings are down")
+
+    monkeypatch.setattr(sarvam_bridge, "refresh_course_facts", boom)
+    await scheduler.course_facts_refresh()  # must not raise

@@ -183,6 +183,23 @@ async def dnd_refresh() -> None:
         await r.sadd(worker.DND_SET_KEY, *phone_list)
 
 
+# Every 30 minutes, and at startup (app/main.py). The digest's TTL is two
+# hours, so with this running it never expires in practice and no call pays
+# the rebuild — the first call after an expiry used to miss FACTS_DEADLINE_S
+# and run tool-only for its whole length. Lazy import: sarvam_bridge pulls in
+# the whole telephony stack, which the scheduler otherwise has no need of.
+COURSE_FACTS_REFRESH_MINUTES = 30
+
+
+async def course_facts_refresh() -> None:
+    from app.telephony import sarvam_bridge
+    try:
+        await sarvam_bridge.refresh_course_facts()
+    except Exception as exc:  # noqa: BLE001 - never crash the scheduler loop
+        logger.error(f"[scheduler] course_facts_refresh failed: "
+                     f"{type(exc).__name__}: {exc}")
+
+
 async def sheets_sync() -> dict:
     """The scheduled sync, and the one /admin/sheets/sync triggers by hand.
 
@@ -356,6 +373,8 @@ def start() -> AsyncIOScheduler:
     sched.add_job(retry_sweeper, "interval", minutes=RETRY_SWEEP_MINUTES, id="retry_sweeper")
     sched.add_job(dnd_refresh, CronTrigger(hour=6, minute=0), id="dnd_refresh")
     sched.add_job(sheets_sync, "interval", minutes=SHEETS_SYNC_MINUTES, id="sheets_sync")
+    sched.add_job(course_facts_refresh, "interval", minutes=COURSE_FACTS_REFRESH_MINUTES,
+                  id="course_facts_refresh")
     sched.add_job(transcript_reconcile, "interval", minutes=TRANSCRIPT_RECONCILE_MINUTES,
                   id="transcript_reconcile")
     sched.start()

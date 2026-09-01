@@ -3555,3 +3555,112 @@ async def test_the_two_way_prompt_carries_the_telugu_name(two_way, monkeypatch):
     )
 
     assert seen["lead_name"] == "గాయత్రీ"
+
+
+# ── read and store the documents FIRST ───────────────────────────────────────
+#
+# Demo call 2026-09-01 21:37: "what do you teach" and "tell me about SEO" each
+# went to the search tool with a spoken "ఒక్క క్షణం, చూసి చెప్తాను" — the first
+# lookup then timed out and the turn took 8.7 s — while a 4.2k digest built
+# from four topics sat in the prompt saying nothing about either. The owner's
+# direction, for the second time: the documents are read and stored before
+# the call; the agent answers at once.
+
+def test_the_facts_sweep_covers_what_leads_actually_ask():
+    joined = " ".join(sarvam_bridge._FACTS_QUERIES).lower()
+    for topic in ("fees", "duration", "placement", "modules", "seo", "google ads",
+                  "ai tools", "eligibility", "offline", "location", "certificate"):
+        assert topic in joined, f"the pre-read never asks the documents about {topic!r}"
+
+
+async def test_refresh_rebuilds_and_recaches_even_when_a_digest_is_cached(monkeypatch):
+    """The scheduler's job: the cache must never be allowed to expire under a
+    call, so the refresh writes a fresh digest regardless of what is there."""
+    class _Redis:
+        def __init__(self):
+            self.store = {"sarvam:course_facts:v1": "stale"}
+            self.expiry = {}
+
+        async def get(self, key):
+            return self.store.get(key)
+
+        async def set(self, key, value, ex=None):
+            self.store[key] = value
+            self.expiry[key] = ex
+
+    redis = _Redis()
+    monkeypatch.setattr(sarvam_bridge.redis_client, "get_redis", lambda: redis)
+
+    async def fake_search(query, *a, **kw):
+        return f"[From course material]\nFacts about {query}."
+
+    monkeypatch.setattr(sarvam_bridge, "search_relevant", fake_search)
+
+    n = await sarvam_bridge.refresh_course_facts()
+
+    assert n > 0
+    assert "stale" not in redis.store["sarvam:course_facts:v1"]
+    assert "Facts about SEO" in redis.store["sarvam:course_facts:v1"]
+    assert redis.expiry["sarvam:course_facts:v1"] == sarvam_bridge._FACTS_TTL_S
+
+
+async def test_a_call_still_reads_the_cached_digest_first(monkeypatch):
+    """refresh() is the writer; a call is a reader — it must not rebuild when
+    a digest is already cached (that is the 3 s of silence the cache exists
+    to avoid)."""
+    class _Redis:
+        async def get(self, key):
+            return "cached digest" if key == "sarvam:course_facts:v1" else None
+
+        async def set(self, *a, **kw):
+            raise AssertionError("a cached digest must not be rebuilt by a call")
+
+    monkeypatch.setattr(sarvam_bridge.redis_client, "get_redis", lambda: _Redis())
+
+    async def never(*a, **kw):
+        raise AssertionError("search must not run when the digest is cached")
+
+    monkeypatch.setattr(sarvam_bridge, "search_relevant", never)
+
+    assert await sarvam_bridge._course_facts() == "cached digest"
+
+
+async def test_the_core_facts_are_never_squeezed_out_by_the_wider_topics(monkeypatch):
+    """Live 2026-09-01 22:00, the first call after the sweep was widened to
+    twelve topics: "the fee details are not with me" - while the digest held
+    9.7k characters of SEO modules and audience sections. The fee table is
+    the largest retrieval block and the first topic, so a fair share of the
+    whole cap refused it once and the wider topics spent the rest. The core
+    topics pack first into their own reserved budget."""
+    _SEP = "\n\n---\n\n"
+
+    async def fake_search(query, *a, **kw):
+        if "fee" in query:
+            return "Total Fee: 50,000 rupees. " + ("f" * 880)
+        if "duration" in query:
+            return "Course Duration is 3 Months. " + ("d" * 700)
+        if "placement" in query:
+            return "Placement support included. " + ("p" * 700)
+        if "programs" in query:
+            return "Programs: BDLP, BDCP. " + ("g" * 700)
+        # every wider topic returns two unique kilobyte regions
+        return _SEP.join(f"{query[:12]} detail {i}: " + ("w" * 900) for i in range(2))
+
+    class _FakeRedis:
+        async def get(self, key):
+            return None
+
+        async def set(self, key, value, ex=None):
+            pass
+
+    monkeypatch.setattr(sarvam_bridge, "search_relevant", fake_search)
+    monkeypatch.setattr(sarvam_bridge.redis_client, "get_redis", lambda: _FakeRedis())
+
+    digest = await sarvam_bridge._course_facts()
+
+    assert "Total Fee: 50,000 rupees." in digest, "the fee table was squeezed out again"
+    assert "Course Duration is 3 Months." in digest
+    assert "Placement support included." in digest
+    assert "Programs: BDLP, BDCP." in digest
+    assert "detail 0" in digest, "the wider topics should still get the leftover"
+    assert len(digest) <= sarvam_bridge._FACTS_MAX_CHARS

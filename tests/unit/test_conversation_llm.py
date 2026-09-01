@@ -512,4 +512,7 @@ def test_the_search_tool_defers_to_the_facts_digest():
     desc = search["function"]["description"]
 
     assert "KNOWN COURSE FACTS" in desc
-    assert "not covered" in desc.lower()
+    # Since 2026-09-01 the digest covers the whole subject range, so the
+    # tool is the exception - for what the facts say nothing about at all.
+    assert "says nothing about at all" in desc
+    assert "answered directly from them" in desc

@@ -1505,21 +1505,57 @@ class _Conversation:
 #
 # search_relevant, never search_permissive: the digest feeds live calls, so
 # the relevance floor applies to it exactly as to the tool (CLAUDE.md).
+# Widened 2026-09-01 from four topics to the whole range a lead asks about.
+# With only fees / programs / duration / placement in the digest, "what do you
+# teach", "tell me about SEO", "who can join" and "where are you" each cost a
+# tool round-trip and a spoken "ఒక్క క్షణం, చూసి చెప్తాను" — on the demo call
+# one such lookup then timed out and the turn took 8.7 s. The owner's
+# direction, twice: read and store the documents FIRST, then answer at once.
+# Each entry maps to a real section of the three documents (the curriculum's
+# module list, the knowledge document's 4.x programs / 5.x categories / 3.x
+# audiences, the organisation document's location and mode sections).
 _FACTS_QUERIES = (
     "course fees and complete price structure for all programs",
     "digital marketing course programs and levels overview",
     "course duration batches and timings",
     "placement internship and job support",
+    "curriculum modules and topics taught in the digital marketing course",
+    "SEO training modules keyword research on-page technical local SEO",
+    "Google Ads Meta Ads performance marketing social media YouTube training",
+    "AI tools ChatGPT prompt engineering AI marketing modules",
+    "who can join eligibility freshers students job seekers working professionals",
+    "online offline hybrid mode of training classroom",
+    "institute location address Hyderabad contact and languages of training",
+    "certificate diploma MBA certification provided",
 )
 _FACTS_CACHE_KEY = "sarvam:course_facts:v1"
-_FACTS_TTL_S = 3600          # re-ingested documents propagate within the hour
+# Two hours, and refreshed every 30 minutes by the scheduler (and at
+# startup) — so the key never actually expires while the service is up, and
+# a re-ingested document still propagates within the half hour. Before this
+# the digest lived exactly one hour and the first call after that paid the
+# rebuild, missed FACTS_DEADLINE_S, and ran tool-only for its whole length.
+_FACTS_TTL_S = 7200
 # Paid on EVERY request, so it is a latency knob as much as a size one:
 # measured 2026-08-29, a 6.9k digest cost ~0.6s per turn against no digest
 # at all. 4500 is the smallest value that still carried every fact once the
 # budget was shared per topic and the curriculum noise was filtered out —
 # below ~3000 the fee table itself starts falling off. Re-measure with the
 # cap sweep in this file's tests if the documents grow substantially.
-_FACTS_MAX_CHARS = 4500
+# Raised to 10000 on 2026-09-01 with the twelve-topic sweep above: the
+# curriculum headings and the audience/mode/location sections need the room.
+# OpenAI caches an identical prompt prefix across turns, so the per-turn
+# cost of a larger system prompt is far below the 2026-08-29 figure; the
+# turn-latency log line is the place to re-check it.
+_FACTS_MAX_CHARS = 10000
+# The first _FACTS_CORE_TOPICS queries (fees, programs, duration, placement)
+# are what most calls are about, and their retrieval blocks are the largest.
+# They pack first into a reserved budget of this size - the cap that carried
+# every core fact when they were the only topics - and the wider topics share
+# whatever is left. Without the reservation the fee table was squeezed out
+# entirely by the eight new topics (live 2026-09-01 22:00: "the fee details
+# are not with me" on a call the digest had 9.7k characters for).
+_FACTS_CORE_TOPICS = 4
+_FACTS_CORE_CHARS = 5000
 # One failed build arms this instead of every call re-paying the stall for
 # the whole outage — an answered lead in silence each time, per the review.
 _FACTS_COOLDOWN_KEY = "sarvam:course_facts:cooldown"
@@ -1566,6 +1602,78 @@ async def _course_facts() -> str:
             return ""    # a recent build failed; don't stall this call too
     except Exception:  # noqa: BLE001 - cache is best-effort
         pass
+    return await _build_course_facts(r)
+
+
+async def refresh_course_facts() -> int:
+    """Rebuild the digest and re-cache it whether or not one is cached.
+
+    Run at startup and every 30 minutes by the scheduler, so the cache is
+    warm before any lead answers and a call never pays the rebuild. Returns
+    the digest length for the log; never raises.
+    """
+    r = None
+    with contextlib.suppress(Exception):
+        r = redis_client.get_redis()
+    digest = await _build_course_facts(r)
+    logger.info(f"[sarvam] course facts refreshed: {len(digest)} chars from "
+                f"{len(_FACTS_QUERIES)} topics")
+    return len(digest)
+
+
+def _pack_topics(results, cap: int, blocks: list[str], seen: set[str],
+                 total: int) -> int:
+    """Append each topic's blocks to *blocks* within *cap* total characters.
+
+    A share of the remaining budget per TOPIC, not first-come-first-served:
+    the fee query returns the most verbose chunks, so greedily filling from
+    it ate the whole cap and the duration/mode facts fell off the end
+    entirely (measured 2026-08-29). Unspent budget rolls forward, and a
+    second pass goes ROUND-ROBIN across topics - each topic's first refused
+    block, then each topic's second - so a topic whose only block was too
+    big for its first share still lands once the quiet topics have taken
+    theirs. Whole blocks only: a raw character slice could land inside a
+    figure ("Total Fee: 1,5") that the prompt presents as fact.
+    """
+    results = list(results)
+    if not results:
+        return total
+    share = max(1, (cap - total) // len(results))
+    allowance = total
+    skipped: list[list[str]] = []
+    for result in results:
+        allowance += share
+        skipped.append([])
+        if not result or result == NO_MATERIAL_NOTE:
+            continue
+        for raw_block in result.split("\n\n---\n\n"):
+            block = _useful_facts(raw_block)
+            if not block or block in seen:
+                continue
+            seen.add(block)
+            cost = len(block) + (2 if blocks else 0)
+            if total + cost > min(allowance, cap):
+                skipped[-1].append(block)
+                continue
+            blocks.append(block)
+            total += cost
+    depth = 0
+    while any(depth < len(topic) for topic in skipped):
+        for topic in skipped:
+            if depth >= len(topic):
+                continue
+            block = topic[depth]
+            cost = len(block) + (2 if blocks else 0)
+            if total + cost > cap:
+                continue
+            blocks.append(block)
+            total += cost
+        depth += 1
+    return total
+
+
+async def _build_course_facts(r) -> str:
+    """One build: the topic sweep, the per-topic budget, the cache write."""
     try:
         results = await asyncio.gather(
             *(search_relevant(q) for q in _FACTS_QUERIES))
@@ -1586,29 +1694,12 @@ async def _course_facts() -> str:
     # simultaneously being asked those exact questions on live calls.
     # Unspent budget rolls forward, so a quiet topic never wastes the room a
     # verbose one could have used.
-    share = max(1, _FACTS_MAX_CHARS // max(1, len(results)))
-    seen: set[str] = set()
     blocks: list[str] = []
-    total = 0
-    allowance = 0
-    for result in results:
-        allowance += share
-        if not result or result == NO_MATERIAL_NOTE:
-            continue
-        for raw_block in result.split("\n\n---\n\n"):
-            block = _useful_facts(raw_block)
-            if not block or block in seen:
-                continue
-            # Whole blocks only. A raw character slice could land inside a
-            # figure — "Total Fee: ₹1,5" — and the prompt presents this text
-            # as fact to answer from directly, with no fresh lookup to
-            # correct it. The straddling block is dropped, never halved.
-            cost = len(block) + (2 if blocks else 0)
-            if total + cost > min(allowance, _FACTS_MAX_CHARS):
-                continue
-            seen.add(block)
-            blocks.append(block)
-            total += cost
+    seen: set[str] = set()
+    core = min(_FACTS_CORE_CHARS, _FACTS_MAX_CHARS)
+    total = _pack_topics(results[:_FACTS_CORE_TOPICS], core, blocks, seen, 0)
+    total = _pack_topics(results[_FACTS_CORE_TOPICS:], _FACTS_MAX_CHARS,
+                         blocks, seen, total)
     digest = "\n\n".join(blocks)
     if digest and r is not None:
         with contextlib.suppress(Exception):
