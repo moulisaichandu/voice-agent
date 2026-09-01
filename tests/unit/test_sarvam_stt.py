@@ -960,3 +960,27 @@ def test_the_threshold_never_drops_below_the_absolute_floor(monkeypatch):
     monkeypatch.setattr(sarvam_stt, "SARVAM_NOISE_GATE_SNR", 1.5)
     assert sarvam_stt._gate_threshold(5.0) == 60.0
     assert sarvam_stt._gate_threshold(400.0) == 600.0
+
+
+async def test_the_agents_own_echo_does_not_raise_the_bar_against_the_lead(gated):
+    """Rehearsal call 2026-09-01 14:54: the floor was measured as the AVERAGE
+    of all non-speech audio, which during the agent's longest answer was its
+    own echo on the handset (RMS 2771). The bar became 4157, the lead's real
+    question (1454) failed it and was dropped. The floor is now the quietest
+    200 ms of recent non-speech audio — a loud stretch cannot inflate it as
+    long as any quiet gap exists, and a steadily loud room still sets it."""
+    got: list = []
+    async with sarvam_stt.SarvamSTT(lead_id="L") as stt:
+        pump = asyncio.ensure_future(_pump(stt, got))
+        for _ in range(15):                        # a quiet gap before the answer
+            await stt.send_audio(_frame(100))
+        for _ in range(60):                        # 1.2 s of the agent's echo
+            await stt.send_audio(_frame(2000))
+        gated.push(_vad("START_SPEECH"))
+        await _settle()
+        for _ in range(12):                        # the lead, well above the real floor
+            await stt.send_audio(_frame(1400))
+        await _settle()
+        pump.cancel()
+
+    assert got == ["speech_started"], f"the lead was gated out by the agent's echo: {got}"

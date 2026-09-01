@@ -41,6 +41,7 @@ import binascii
 import json
 import logging
 import time
+from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -180,6 +181,14 @@ def _rms(sumsq: int, count: int) -> float:
 # on telephony noise anyway). It decides what counts as the lead speaking.
 
 _SAMPLE_RATE = 8000
+# The floor is the QUIETEST block of recent non-speech audio, not its
+# average. Rehearsal call 2026-09-01 14:54: the average over the agent's
+# longest answer was the answer's own echo on the handset (RMS 2771), the bar
+# became 4157, and the lead's real question at 1454 was dropped. Blocks of
+# 200 ms; a window of 100 of them (~20 s of non-speech audio) is longer than
+# any agent turn, so the quiet gap before an answer outlives the answer's echo.
+_FLOOR_BLOCK_SAMPLES = _SAMPLE_RATE // 5
+_FLOOR_BLOCKS = 100
 # How long a verdict on an ended utterance stays attributable to a transcript
 # that arrives after it. END_SPEECH-to-transcript measured 0-1.2 s live; after
 # this a late transcript is judged unmeasured, i.e. passed through.
@@ -235,6 +244,9 @@ class SarvamSTT:
         self._utterance_passed = False   # this utterance's audio confirmed as speech
         self._floor_rms = 0.0            # the quiet stretch before this utterance
         self._last_verdict: _Verdict | None = None
+        self._floor_blocks: deque[float] = deque(maxlen=_FLOOR_BLOCKS)
+        self._floor_block_sumsq = 0
+        self._floor_block_count = 0
 
     async def __aenter__(self) -> SarvamSTT:
         if not SARVAM_API_KEY:
@@ -314,6 +326,13 @@ class SarvamSTT:
         else:
             self._silence_sumsq += sumsq
             self._silence_count += count
+            self._floor_block_sumsq += sumsq
+            self._floor_block_count += count
+            if self._floor_block_count >= _FLOOR_BLOCK_SAMPLES:
+                self._floor_blocks.append(
+                    _rms(self._floor_block_sumsq, self._floor_block_count))
+                self._floor_block_sumsq = 0
+                self._floor_block_count = 0
 
         now = time.monotonic()
         if self._last_frame_at is not None:
@@ -324,6 +343,14 @@ class SarvamSTT:
 
     def _gate_enabled(self) -> bool:
         return SARVAM_NOISE_GATE_ENABLED
+
+    def _noise_floor(self) -> float:
+        """The quietest 200 ms among the last ~20 s of non-speech audio; the
+        plain average of the current quiet stretch only until a first full
+        block exists. See _FLOOR_BLOCKS for why not the average."""
+        if self._floor_blocks:
+            return min(self._floor_blocks)
+        return _rms(self._silence_sumsq, self._silence_count)
 
     def _confirm_if_speech(self) -> None:
         """Pass the pending START_SPEECH through once enough audio has arrived
@@ -487,8 +514,7 @@ class SarvamSTT:
                             # Held until the audio confirms it — see
                             # _confirm_if_speech. The floor is the quiet
                             # stretch accumulated since the last END_SPEECH.
-                            self._floor_rms = _rms(self._silence_sumsq,
-                                                   self._silence_count)
+                            self._floor_rms = self._noise_floor()
                             self._start_pending = True
                         else:
                             yield STTEvent("speech_started")
